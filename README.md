@@ -26,6 +26,10 @@
 ### 前置要求
 
 - **Rust 1.80+**（[安装 rustup](https://rustup.rs)）
+- **C 编译器**（tree-sitter grammar 以 C 源码编译，需要系统安装 C 工具链）：
+  - **Windows**：安装 [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)（选"使用 C++ 的桌面开发"工作负载）或 [LLVM/Clang](https://releases.llvm.org/)
+  - **Linux**：`sudo apt install build-essential`（Debian/Ubuntu）或 `sudo dnf install gcc`（Fedora）
+  - **macOS**：`xcode-select --install`（自动安装命令行工具含 clang）
 - **Git**（可选，变更对比功能需要）
 
 ### 从源码编译安装
@@ -39,6 +43,8 @@ cargo build --release
 编译完成后，二进制文件位于：
 - **Windows**: `target/release/code-connect.exe`
 - **Linux / macOS**: `target/release/code-connect`
+
+项目所有核心依赖（tree-sitter、tantivy、sled、petgraph 等）均为跨平台库，完全支持 **Windows / Linux / macOS** 三平台编译运行。
 
 ### 添加到 PATH（可选）
 
