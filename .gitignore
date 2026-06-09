@@ -1,9 +1,10 @@
 # Rust
-/target/
+/target
 **/*.rs.bk
+*.pdb
 
 # CodeConnect 本地数据
-.codeconnect/
+/.codeconnect
 
 # IDE
 .vscode/

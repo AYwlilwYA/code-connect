@@ -4,37 +4,45 @@
 [workspace]
 # 项目根目录列表（monorepo 场景可指定多个）
 roots = ["."]
-# 排除模式（自动合并 .gitignore）
+# 额外排除模式（自动合并 .gitignore 中的忽略规则）
 excludes = ["node_modules", "target", ".git", "dist", "build"]
 
 [languages]
-# 启用的语言（注释掉即禁用）
+# 启用的语言（注释掉即禁用对应语言的解析与索引）
 rust = true
 typescript = true
 javascript = true
 java = true
-# kotlin = true   # 待 grammar 稳定后启用
+# kotlin = true   # 待 tree-sitter grammar 稳定后启用
 csharp = true
 
 [index]
-# 数据目录（相对于项目根）
+# 索引数据目录（相对于项目根目录）
 data_dir = ".codeconnect"
-# 是否启用增量索引
+# 是否启用增量索引（仅处理变更文件，提升索引速度）
 incremental = true
+# 索引时额外跳过的路径模式（glob 格式）
+exclude_patterns = ["target/", ".git/", "node_modules/"]
 
 [search]
-# 默认最大返回数
+# 搜索默认返回条数
+default_limit = 20
+# 全局默认最大返回结果数（搜索结果上限）
 max_results = 50
 
 [complexity]
-# 圈复杂度告警阈值
-warning_threshold = 10
-error_threshold = 20
+# 圈复杂度告警阈值（超过会输出警告信息）
+warn_threshold = 15
+# 圈复杂度错误阈值（超过会标记为质量问题）
+error_threshold = 30
 
-[dead_code]
-# 手动指定入口点（如 main 函数、HTTP 路由处理函数等）
-entry_points = []
+# 死代码检测配置（数组格式，每个条目定义一组入口点）
+[[dead_code]]
+# 手动指定分析的入口点（如 main 函数、HTTP 路由处理函数等）
+# 从这些入口出发可达的代码视为"活代码"，不可达的标记为死代码
+entry_points = ["src/main.rs", "src/lib.rs"]
 
+# 架构规则（数组格式，每条规则定义一个约束检查）
 [[rules]]
 name = "no-circular-deps"
 description = "检测模块间的循环依赖"
@@ -42,5 +50,9 @@ description = "检测模块间的循环依赖"
 [[rules]]
 name = "layer-architecture"
 description = "分层架构约束（领域层不可依赖基础设施层）"
-layers = []
-allowed = []
+layers = ["domain", "application", "infrastructure"]
+allowed = [
+    { from = "application", to = "domain" },
+    { from = "infrastructure", to = "domain" },
+    { from = "infrastructure", to = "application" },
+]
