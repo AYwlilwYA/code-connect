@@ -1,0 +1,24 @@
+[workspace]
+roots = ["."]
+
+[languages]
+# 语言开关（每个语言一个 bool 字段）
+rust = true
+typescript = true
+javascript = true
+java = true
+csharp = true
+
+[index]
+exclude_patterns = ["target/", ".git/", "node_modules/", ".claude/"]
+
+[search]
+default_limit = 20
+
+[complexity]
+warn_threshold = 15
+error_threshold = 30
+
+# dead_code 需要数组格式，每个条目是一个 [[dead_code]] 条目
+[[dead_code]]
+entry_points = ["crates/cli/src/main.rs"]

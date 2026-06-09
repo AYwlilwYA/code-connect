@@ -447,6 +447,7 @@ pub fn handle_get_metrics(
             &symbols,
             &call_graph,
             &type_hierarchy,
+            None,
         );
 
         let result = serde_json::json!({
@@ -490,6 +491,7 @@ pub fn handle_get_metrics(
             &[symbol],
             &call_graph,
             &type_hierarchy,
+            None,
         );
 
         let m = &metrics[0];

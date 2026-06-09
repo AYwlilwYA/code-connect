@@ -12,6 +12,7 @@ use codeconnect_index::full_indexer::FullIndexer;
 use codeconnect_index::sled_store::SledStore;
 use codeconnect_index::tantivy_index::TantivyIndex;
 use codeconnect_parser::factory::ParserRegistry;
+use codeconnect_parser::csharp::CSharpParser;
 use codeconnect_parser::java::JavaParser;
 use codeconnect_parser::rust::RustParser;
 use codeconnect_parser::typescript::TypeScriptParser;
@@ -60,6 +61,9 @@ pub async fn run(
         .map_err(|e| format!("无法创建 sled 存储: {}", e))?;
 
     // 注册解析器（按配置开关）
+    eprintln!("[DEBUG] languages: rust={}, ts={}, js={}, java={}, csharp={}, kotlin={}",
+        config.languages.rust, config.languages.typescript, config.languages.javascript,
+        config.languages.java, config.languages.csharp, config.languages.kotlin);
     let mut registry = ParserRegistry::new();
 
     if config.languages.rust {
@@ -79,7 +83,8 @@ pub async fn run(
         println!("  已注册: Java 解析器");
     }
     if config.languages.csharp {
-        tracing::info!("C# 解析器已注册");
+        registry.register(Arc::new(CSharpParser::new()));
+        println!("  已注册: C# 解析器");
     }
     if config.languages.kotlin {
         tracing::info!("Kotlin 解析器已注册");

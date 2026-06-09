@@ -368,6 +368,83 @@ impl FullIndexer {
         self.sled
             .put_file_symbols(file_path_str, &file_symbol_bytes)?;
 
+        // ---- 写入调用边 ----
+        // 只对 Function / Method 类型的符号创建出边（调用者），
+        // 避免为局部变量、字段、类等非可执行符号创建无意义的边。
+        // 对于每个 CallSite，如果能匹配到文件内的符号，使用其 StableSymbolId；
+        // 否则直接用 callee_name 作为 callee_id。
+        //
+        // 调用者匹配策略：
+        // 按 CallSite 的行号范围与文件内 Function/Method 符号的行号范围做包含匹配。
+        // 只有行号在符号范围内的调用才会被绑定到该符号，
+        // 避免将所有调用都错误地绑定到文件中所有函数。
+
+        // 先建立一个从符号名到 StableSymbolId 的快速查找表
+        let name_to_sym_id: HashMap<&str, &str> = parsed.symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.id.as_str()))
+            .collect();
+
+        for call in &parsed.calls {
+            if call.callee_name.is_empty() {
+                continue;
+            }
+
+            // 被调用方 ID：优先匹配文件内符号的 StableSymbolId，否则直接用 callee_name
+            let callee_id = name_to_sym_id
+                .get(call.callee_name.as_str())
+                .map(|&id| id.to_string())
+                .unwrap_or_else(|| call.callee_name.clone());
+
+            // 如果 CallSite 已有 caller_id，直接使用
+            if !call.caller_id.is_empty() {
+                let edge = codeconnect_core::types::CallEdge {
+                    caller_id: call.caller_id.clone(),
+                    callee_id: callee_id.clone(),
+                    location: call.location.clone(),
+                    call_type: call.call_type.clone(),
+                    confidence: call.confidence,
+                };
+                let edge_bytes = serde_json::to_vec(&edge)
+                    .map_err(|e| CodeConnectError::Index(format!("序列化调用边失败: {}", e)))?;
+                // 用 caller_id 和 callee_name 作为键写入
+                self.sled.put_call_edge(&call.caller_id, &call.callee_name, &edge_bytes)?;
+            } else {
+                // 无 caller_id 时，通过行号范围匹配找到包含此调用的函数
+                // 调用行号必须在符号的 line..=end_line 范围内
+                let call_line = call.location.line;
+                for symbol in &parsed.symbols {
+                    if !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method) {
+                        continue;
+                    }
+                    // 检查调用是否在此符号的行号范围内
+                    if call_line > 0
+                        && symbol.location.line > 0
+                        && symbol.location.end_line > 0
+                        && call_line >= symbol.location.line
+                        && call_line <= symbol.location.end_line
+                    {
+                        let edge = codeconnect_core::types::CallEdge {
+                            caller_id: symbol.id.clone(),
+                            callee_id: callee_id.clone(),
+                            location: call.location.clone(),
+                            call_type: call.call_type.clone(),
+                            confidence: call.confidence,
+                        };
+                        // 如果 callee_id 本身也是一个稳定 ID，且已在 name_to_sym_id 中
+                        // 用 callee_id 替代 callee_name 作为键，以便 sled 中正确关联
+                        let callee_key = name_to_sym_id
+                            .get(callee_id.as_str())
+                            .copied()
+                            .unwrap_or(&callee_id);
+                        let edge_bytes = serde_json::to_vec(&edge)
+                            .map_err(|e| CodeConnectError::Index(format!("序列化调用边失败: {}", e)))?;
+                        self.sled.put_call_edge(&symbol.id, callee_key, &edge_bytes)?;
+                    }
+                }
+            }
+        }
+
         // ---- 写入文件指纹 ----
         self.sled
             .put_fingerprint(file_path_str, parsed.content_hash.as_bytes())?;

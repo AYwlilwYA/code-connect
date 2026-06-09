@@ -44,11 +44,11 @@ impl RustParser {
     }
 
     /// 将 tree-sitter 节点转为源码位置（0-based → 1-based）
-    fn node_to_location(&self, node: tree_sitter::Node) -> SourceLocation {
+    fn node_to_location(&self, node: tree_sitter::Node, file_path: &str) -> SourceLocation {
         let start = node.start_position();
         let end = node.end_position();
         SourceLocation {
-            file_path: String::new(), // 由外部调用者填充
+            file_path: file_path.to_string(),
             line: start.row as u64 + 1,
             column: start.column as u64 + 1,
             end_line: end.row as u64 + 1,
@@ -127,43 +127,43 @@ impl LanguageParser for RustParser {
                     }
                     "symbol.function" => {
                         kind = SymbolKind::Function;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.method" => {
                         kind = SymbolKind::Method;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.struct" => {
                         kind = SymbolKind::Struct;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.trait" => {
                         kind = SymbolKind::Trait;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.enum" => {
                         kind = SymbolKind::Enum;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.type_alias" => {
                         kind = SymbolKind::TypeAlias;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.macro" => {
                         kind = SymbolKind::Macro;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.module" => {
                         kind = SymbolKind::Module;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.variable" => {
                         kind = SymbolKind::Variable;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.field" => {
                         kind = SymbolKind::Field;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.parent" => {
                         parent = self.node_text(node, source).to_string();
@@ -264,15 +264,15 @@ impl LanguageParser for RustParser {
                         callee_name = self.node_text(node, source).to_string();
                     }
                     "call" => {
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "call.method" => {
                         call_type = CallType::Virtual; // Rust 方法调用可能通过 trait 动态分发
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "call.macro" => {
                         call_type = CallType::MacroExpansion;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     _ => {}
                 }

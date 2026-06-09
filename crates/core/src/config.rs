@@ -305,8 +305,13 @@ fn find_and_load_project_config() -> Option<CodeConnectConfig> {
         let config_path = dir.join(".codeconnect.toml");
         if config_path.is_file() {
             if let Ok(content) = std::fs::read_to_string(&config_path) {
-                if let Ok(config) = toml::from_str::<CodeConnectConfig>(&content) {
-                    return Some(config);
+                match toml::from_str::<CodeConnectConfig>(&content) {
+                    Ok(config) => {
+                        return Some(config);
+                    }
+                    Err(e) => {
+                        eprintln!("警告：TOML 配置文件解析失败 ({}) : {}", config_path.display(), e);
+                    }
                 }
             }
         }

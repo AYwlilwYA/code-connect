@@ -95,8 +95,12 @@ pub struct CallChainNode {
 pub struct CallGraph {
     /// 有向图：调用者 → 被调用者
     graph: DiGraph<SymbolNode, CallEdge>,
-    /// 符号 ID → NodeIndex 映射，用于 O(1) 按 ID 查找节点
+    /// 符号 ID → NodeIndex 映射，用于 O(1) 按稳定 ID 查找节点
     id_to_index: HashMap<String, NodeIndex>,
+    /// 符号名称 → NodeIndex 映射，用于 O(1) 按名称查找节点
+    /// 注意：同一个名称可能对应多个不同的稳定 ID（不同文件中的同名函数），
+    /// 此映射保留最后插入的值，适用于死代码检测等按名称查询的场景
+    name_to_index: HashMap<String, NodeIndex>,
 }
 
 impl CallGraph {
@@ -105,6 +109,7 @@ impl CallGraph {
         Self {
             graph: DiGraph::new(),
             id_to_index: HashMap::new(),
+            name_to_index: HashMap::new(),
         }
     }
 
@@ -121,7 +126,10 @@ impl CallGraph {
             return idx;
         }
         let idx = self.graph.add_node(node.clone());
+        let name = node.name.clone();
         self.id_to_index.insert(node.symbol_id, idx);
+        // 同时维护名称索引，用于按符号名称（如 "main"）查询
+        self.name_to_index.insert(name, idx);
         idx
     }
 
@@ -132,8 +140,15 @@ impl CallGraph {
     ///
     /// 边的方向：from caller → to callee。
     pub fn add_edge(&mut self, caller: &str, callee: &str, edge: CallEdge) {
-        let from = self.id_to_index.get(caller);
-        let to = self.id_to_index.get(callee);
+        // 先按稳定 ID 查找，失败时按名称查找（兼容测试中 add_edge_raw 用名称作为 ID）
+        let from = self
+            .id_to_index
+            .get(caller)
+            .or_else(|| self.name_to_index.get(caller));
+        let to = self
+            .id_to_index
+            .get(callee)
+            .or_else(|| self.name_to_index.get(callee));
         if let (Some(&from), Some(&to)) = (from, to) {
             self.graph.add_edge(from, to, edge);
         }
@@ -143,8 +158,10 @@ impl CallGraph {
     ///
     /// 返回 `None` 如果该符号不在图中。
     pub fn get_node_by_id(&self, symbol_id: &str) -> Option<&SymbolNode> {
+        // 先按 ID 查找，再按名称查找（兼容按 name 查询的场景）
         self.id_to_index
             .get(symbol_id)
+            .or_else(|| self.name_to_index.get(symbol_id))
             .map(|&idx| &self.graph[idx])
     }
 
@@ -168,8 +185,8 @@ impl CallGraph {
         symbol_id: &str,
         max_depth: usize,
     ) -> Vec<CallChainNode> {
-        let start_idx = match self.id_to_index.get(symbol_id) {
-            Some(&idx) => idx,
+        let start_idx = match self.find_node_index(symbol_id) {
+            Some(idx) => idx,
             None => return Vec::new(),
         };
 
@@ -196,8 +213,8 @@ impl CallGraph {
         symbol_id: &str,
         max_depth: usize,
     ) -> Vec<CallChainNode> {
-        let start_idx = match self.id_to_index.get(symbol_id) {
-            Some(&idx) => idx,
+        let start_idx = match self.find_node_index(symbol_id) {
+            Some(idx) => idx,
             None => return Vec::new(),
         };
 
@@ -334,82 +351,125 @@ impl CallGraph {
         let mut call_graph = CallGraph::new();
 
         // ================================================================
-        // 第一步：扫描所有调用边，收集节点和边的数据
+        // 第一步：扫描所有 symbols:，建立 name → stable_id 的反向映射
         // ================================================================
-        let edges_prefix = b"edges:";
-        let mut edge_records: Vec<(String, String, CallEdge)> = Vec::new();
-        let mut seen_symbols: HashMap<String, bool> = HashMap::new();
+        let symbols_prefix = b"symbols:";
+        // name → (stable_id, Symbol) 映射，同一名称可能有多个重载
+        let mut name_to_stable: HashMap<String, Vec<String>> = HashMap::new();
 
-        for item in sled.scan_prefix(edges_prefix) {
+        for item in sled.scan_prefix(symbols_prefix) {
             let (key, value) = item?;
             let key_str = String::from_utf8_lossy(&key).to_string();
+            // 键格式：symbols:{stable_id}
+            let stable_id = key_str["symbols:".len()..].to_string();
 
-            // 键格式：edges:{caller_id}::{callee_id}
-            // 去掉 "edges:" 前缀后按 "::" 分割
-            let body = &key_str["edges:".len()..];
-            let parts: Vec<&str> = body.split("::").collect();
-            if parts.len() < 2 {
-                continue; // 跳过格式不符的键
+            if let Ok(symbol) = serde_json::from_slice::<Symbol>(&value) {
+                let name = symbol.name.clone();
+                let node = SymbolNode::from_symbol(&symbol);
+                call_graph.add_node(node);
+                // 建立名称到稳定 ID 的映射
+                name_to_stable.entry(name).or_default().push(stable_id);
             }
-            let caller_id = parts[0].to_string();
-            let callee_id = parts[1..].join("::"); // callee_id 可能包含 ::
+        }
 
-            // 标记出现过的符号
-            seen_symbols.insert(caller_id.clone(), true);
-            seen_symbols.insert(callee_id.clone(), true);
+        // ================================================================
+        // 第二步：扫描所有调用边，解析 caller/callee，并添加边
+        // ================================================================
+        // 注意：edges 键的格式为 edges:{stable_id}::{callee_name}
+        // 其中 stable_id 自身包含 5 个 "::" 段（StableSymbolId 格式），
+        // 所以不能用简单的 split("::") 拆分键来获取 caller/callee。
+        // 改为直接从反序列化的 CallEdge 值中读取 caller_id 和 callee_id。
+        // ================================================================
+        let edges_prefix = b"edges:";
 
-            // 反序列化 CallEdge
+        for item in sled.scan_prefix(edges_prefix) {
+            let (_key, value) = item?;
+
+            // 从值中反序列化 CallEdge，直接获取 caller_id 和 callee_id
             let call_edge: CallEdge = serde_json::from_slice(&value).map_err(|e| {
                 CodeConnectError::Serialization(e)
             })?;
 
-            edge_records.push((caller_id, callee_id, call_edge));
-        }
+            let caller_key = &call_edge.caller_id;
+            let callee_key = &call_edge.callee_id;
 
-        // ================================================================
-        // 第二步：为每个出现过的符号创建图节点
-        // ================================================================
-        for symbol_id in seen_symbols.keys() {
-            match sled.get_symbol(symbol_id) {
-                Ok(Some(data)) => {
-                    let symbol: Symbol = serde_json::from_slice(&data).map_err(|e| {
-                        CodeConnectError::Serialization(e)
-                    })?;
-                    let node = SymbolNode::from_symbol(&symbol);
-                    call_graph.add_node(node);
-                }
-                Ok(None) => {
-                    // 符号在 edges 中被引用但不在 symbols 中存储
-                    // 创建一个占位节点，避免边无法添加
-                    let placeholder = SymbolNode {
-                        symbol_id: symbol_id.clone(),
-                        name: format!("<未知符号:{}>", symbol_id),
-                        kind: SymbolKind::Unknown(format!("未索引")),
-                        file_path: String::new(),
-                    };
-                    call_graph.add_node(placeholder);
-                }
-                Err(_) => {
-                    // 读取失败也创建占位节点
-                    let placeholder = SymbolNode {
-                        symbol_id: symbol_id.clone(),
-                        name: format!("<未知符号:{}>", symbol_id),
-                        kind: SymbolKind::Unknown(format!("读取失败")),
-                        file_path: String::new(),
-                    };
-                    call_graph.add_node(placeholder);
-                }
-            }
-        }
+            // 解析 caller：按稳定 ID 或名称查找
+            let caller_id = Self::resolve_symbol_ref(
+                &call_graph, &name_to_stable, caller_key,
+            );
 
-        // ================================================================
-        // 第三步：添加所有调用边
-        // ================================================================
-        for (caller_id, callee_id, edge) in edge_records {
-            call_graph.add_edge(&caller_id, &callee_id, edge);
+            // 解析 callee：按稳定 ID 或名称查找
+            let callee_id = Self::resolve_symbol_ref(
+                &call_graph, &name_to_stable, callee_key,
+            );
+
+            // 确保两个节点都存在（可能需要在此时创建占位节点）
+            Self::ensure_node_exists(&mut call_graph, &caller_id, caller_key);
+            Self::ensure_node_exists(&mut call_graph, &callee_id, callee_key);
+
+            call_graph.add_edge(&caller_id, &callee_id, call_edge);
         }
 
         Ok(call_graph)
+    }
+
+    /// 解析 edges 键中的符号引用
+    ///
+    /// 如果 key 已经在图中按稳定 ID 找到，直接返回 key。
+    /// 如果 key 在 name_to_index 中（纯名称），通过 name_to_stable 找到对应的稳定 ID 返回。
+    /// 如果以上都找不到，通过 name_to_stable 模糊匹配，取第一个。
+    /// 如果还是找不到，返回原始 key 作为回退。
+    fn resolve_symbol_ref(
+        call_graph: &CallGraph,
+        name_to_stable: &HashMap<String, Vec<String>>,
+        key: &str,
+    ) -> String {
+        // 先按稳定 ID 查找（id_to_index 以 StableSymbolId 为键）
+        if call_graph.id_to_index.contains_key(key) {
+            return key.to_string();
+        }
+        // 按名称在 name_to_index 中命中，但需要返回稳定的 ID 而非原始名称，
+        // 以确保 add_edge 中 id_to_index 能命中
+        if call_graph.name_to_index.contains_key(key) {
+            // 通过 name_to_stable 找到对应的稳定 ID
+            if let Some(ids) = name_to_stable.get(key) {
+                if !ids.is_empty() {
+                    return ids[0].clone();
+                }
+            }
+            // 退化：返回原始 key（可能在 add_edge 的 name_to_index 回退中命中）
+            return key.to_string();
+        }
+        // 尝试通过名称→稳定 ID 映射找到对应的稳定 ID
+        if let Some(ids) = name_to_stable.get(key) {
+            if !ids.is_empty() {
+                return ids[0].clone();
+            }
+        }
+        // 回退：返回原始 key
+        key.to_string()
+    }
+
+    /// 确保节点在图中存在
+    ///
+    /// 如果节点不存在，创建一个占位节点。
+    fn ensure_node_exists(
+        call_graph: &mut CallGraph,
+        node_id: &str,
+        original_key: &str,
+    ) {
+        if call_graph.id_to_index.contains_key(node_id)
+            || call_graph.name_to_index.contains_key(node_id)
+        {
+            return;
+        }
+        let placeholder = SymbolNode {
+            symbol_id: node_id.to_string(),
+            name: original_key.to_string(),
+            kind: SymbolKind::Unknown(format!("未索引")),
+            file_path: String::new(),
+        };
+        call_graph.add_node(placeholder);
     }
 
     // -----------------------------------------------------------------------
@@ -458,17 +518,29 @@ impl CallGraph {
         self.add_edge(caller_id, callee_id, edge);
     }
 
+    /// 按 ID 或名称查找节点索引
+    ///
+    /// 优先按稳定 ID 查找，失败时按名称查找。
+    /// 这样同时兼容按 `symbol.id` 和按 `symbol.name` 的查询。
+    #[inline]
+    fn find_node_index(&self, key: &str) -> Option<NodeIndex> {
+        self.id_to_index
+            .get(key)
+            .or_else(|| self.name_to_index.get(key))
+            .copied()
+    }
+
     /// 获取指定符号的出入度
     ///
     /// 返回 `(fan_in, fan_out)` 元组：
     /// - `fan_in` — 入度（被其他符号调用的次数）
     /// - `fan_out` — 出度（调用其他符号的次数）
     ///
-    /// 按 symbol_id 查询（与 `add_node`/`add_edge` 的键一致）。
+    /// 按 symbol_id 或名称查询（与 `add_node`/`add_edge` 的键一致）。
     /// 如果符号不在图中，返回 `(0, 0)`。
     pub fn degree(&self, symbol_id: &str) -> (u64, u64) {
-        let idx = match self.id_to_index.get(symbol_id) {
-            Some(&i) => i,
+        let idx = match self.find_node_index(symbol_id) {
+            Some(i) => i,
             None => return (0, 0),
         };
 
@@ -481,8 +553,8 @@ impl CallGraph {
     ///
     /// 返回所有通过入边连接到该符号的符号 ID 列表。
     pub fn get_callers(&self, symbol_id: &str) -> Vec<String> {
-        let idx = match self.id_to_index.get(symbol_id) {
-            Some(&i) => i,
+        let idx = match self.find_node_index(symbol_id) {
+            Some(i) => i,
             None => return Vec::new(),
         };
 
@@ -496,8 +568,8 @@ impl CallGraph {
     ///
     /// 返回该符号通过出边调用的所有符号 ID 列表。
     pub fn get_callees(&self, symbol_id: &str) -> Vec<String> {
-        let idx = match self.id_to_index.get(symbol_id) {
-            Some(&i) => i,
+        let idx = match self.find_node_index(symbol_id) {
+            Some(i) => i,
             None => return Vec::new(),
         };
 
@@ -511,8 +583,8 @@ impl CallGraph {
     ///
     /// 使用 petgraph 内置 BFS 算法，沿出边方向遍历。
     pub fn bfs_reachable(&self, symbol_id: &str) -> Vec<String> {
-        let start = match self.id_to_index.get(symbol_id) {
-            Some(&i) => i,
+        let start = match self.find_node_index(symbol_id) {
+            Some(i) => i,
             None => return Vec::new(),
         };
 

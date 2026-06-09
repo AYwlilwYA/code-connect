@@ -6,7 +6,7 @@
 //! - **继承深度** — 基于类型层次图的继承链深度
 //! - **死代码检测** — 基于调用图可达性分析
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use codeconnect_core::types::Symbol;
 
@@ -64,7 +64,7 @@ impl MetricCalculator {
     ///
     /// ## 算法
     /// 1. 如果 `symbol.complexity` 已有值，直接返回（来自解析器的预计算结果）
-    /// 2. 否则对 `source` 文本进行轻量级分析，统计分支关键字：
+    /// 2. 否则对符号所在函数的源码进行轻量级分析，统计分支关键字：
     ///    - 条件分支: `if`, `else if`
     ///    - 循环: `for`, `while`, `loop`
     ///    - 模式匹配: `match`, `case`, `switch`
@@ -73,6 +73,7 @@ impl MetricCalculator {
     ///    - 空值合并: `?.`, `??`
     ///    - 三元运算符: `?`
     /// 3. 圈复杂度 = 1（函数入口） + 分支节点总数
+    ///
     pub fn compute_complexity(symbol: &Symbol, source: &str) -> u64 {
         // 优先使用解析器预计算的值
         if let Some(complexity) = symbol.complexity {
@@ -115,6 +116,44 @@ impl MetricCalculator {
         complexity
     }
 
+    /// 从文件源码中提取符号对应行范围的文本
+    ///
+    /// 根据 `symbol.location` 的行范围（line 到 end_line）截取文本。
+    /// 如果源文本行数不大（不超过 end_line 较多），说明源文本可能就是函数体而非整个文件，
+    /// 此时直接返回完整源码。
+    fn extract_symbol_source(symbol: &Symbol, file_source: &str) -> Option<String> {
+        let loc = &symbol.location;
+        // 行范围无效时不截取
+        if loc.line == 0 || loc.end_line == 0 || loc.line > loc.end_line {
+            return None;
+        }
+
+        let lines: Vec<&str> = file_source.lines().collect();
+        let total_lines = lines.len() as u64;
+
+        // 如果源文本总行数不大于符号结束行号的 1.5 倍，
+        // 说明传入的可能就是函数体而非整个文件，不截取
+        // 使用比例检测而非固定偏移量，避免对大文件也做无意义截取
+        if total_lines <= loc.end_line || total_lines <= 20 {
+            return None;
+        }
+        // 如果符号范围覆盖了整个文件的大部分（>80%），不做截取
+        let span_lines = loc.end_line - loc.line + 1;
+        if total_lines > 0 && span_lines as f64 / total_lines as f64 > 0.8 {
+            return None;
+        }
+
+        // 行号是 1-based，转换为 0-based 索引
+        let start_idx = (loc.line as usize).saturating_sub(1).min(lines.len());
+        let end_idx = (loc.end_line as usize).min(lines.len());
+
+        if start_idx >= end_idx {
+            return None;
+        }
+
+        Some(lines[start_idx..end_idx].join("\n"))
+    }
+
     // ========================================================================
     // 批量指标计算
     // ========================================================================
@@ -122,23 +161,56 @@ impl MetricCalculator {
     /// 批量计算所有符号的代码质量指标
     ///
     /// ## 计算内容
-    /// - **圈复杂度** — 从 `symbol.complexity` 字段获取（解析器预计算）
+    /// - **圈复杂度** — 优先使用 `symbol.complexity` 预计算值；
+    ///   如果为空且提供了 `source_cache`，则通过文本扫描回退计算；
+    ///   回退计算时会根据 `symbol.location` 的行范围从文件源码中截取函数体，
+    ///   确保每个符号的复杂度基于其自身的代码，而非整个文件；
+    ///   否则默认为 1
     /// - **fan_in** — 调用图中指向当前符号的入边数量
     /// - **fan_out** — 调用图中从当前符号出发的出边数量
     /// - **继承深度** — 类型层次图中当前符号到根的距离
+    ///
+    /// ## 参数
+    /// - `symbols` — 符号列表
+    /// - `call_graph` — 调用图
+    /// - `type_hierarchy` — 类型层次图
+    /// - `source_cache` — 可选的文件路径→整个文件源码内容映射，
+    ///   `compute_complexity` 内部会根据符号行范围自动截取函数体
     pub fn compute_all(
         symbols: &[Symbol],
         call_graph: &CallGraph,
         type_hierarchy: &TypeHierarchy,
+        source_cache: Option<&HashMap<String, String>>,
     ) -> Vec<CodeMetrics> {
         symbols
             .iter()
             .map(|symbol| {
-                // 圈复杂度：优先用预计算值，否则默认为 1
-                let cyclomatic_complexity = symbol.complexity.unwrap_or(1);
+                // 圈复杂度：优先用预计算值 → 回退文本扫描 → 默认 1
+                let cyclomatic_complexity = match symbol.complexity {
+                    Some(c) => c,
+                    None => {
+                        // 回退计算：从源码缓存中查找对应文件的源码做文本扫描
+                        if let Some(cache) = source_cache {
+                            let file_path = &symbol.location.file_path;
+                            if let Some(file_source) = cache.get(file_path) {
+                                // 尝试从文件源码中截取符号对应的行范围，
+                                // 以获取该符号自身的源码（而非整个文件）
+                                let scoped_source = Self::extract_symbol_source(symbol, file_source);
+                                let source = scoped_source.as_deref().unwrap_or(file_source);
+                                Self::compute_complexity(symbol, source)
+                            } else {
+                                1 // 找不到源码，默认值
+                            }
+                        } else {
+                            1 // 没有源码缓存，默认值
+                        }
+                    }
+                };
 
                 // 出入度：从调用图获取
-                let (fan_in, fan_out) = call_graph.degree(&symbol.name);
+                // 注意：按符号的稳定 ID 查询（id_to_index 以 stable_id 为键），
+                // 回退按名称查询（name_to_index 以符号名称为键）
+                let (fan_in, fan_out) = call_graph.degree(&symbol.id);
 
                 // 继承深度：从类型层次图计算祖先数量
                 let ancestors = type_hierarchy.get_ancestors(&symbol.name);
@@ -453,15 +525,18 @@ mod tests {
         let type_hierarchy = build_sample_hierarchy();
 
         // 符号列表
+        // 注意：Symbol.id 需要与图中 add_edge_raw 使用的节点 ID 一致，
+        // 这样 compute_all 中 call_graph.degree(&symbol.id) 才能正确匹配。
+        // add_edge_raw 内部会将 symbol_id 和 name 都设为同一个值。
         let symbols = vec![
-            make_symbol("s1", "main", Some(3)),
-            make_symbol("s2", "helper", Some(2)),
-            make_symbol("s3", "logger", Some(1)),
-            make_symbol("s4", "orphan", None), // 无预计算复杂度
-            make_symbol("s5", "Dog", Some(5)),
+            make_symbol("main", "main", Some(3)),
+            make_symbol("helper", "helper", Some(2)),
+            make_symbol("logger", "logger", Some(1)),
+            make_symbol("orphan", "orphan", None), // 无预计算复杂度
+            make_symbol("Dog", "Dog", Some(5)),
         ];
 
-        let metrics = MetricCalculator::compute_all(&symbols, &cg, &type_hierarchy);
+        let metrics = MetricCalculator::compute_all(&symbols, &cg, &type_hierarchy, None);
 
         // 验证 main
         let main = metrics.iter().find(|m| m.name == "main").unwrap();
