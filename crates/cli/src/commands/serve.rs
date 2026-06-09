@@ -1,0 +1,69 @@
+//! 启动 MCP 服务器子命令
+//!
+//! 以 stdio 模式启动 CodeConnect MCP 服务器，
+//! 读取已构建的索引并提供代码分析工具供 AI 助手调用。
+
+use std::path::Path;
+use std::sync::Arc;
+
+use codeconnect_core::config::CodeConnectConfig;
+use codeconnect_index::sled_store::SledStore;
+use codeconnect_index::tantivy_index::TantivyIndex;
+use codeconnect_mcp::server::CodeConnectServer;
+use codeconnect_mcp::tools::ToolRegistry;
+
+/// 启动 MCP stdio 服务器
+///
+/// # 参数
+///
+/// - `project_root` — 项目根目录
+/// - `data_dir` — 索引数据目录（包含 tantivy 和 sled 子目录）
+/// - `config` — CodeConnect 配置
+pub async fn run(
+    project_root: &Path,
+    data_dir: &Path,
+    config: &CodeConnectConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = config;
+    println!("CodeConnect MCP 服务器正在启动...");
+    println!("  项目根目录: {}", project_root.display());
+    println!("  数据目录:   {}", data_dir.display());
+    println!("  模式:       stdio");
+    println!();
+
+    let tantivy_dir = data_dir.join("tantivy");
+    let sled_dir = data_dir.join("sled");
+
+    // 打开或创建索引
+    let tantivy = Arc::new(
+        TantivyIndex::open_or_create(&tantivy_dir)
+            .map_err(|e| format!("无法打开 tantivy 索引: {}", e))?,
+    );
+
+    let sled = Arc::new(
+        SledStore::open(&sled_dir)
+            .map_err(|e| format!("无法打开 sled 存储: {}", e))?,
+    );
+
+    let doc_count = tantivy.doc_count().unwrap_or(0);
+    println!("已加载索引: {} 个符号文档", doc_count);
+
+    if doc_count == 0 {
+        tracing::warn!("索引为空！请先运行 `codeconnect index` 构建索引。");
+    }
+
+    // 构建工具注册表
+    let registry = ToolRegistry::new()
+        .with_sled(sled)
+        .with_tantivy(tantivy);
+
+    // 创建并启动服务器
+    let server = CodeConnectServer::new(registry);
+
+    tracing::info!("MCP 服务器已就绪，等待客户端连接...");
+
+    server.start_stdio().await
+        .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
+
+    Ok(())
+}

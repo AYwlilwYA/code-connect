@@ -1,0 +1,14 @@
+[package]
+name = "benches"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bench]]
+name = "index_bench"
+path = "index_bench.rs"
+harness = false
+
+[dependencies]
+codeconnect-core = { path = "../crates/core" }
+criterion = { workspace = true, features = ["html_reports"] }

@@ -1,0 +1,78 @@
+[workspace]
+resolver = "2"
+default-members = ["crates/cli"]
+exclude = ["tests/fixtures"]
+members = [
+    "crates/core",
+    "crates/parser",
+    "crates/index",
+    "crates/graph",
+    "crates/services",
+    "crates/diff",
+    "crates/mcp",
+    "crates/watcher",
+    "crates/cli",
+    "benches",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/user/code-connect"
+description = "高性能多语言代码分析工具 — 面向 LLM Agent 的 MCP 服务器"
+
+[workspace.dependencies]
+# === 异步 + 并发 ===
+tokio = { version = "1", features = ["full"] }
+rayon = "1"
+dashmap = "6"
+crossbeam = "0.8"
+lru = "0.12"
+
+# === 解析 ===
+tree-sitter = "0.25"
+tree-sitter-rust = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-java = "0.23"
+# tree-sitter-kotlin = { git = "https://github.com/fwcd/tree-sitter-kotlin" }  # 待后续启用
+tree-sitter-c-sharp = "0.23"
+
+# === 存储 ===
+tantivy = "0.22"
+sled = "0.34"
+
+# === 图 ===
+petgraph = "0.7"
+
+# === MCP ===
+rmcp = "0.17"
+
+# === 文件 + Git ===
+notify = { version = "8", features = ["macos_fsevent"] }
+ignore = "0.4"
+git2 = "0.19"
+
+# === 工具 ===
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+blake3 = "1"
+schemars = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+# === 测试 ===
+insta = "1"
+criterion = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,21 @@
+[package]
+name = "codeconnect-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP 服务器：rmcp 集成、工具注册、JSON Schema"
+
+[dependencies]
+codeconnect-core = { path = "../core" }
+codeconnect-services = { path = "../services" }
+codeconnect-index = { path = "../index" }
+codeconnect-graph = { path = "../graph" }
+
+rmcp.workspace = true
+tokio = { workspace = true, features = ["full"] }
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+uuid.workspace = true

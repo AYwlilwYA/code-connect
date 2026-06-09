@@ -1,0 +1,46 @@
+# CodeConnect 示例配置文件
+# 复制为 .codeconnect.toml 到项目根目录或 ~/.codeconnect/config.toml
+
+[workspace]
+# 项目根目录列表（monorepo 场景可指定多个）
+roots = ["."]
+# 排除模式（自动合并 .gitignore）
+excludes = ["node_modules", "target", ".git", "dist", "build"]
+
+[languages]
+# 启用的语言（注释掉即禁用）
+rust = true
+typescript = true
+javascript = true
+java = true
+# kotlin = true   # 待 grammar 稳定后启用
+csharp = true
+
+[index]
+# 数据目录（相对于项目根）
+data_dir = ".codeconnect"
+# 是否启用增量索引
+incremental = true
+
+[search]
+# 默认最大返回数
+max_results = 50
+
+[complexity]
+# 圈复杂度告警阈值
+warning_threshold = 10
+error_threshold = 20
+
+[dead_code]
+# 手动指定入口点（如 main 函数、HTTP 路由处理函数等）
+entry_points = []
+
+[[rules]]
+name = "no-circular-deps"
+description = "检测模块间的循环依赖"
+
+[[rules]]
+name = "layer-architecture"
+description = "分层架构约束（领域层不可依赖基础设施层）"
+layers = []
+allowed = []
