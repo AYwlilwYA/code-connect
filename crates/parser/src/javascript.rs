@@ -1,0 +1,527 @@
+//! JavaScript 语言解析器
+//!
+//! 使用 tree-sitter-javascript grammar 解析 .js/.jsx/.mjs/.cjs 文件，
+//! 提取函数、类、方法等符号定义，以及函数调用和 import/require 导入语句。
+
+use std::collections::HashSet;
+use std::path::Path;
+use std::sync::Mutex;
+
+use codeconnect_core::error::CodeConnectError;
+use codeconnect_core::symbol_id::StableSymbolId;
+use codeconnect_core::types::{
+    CallSite, CallType, Import, ImportResolution, SourceLocation, Symbol, SymbolKind,
+};
+use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
+
+use crate::query_loader::load_javascript_queries;
+use crate::r#trait::LanguageParser;
+
+/// JavaScript 语言解析器
+///
+/// 包装了 tree-sitter-javascript grammar 和一个 `Mutex<Parser>`，
+/// 确保并发调用时的线程安全。支持 JSX 语法。
+pub struct JavaScriptParser {
+    /// tree-sitter 解析器实例（Mutex 因为 Parser 不是 Sync）
+    parser: Mutex<Parser>,
+    /// JS language 对象（用于 Query::new 编译查询）
+    language: tree_sitter::Language,
+}
+
+impl JavaScriptParser {
+    /// 创建新的 JavaScript 解析器
+    pub fn new() -> Self {
+        let mut parser = Parser::new();
+        let language: tree_sitter::Language = tree_sitter::Language::new(tree_sitter_javascript::LANGUAGE);
+        parser
+            .set_language(&language)
+            .expect("加载 JavaScript tree-sitter grammar 失败");
+        Self {
+            parser: Mutex::new(parser),
+            language,
+        }
+    }
+
+    /// 将 tree-sitter 节点转为源码位置（0-based → 1-based）
+    fn node_to_location(&self, node: tree_sitter::Node, file_path: &str) -> SourceLocation {
+        let start = node.start_position();
+        let end = node.end_position();
+        SourceLocation {
+            file_path: file_path.to_string(),
+            line: start.row as u64 + 1,
+            column: start.column as u64 + 1,
+            end_line: end.row as u64 + 1,
+            end_column: end.column as u64 + 1,
+        }
+    }
+
+    /// 获取节点的源码文本（UTF-8 安全）
+    fn node_text<'a>(&self, node: tree_sitter::Node, source: &'a str) -> &'a str {
+        node.utf8_text(source.as_bytes()).unwrap_or("")
+    }
+}
+
+impl Default for JavaScriptParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LanguageParser for JavaScriptParser {
+    fn language(&self) -> &'static str {
+        "javascript"
+    }
+
+    fn file_extensions(&self) -> &[&str] {
+        &["js", "jsx", "mjs", "cjs"]
+    }
+
+    fn parse(&self, source: &str) -> Result<Tree, CodeConnectError> {
+        let mut parser = self.parser.lock().map_err(|e| CodeConnectError::Parse {
+            file: Path::new("").to_path_buf(),
+            message: format!("获取解析器锁失败: {}", e),
+        })?;
+        parser
+            .parse(source, None)
+            .ok_or_else(|| CodeConnectError::Parse {
+                file: Path::new("").to_path_buf(),
+                message: "JavaScript 源码解析失败，可能包含语法错误".to_string(),
+            })
+    }
+
+    fn extract_symbols(&self, tree: &Tree, source: &str, file_path: &Path) -> Vec<Symbol> {
+        let queries = load_javascript_queries();
+        let file_path_str = file_path.to_string_lossy().to_string();
+        let mut results = Vec::new();
+        // 用 HashSet 去重——同一个符号可能被多个 query pattern 匹配
+        let mut seen_names: HashSet<(String, String)> = HashSet::new();
+
+        // 先用查询收集所有被 export 声明的名称
+        // 注意：tree-sitter inline query 不支持复杂替代组合，分两次查询
+        let mut exported_names: HashSet<String> = HashSet::new();
+        for export_pattern in &[
+            r#"(export_statement (function_declaration name: (identifier) @export.name))"#,
+            r#"(export_statement (class_declaration name: (identifier) @export.name))"#,
+        ] {
+            if let Ok(export_query) = tree_sitter::Query::new(&self.language, export_pattern) {
+                let mut ec = QueryCursor::new();
+                let mut em = ec.matches(&export_query, tree.root_node(), source.as_bytes());
+                while let Some(m) = em.next() {
+                    for cap in m.captures {
+                        if export_query.capture_names()[cap.index as usize] == "export.name" {
+                            exported_names.insert(self.node_text(cap.node, source).to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        let query = match Query::new(&self.language, &queries.symbols) {
+            Ok(q) => q,
+            Err(_) => return results,
+        };
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+
+        while let Some(m) = matches.next() {
+            let mut name = String::new();
+            let mut kind = SymbolKind::Unknown("unknown".to_string());
+            let mut location = self.node_to_location(tree.root_node(), &file_path_str);
+            for capture in m.captures {
+                let node = capture.node;
+                let capture_name = query.capture_names()[capture.index as usize];
+
+                match capture_name {
+                    "symbol.name" => {
+                        name = self.node_text(node, source).to_string();
+                    }
+                    "symbol.function" => {
+                        kind = SymbolKind::Function;
+                        location = self.node_to_location(node, &file_path_str);
+                    }
+                    "symbol.method" => {
+                        kind = SymbolKind::Method;
+                        location = self.node_to_location(node, &file_path_str);
+                    }
+                    "symbol.class" => {
+                        kind = SymbolKind::Class;
+                        location = self.node_to_location(node, &file_path_str);
+                    }
+                    "symbol.variable" => {
+                        kind = SymbolKind::Variable;
+                        location = self.node_to_location(node, &file_path_str);
+                    }
+                    _ => {}
+                }
+            }
+
+            if name.is_empty() {
+                continue;
+            }
+
+            // 去重：同一文件中同名符号优先保留更具体的类型
+            // 函数优先于变量（箭头函数同时匹配 variable_declarator + arrow_function）
+            let kind_str = kind_to_str(&kind);
+            let dedup_key = (name.clone(), kind_str.to_string());
+            if seen_names.contains(&dedup_key) {
+                continue;
+            }
+            // 检查是否有同名的低优先级类型，如果存在则替换
+            let kind_priority = kind_priority_val(&kind);
+            let to_remove: Option<(String, String)> = seen_names
+                .iter()
+                .find(|(n, k)| *n == name && kind_priority_val_for_str(k) < kind_priority)
+                .cloned();
+            if let Some(ref key) = to_remove {
+                seen_names.remove(key);
+                results.retain(|s: &Symbol| !(s.name == name && kind_to_str(&s.kind) == key.1));
+            }
+            seen_names.insert(dedup_key);
+
+            let id = StableSymbolId::new("javascript", &file_path_str, kind_str, &name);
+
+            // 检查是否在导出列表中（通过 export_query 预收集）
+            let is_exported = exported_names.contains(&name);
+
+            // JS 中 export 关键字标记的符号为公开 API
+            let modifiers = if is_exported {
+                vec!["export".to_string()]
+            } else {
+                vec![]
+            };
+
+            results.push(Symbol {
+                id: id.to_string(),
+                name,
+                kind,
+                location,
+                signature: None,
+                doc_comment: None,
+                parent_id: None,
+                modifiers,
+                is_exported,
+                complexity: None,
+            });
+        }
+
+        results
+    }
+
+    fn extract_calls(&self, tree: &Tree, source: &str, file_path: &Path) -> Vec<CallSite> {
+        let queries = load_javascript_queries();
+        let file_path_str = file_path.to_string_lossy().to_string();
+        let mut results = Vec::new();
+
+        let query = match Query::new(&self.language, &queries.calls) {
+            Ok(q) => q,
+            Err(_) => return results,
+        };
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+
+        while let Some(m) = matches.next() {
+            let mut callee_name = String::new();
+            let mut call_type = CallType::Direct;
+            let mut location = SourceLocation {
+                file_path: file_path_str.clone(),
+                line: 0,
+                column: 0,
+                end_line: 0,
+                end_column: 0,
+            };
+
+            for capture in m.captures {
+                let node = capture.node;
+                let capture_name = query.capture_names()[capture.index as usize];
+
+                match capture_name {
+                    "call.name" => {
+                        callee_name = self.node_text(node, source).to_string();
+                    }
+                    "call" => {
+                        location = self.node_to_location(node, &file_path_str);
+                    }
+                    "call.method" => {
+                        call_type = CallType::Virtual;
+                        location = self.node_to_location(node, &file_path_str);
+                    }
+                    "call.constructor" => {
+                        call_type = CallType::Direct;
+                        location = self.node_to_location(node, &file_path_str);
+                    }
+                    _ => {}
+                }
+            }
+
+            if !callee_name.is_empty() && location.line > 0 {
+                results.push(CallSite {
+                    caller_id: String::new(),
+                    callee_name,
+                    location,
+                    call_type,
+                    confidence: 0.9,
+                });
+            }
+        }
+
+        results
+    }
+
+    fn extract_imports(&self, tree: &Tree, source: &str, file_path: &Path) -> Vec<Import> {
+        let queries = load_javascript_queries();
+        let file_path_str = file_path.to_string_lossy().to_string();
+        let mut results = Vec::new();
+
+        let query = match Query::new(&self.language, &queries.imports) {
+            Ok(q) => q,
+            Err(_) => return results,
+        };
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+
+        while let Some(m) = matches.next() {
+            let mut import_path = String::new();
+            let mut alias = None;
+            let mut match_line: u64 = 0;
+
+            for capture in m.captures {
+                let node = capture.node;
+                let capture_name = query.capture_names()[capture.index as usize];
+
+                match capture_name {
+                    "import.path" => {
+                        import_path = self.node_text(node, source).to_string();
+                    }
+                    "import.name" => {
+                        alias = Some(self.node_text(node, source).to_string());
+                    }
+                    "import.default" => {
+                        alias = Some(self.node_text(node, source).to_string());
+                    }
+                    _ => {
+                        if match_line == 0 {
+                            match_line = node.start_position().row as u64 + 1;
+                        }
+                    }
+                }
+            }
+
+            if !import_path.is_empty() {
+                results.push(Import {
+                    file_path: file_path_str.clone(),
+                    import_path,
+                    alias,
+                    line: match_line,
+                    resolution: ImportResolution::Unresolved,
+                });
+            }
+        }
+
+        results
+    }
+
+    fn infer_package(&self, file_path: &Path, _source: &str) -> Option<String> {
+        // JS 项目：从文件路径推断包名——取 src 目录的父目录名
+        let mut current = file_path.parent();
+        while let Some(dir) = current {
+            if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+                if name == "src" {
+                    current = dir.parent();
+                    continue;
+                }
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+            current = dir.parent();
+        }
+        None
+    }
+}
+
+/// 辅助函数：将 SymbolKind 转为字符串
+fn kind_to_str(kind: &SymbolKind) -> &str {
+    match kind {
+        SymbolKind::Function => "function",
+        SymbolKind::Method => "method",
+        SymbolKind::Class => "class",
+        SymbolKind::Variable => "variable",
+        _ => "unknown",
+    }
+}
+
+/// 返回 SymbolKind 的去重优先级（数值越大越优先保留）
+fn kind_priority_val(kind: &SymbolKind) -> u32 {
+    match kind {
+        SymbolKind::Function => 10,
+        SymbolKind::Method => 9,
+        SymbolKind::Class => 8,
+        SymbolKind::Variable => 1,
+        _ => 0,
+    }
+}
+
+/// 从字符串获取优先级（用于 seen_names 中的类型比较）
+fn kind_priority_val_for_str(kind_str: &str) -> u32 {
+    match kind_str {
+        "function" => 10,
+        "method" => 9,
+        "class" => 8,
+        "variable" => 1,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn parse_source(source: &str) -> (Tree, JavaScriptParser) {
+        let parser = JavaScriptParser::new();
+        let tree = parser.parse(source).expect("解析测试源码失败");
+        (tree, parser)
+    }
+
+    #[test]
+    fn test_parse_function() {
+        let source = r#"
+function greet(name) {
+    return `Hello, ${name}`;
+}
+"#;
+        let (tree, parser) = parse_source(source);
+        let symbols = parser.extract_symbols(&tree, source, Path::new("test.js"));
+        let func = symbols.iter().find(|s| s.name == "greet");
+        assert!(func.is_some(), "应找到 greet 函数");
+        assert_eq!(func.unwrap().kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_parse_class() {
+        let source = r#"
+class Person {
+    constructor(name) {
+        this.name = name;
+    }
+    greet() {
+        return `Hi, I'm ${this.name}`;
+    }
+}
+"#;
+        let (tree, parser) = parse_source(source);
+        let symbols = parser.extract_symbols(&tree, source, Path::new("test.js"));
+        let cls = symbols.iter().find(|s| s.name == "Person");
+        assert!(cls.is_some(), "应找到 Person 类");
+        assert_eq!(cls.unwrap().kind, SymbolKind::Class);
+    }
+
+    #[test]
+    fn test_parse_arrow_function() {
+        let source = r#"
+const add = (a, b) => a + b;
+"#;
+        let (tree, parser) = parse_source(source);
+        let symbols = parser.extract_symbols(&tree, source, Path::new("test.js"));
+        let func = symbols.iter().find(|s| s.name == "add");
+        assert!(func.is_some(), "应找到 add 箭头函数");
+        assert_eq!(func.unwrap().kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_parse_function_calls() {
+        let source = r#"
+function main() {
+    foo();
+    bar.baz();
+    new Person("Alice");
+}
+"#;
+        let (tree, parser) = parse_source(source);
+        let calls = parser.extract_calls(&tree, source, Path::new("test.js"));
+        let foo_call = calls.iter().find(|c| c.callee_name == "foo");
+        let baz_call = calls.iter().find(|c| c.callee_name == "baz");
+        let person_call = calls.iter().find(|c| c.callee_name == "Person");
+        assert!(foo_call.is_some(), "应有 foo 调用");
+        assert!(baz_call.is_some(), "应有 baz 方法调用");
+        assert!(person_call.is_some(), "应有 Person 构造调用");
+    }
+
+    #[test]
+    fn test_parse_imports() {
+        let source = r#"
+import { AuthService } from "./auth";
+import * as utils from "./utils";
+"#;
+        let (tree, parser) = parse_source(source);
+        let imports = parser.extract_imports(&tree, source, Path::new("test.js"));
+        assert!(!imports.is_empty(), "应有导入语句");
+        let auth_import = imports.iter().find(|i| i.import_path == "./auth");
+        assert!(auth_import.is_some(), "应有 ./auth 导入");
+    }
+
+    #[test]
+    fn test_parse_require() {
+        let source = r#"
+const fs = require("fs");
+const path = require("path");
+"#;
+        let (tree, parser) = parse_source(source);
+        let imports = parser.extract_imports(&tree, source, Path::new("test.js"));
+        let fs_import = imports.iter().find(|i| i.import_path == "fs");
+        let path_import = imports.iter().find(|i| i.import_path == "path");
+        assert!(fs_import.is_some(), "应有 fs 导入");
+        assert!(path_import.is_some(), "应有 path 导入");
+    }
+
+    #[test]
+    fn test_parse_export() {
+        let source = r#"
+export function greet(name) {
+    return `Hello, ${name}`;
+}
+"#;
+        let (tree, parser) = parse_source(source);
+        let symbols = parser.extract_symbols(&tree, source, Path::new("test.js"));
+        let func = symbols.iter().find(|s| s.name == "greet");
+        assert!(func.is_some(), "应找到 greet 函数");
+        assert!(func.unwrap().is_exported, "greet 应标记为导出");
+    }
+
+    #[test]
+    fn test_language_name() {
+        let parser = JavaScriptParser::new();
+        assert_eq!(parser.language(), "javascript");
+    }
+
+    #[test]
+    fn test_file_extensions() {
+        let parser = JavaScriptParser::new();
+        assert_eq!(parser.file_extensions(), &["js", "jsx", "mjs", "cjs"]);
+    }
+
+    #[test]
+    fn test_parse_empty_file() {
+        let source = "";
+        let parser = JavaScriptParser::new();
+        let result = parser.parse(source);
+        // JS 空文件通常也会产生一个有效的树（包含 ERROR 节点但不会返回 None）
+        // 具体行为取决于 tree-sitter-javascript 的实现
+        if let Ok(tree) = result {
+            let symbols = parser.extract_symbols(&tree, source, Path::new("test.js"));
+            assert!(symbols.is_empty(), "空文件应无符号");
+        }
+    }
+
+    #[test]
+    fn test_infer_package() {
+        let parser = JavaScriptParser::new();
+        let path = PathBuf::from("/home/user/projects/my-app/src/index.js");
+        let pkg = parser.infer_package(&path, "");
+        assert_eq!(pkg, Some("my-app".to_string()));
+    }
+
+}

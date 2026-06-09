@@ -1,0 +1,26 @@
+[package]
+name = "codeconnect-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI 入口：索引、搜索、分析、MCP 服务启动"
+
+[[bin]]
+name = "codeconnect"
+path = "src/main.rs"
+
+[dependencies]
+codeconnect-core = { path = "../core" }
+codeconnect-index = { path = "../index" }
+codeconnect-mcp = { path = "../mcp" }
+codeconnect-services = { path = "../services" }
+codeconnect-watcher = { path = "../watcher" }
+codeconnect-graph = { path = "../graph" }
+codeconnect-parser = { path = "../parser" }
+
+clap.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true

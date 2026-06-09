@@ -1,0 +1,19 @@
+[package]
+name = "codeconnect-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "图分析模块：调用图、依赖图、类型层次、循环检测、LRU 缓存"
+
+[dependencies]
+codeconnect-core = { path = "../core" }
+codeconnect-index = { path = "../index" }
+
+petgraph.workspace = true
+lru.workspace = true
+sled.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true

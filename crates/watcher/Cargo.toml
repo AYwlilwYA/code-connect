@@ -1,0 +1,16 @@
+[package]
+name = "codeconnect-watcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "文件监控模块：notify 文件变更检测、debounce、批量处理"
+
+[dependencies]
+codeconnect-core = { path = "../core" }
+
+notify.workspace = true
+ignore.workspace = true
+tokio = { workspace = true, features = ["sync", "fs", "rt"] }
+crossbeam.workspace = true
+tracing.workspace = true
+thiserror.workspace = true

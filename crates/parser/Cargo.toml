@@ -1,0 +1,24 @@
+[package]
+name = "codeconnect-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "多语言 tree-sitter 解析器：Rust/TypeScript/Java/Kotlin/C#"
+
+[dependencies]
+codeconnect-core = { path = "../core" }
+
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-java.workspace = true
+# tree-sitter-kotlin.workspace = true
+tree-sitter-c-sharp.workspace = true
+
+rayon.workspace = true
+serde.workspace = true
+tracing.workspace = true
+streaming-iterator = "0.1"
+anyhow.workspace = true
+thiserror.workspace = true

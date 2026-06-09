@@ -1,0 +1,98 @@
+//! 快速符号搜索子命令
+//!
+//! 通过 tantivy 全文索引按名称搜索符号，
+//! 返回匹配符号的位置和类型信息。
+
+use std::path::Path;
+
+use codeconnect_index::sled_store::SledStore;
+use codeconnect_index::tantivy_index::TantivyIndex;
+use codeconnect_core::types::Symbol;
+
+/// 执行符号搜索
+///
+/// # 参数
+///
+/// - `project_root` — 项目根目录
+/// - `data_dir` — 索引数据目录
+/// - `query` — 搜索查询字符串
+/// - `limit` — 最大结果数
+/// - `language` — 语言过滤（可选）
+/// - `kind` — 符号类型过滤（可选）
+pub async fn run(
+    project_root: &Path,
+    data_dir: &Path,
+    query: &str,
+    limit: usize,
+    language: Option<String>,
+    kind: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = project_root;
+
+    let tantivy_dir = data_dir.join("tantivy");
+    let sled_dir = data_dir.join("sled");
+
+    let tantivy = TantivyIndex::open_or_create(&tantivy_dir)
+        .map_err(|e| format!("无法打开 tantivy 索引: {}", e))?;
+    let sled = SledStore::open(&sled_dir)
+        .map_err(|e| format!("无法打开 sled 存储: {}", e))?;
+
+    // 搜索符号
+    let search_results = tantivy
+        .search_by_name(query, limit)
+        .map_err(|e| format!("搜索失败: {}", e))?;
+
+    if search_results.is_empty() {
+        println!("未找到匹配 '{}' 的符号", query);
+        return Ok(());
+    }
+
+    println!("搜索 '{}' 结果 (最多 {} 条):", query, limit);
+    println!("{0:-<80}", "");
+
+    let mut shown = 0;
+    for result in &search_results {
+        // 语言过滤
+        if let Some(ref lang) = language {
+            let symbol_lang = result.stable_id.split("::").next().unwrap_or("");
+            if symbol_lang != lang.as_str() {
+                continue;
+            }
+        }
+
+        // 类型过滤
+        if let Some(ref kind_filter) = kind {
+            if result.kind != *kind_filter {
+                continue;
+            }
+        }
+
+        // 从 sled 获取完整符号信息
+        if let Ok(Some(bytes)) = sled.get_symbol(&result.stable_id) {
+            if let Ok(symbol) = serde_json::from_slice::<Symbol>(&bytes) {
+                println!(
+                    "  {}  [{}]  (相关度: {:.2})",
+                    symbol.name, result.kind, result.score
+                );
+                println!(
+                    "    文件: {}:{}",
+                    symbol.location.file_path, symbol.location.line
+                );
+                if let Some(ref sig) = symbol.signature {
+                    println!("    签名: {}", sig);
+                }
+                println!();
+                shown += 1;
+            }
+        }
+    }
+
+    if shown == 0 {
+        println!("未找到匹配的符号（已应用过滤条件）");
+    } else {
+        println!("{0:-<80}", "");
+        println!("共显示 {} 条结果", shown);
+    }
+
+    Ok(())
+}
