@@ -43,11 +43,11 @@ impl JavaParser {
     }
 
     /// 将 tree-sitter 节点转为源码位置（0-based → 1-based）
-    fn node_to_location(&self, node: tree_sitter::Node) -> SourceLocation {
+    fn node_to_location(&self, node: tree_sitter::Node, file_path: &str) -> SourceLocation {
         let start = node.start_position();
         let end = node.end_position();
         SourceLocation {
-            file_path: String::new(), // 由外部调用者填充
+            file_path: file_path.to_string(),
             line: start.row as u64 + 1,
             column: start.column as u64 + 1,
             end_line: end.row as u64 + 1,
@@ -123,31 +123,31 @@ impl LanguageParser for JavaParser {
                     }
                     "symbol.class" => {
                         kind = SymbolKind::Class;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.interface" => {
                         kind = SymbolKind::Interface;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.enum" => {
                         kind = SymbolKind::Enum;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.method" => {
                         kind = SymbolKind::Method;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.constructor" => {
                         kind = SymbolKind::Method; // 构造函数归类为 Method，通过 name 区分
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.field" => {
                         kind = SymbolKind::Field;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.annotation" => {
                         kind = SymbolKind::Interface; // 注解本质是特殊的接口
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     _ => {}
                 }
@@ -237,17 +237,17 @@ impl LanguageParser for JavaParser {
                         callee_name = self.node_text(node, source).to_string();
                     }
                     "call" => {
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                         capture_kind = "call";
                     }
                     "call.method" => {
                         call_type = CallType::Virtual;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                         capture_kind = "call.method";
                     }
                     "call.constructor" => {
                         call_type = CallType::Direct;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                         capture_kind = "call.constructor";
                     }
                     _ => {}

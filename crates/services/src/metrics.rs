@@ -3,6 +3,8 @@
 //! 封装 [`MetricCalculator`]，提供单个符号的圈复杂度计算和
 //! 批量代码质量指标统计。此模块是 graph::metrics 的薄封装。
 
+use std::collections::HashMap;
+
 use codeconnect_core::types::Symbol;
 use codeconnect_graph::call_graph::CallGraph;
 use codeconnect_graph::metrics::{CodeMetrics, MetricCalculator};
@@ -32,7 +34,7 @@ impl MetricsService {
     /// 批量计算所有符号的代码质量指标
     ///
     /// 对每个符号计算：
-    /// - 圈复杂度（来自预计算值或默认 1）
+    /// - 圈复杂度（来自预计算值或回退文本扫描）
     /// - fan_in（入度，被调用次数）
     /// - fan_out（出度，调用次数）
     /// - 继承深度（类型层次中的祖先数量）
@@ -41,6 +43,7 @@ impl MetricsService {
     /// - `symbols` — 符号列表
     /// - `call_graph` — 调用图（用于计算出入度）
     /// - `type_hierarchy` — 类型层次图（用于计算继承深度）
+    /// - `source_cache` — 可选的文件路径→源码内容映射，用于复杂度回退计算
     ///
     /// # 返回
     /// 每个符号的完整代码质量指标列表。
@@ -48,8 +51,9 @@ impl MetricsService {
         symbols: &[Symbol],
         call_graph: &CallGraph,
         type_hierarchy: &TypeHierarchy,
+        source_cache: Option<&HashMap<String, String>>,
     ) -> Vec<CodeMetrics> {
-        MetricCalculator::compute_all(symbols, call_graph, type_hierarchy)
+        MetricCalculator::compute_all(symbols, call_graph, type_hierarchy, source_cache)
     }
 }
 
@@ -59,9 +63,10 @@ mod tests {
     use codeconnect_core::types::{SourceLocation, SymbolKind};
 
     /// 创建测试用 Symbol
+    /// 注意：id 与 name 保持一致，以便在调用图中按 id 查找节点
     fn make_symbol(name: &str, complexity: Option<u64>) -> Symbol {
         Symbol {
-            id: format!("id_{}", name),
+            id: name.to_string(),
             name: name.to_string(),
             kind: SymbolKind::Function,
             location: SourceLocation {
@@ -118,7 +123,7 @@ mod tests {
         let call_graph = CallGraph::new();
         let type_hierarchy = TypeHierarchy::new();
 
-        let metrics = MetricsService::compute_all(&symbols, &call_graph, &type_hierarchy);
+        let metrics = MetricsService::compute_all(&symbols, &call_graph, &type_hierarchy, None);
         assert!(metrics.is_empty());
     }
 
@@ -134,7 +139,7 @@ mod tests {
 
         let type_hierarchy = TypeHierarchy::new();
 
-        let metrics = MetricsService::compute_all(&symbols, &call_graph, &type_hierarchy);
+        let metrics = MetricsService::compute_all(&symbols, &call_graph, &type_hierarchy, None);
         assert_eq!(metrics.len(), 2);
 
         let main = metrics.iter().find(|m| m.name == "main").unwrap();
@@ -143,7 +148,7 @@ mod tests {
         assert_eq!(main.fan_in, 0);
 
         let helper = metrics.iter().find(|m| m.name == "helper").unwrap();
-        assert_eq!(helper.cyclomatic_complexity, 1); // 默认值
+        assert_eq!(helper.cyclomatic_complexity, 1); // 默认值（无源码缓存）
         assert_eq!(helper.fan_in, 1); // 被 main 调用
         assert_eq!(helper.fan_out, 0);
     }

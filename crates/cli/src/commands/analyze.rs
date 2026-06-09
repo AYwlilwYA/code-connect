@@ -2,6 +2,7 @@
 //!
 //! 执行代码质量分析：圈复杂度、死代码检测、架构规则验证等。
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use codeconnect_core::types::Symbol;
@@ -60,7 +61,25 @@ pub async fn run(
             println!("  圈复杂度分析（Top 10）");
             println!("═══════════════════════════════════════════");
 
-            let metrics = MetricCalculator::compute_all(&all_symbols, &call_graph, &type_hierarchy);
+            // 构建源码缓存：收集所有符号涉及到的唯一文件路径，读取源码
+            // 用于复杂度回退计算（当解析器未预计算 complexity 时）
+            let mut source_cache: HashMap<String, String> = HashMap::new();
+            for sym in &all_symbols {
+                let fp = &sym.location.file_path;
+                if !source_cache.contains_key(fp) {
+                    let full_path = project_root.join(fp);
+                    if let Ok(content) = std::fs::read_to_string(&full_path) {
+                        source_cache.insert(fp.clone(), content);
+                    }
+                }
+            }
+
+            let metrics = MetricCalculator::compute_all(
+                &all_symbols,
+                &call_graph,
+                &type_hierarchy,
+                Some(&source_cache),
+            );
 
             let mut sorted: Vec<_> = metrics.iter().collect();
             sorted.sort_by(|a, b| b.cyclomatic_complexity.cmp(&a.cyclomatic_complexity));
@@ -115,14 +134,54 @@ pub async fn run(
     // 死代码检测（第二个阶段，在 complexity 结果之后按条件运行）
     if analyze_type == "deadcode" || analyze_type == "all" {
             // 死代码检测
+            use codeconnect_core::types::SymbolKind;
             println!("═══════════════════════════════════════════");
             println!("  死代码检测");
             println!("═══════════════════════════════════════════");
 
-            let all_names: Vec<String> = all_symbols.iter().map(|s| s.name.clone()).collect();
-            let entries = vec!["main".to_string()];
+            // 只对可调用的符号检测死代码（Function / Method），
+            // 排除 Field、Variable、Parameter、Struct 字段等不可调用符号，
+            // 因为调用图中没有这些符号的边，它们会被错误标记为死代码
+            let callable_symbols: Vec<&Symbol> = all_symbols
+                .iter()
+                .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
+                .collect();
 
-            let dead = MetricCalculator::detect_dead_code(&all_names, &call_graph, &entries);
+            // 使用符号稳定 ID 构建符号列表
+            let all_symbol_ids: Vec<String> = callable_symbols
+                .iter()
+                .map(|s| s.id.clone())
+                .collect();
+
+            // 构建 id → name 映射，用于后续显示
+            let id_to_name: std::collections::HashMap<String, String> = callable_symbols
+                .iter()
+                .map(|s| (s.id.clone(), s.name.clone()))
+                .collect();
+
+            // 入口点：
+            // 1. 所有名为 "main" 的函数
+            // 2. 所有 is_exported 的可调用符号（pub 函数/方法）
+            let mut entries: Vec<String> = callable_symbols
+                .iter()
+                .filter(|s| s.name == "main" || s.is_exported)
+                .map(|s| s.id.clone())
+                .collect();
+
+            // 如果没有找到任何入口点，回退：
+            // 取所有 callable 符号中第一个作为入口点
+            if entries.is_empty() {
+                entries = callable_symbols
+                    .first()
+                    .map(|s| vec![s.id.clone()])
+                    .unwrap_or_default();
+            }
+
+            println!("  可调用符号数: {}", callable_symbols.len());
+            println!("  入口点数: {}", entries.len());
+            println!();
+
+            let dead = MetricCalculator::detect_dead_code(&all_symbol_ids, &call_graph, &entries);
 
             if dead.is_empty() {
                 println!("  未检测到死代码");
@@ -135,16 +194,18 @@ pub async fn run(
                     } else {
                         "低"
                     };
+                    // 用 id_to_name 映射将 StableSymbolId 反查为原始名称
+                    let display_name = id_to_name.get(&d.name).cloned().unwrap_or_else(|| d.name.clone());
                     println!(
                         "  {} — 置信度: {} ({:.0}%)",
-                        d.name,
+                        display_name,
                         confidence_str,
                         d.confidence * 100.0
                     );
                     println!("    {}", d.reason);
                 }
                 println!();
-                println!("  共 {} 个可疑死代码条目", dead.len());
+                println!("  共 {} 个可疑死代码条目（仅函数/方法）", dead.len());
             }
             println!();
     }

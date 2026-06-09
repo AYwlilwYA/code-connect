@@ -57,11 +57,11 @@ impl CSharpParser {
     }
 
     /// 将 tree-sitter 节点转为源码位置（0-based → 1-based）
-    fn node_to_location(&self, node: tree_sitter::Node) -> SourceLocation {
+    fn node_to_location(&self, node: tree_sitter::Node, file_path: &str) -> SourceLocation {
         let start = node.start_position();
         let end = node.end_position();
         SourceLocation {
-            file_path: String::new(), // 由外部调用者填充
+            file_path: file_path.to_string(),
             line: start.row as u64 + 1,
             column: start.column as u64 + 1,
             end_line: end.row as u64 + 1,
@@ -167,31 +167,31 @@ impl LanguageParser for CSharpParser {
                     }
                     "symbol.class" => {
                         kind = SymbolKind::Class;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.interface" => {
                         kind = SymbolKind::Interface;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.struct" => {
                         kind = SymbolKind::Struct;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.enum" => {
                         kind = SymbolKind::Enum;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.method" => {
                         kind = SymbolKind::Method;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.property" => {
                         kind = SymbolKind::Unknown("property".to_string());
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.field" => {
                         kind = SymbolKind::Field;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                         // 字段声明没有 name 字段，从 variable_declaration 内部提取名称
                         // variable_declaration 结构: (predefined_type, variable_declarator(name: identifier))
                         if name.is_empty() {
@@ -207,7 +207,7 @@ impl LanguageParser for CSharpParser {
                     }
                     "symbol.namespace" => {
                         kind = SymbolKind::Module;
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     // 方法声明的参数和返回类型仅用于标记，不单独处理
                     "symbol.parameters" | "symbol.return_type" | "symbol.type" => {}
@@ -287,15 +287,15 @@ impl LanguageParser for CSharpParser {
                         callee_name = self.node_text(node, source).to_string();
                     }
                     "call" => {
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                         call_type = CallType::Direct;
                     }
                     "call.method" => {
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                         call_type = CallType::Virtual;
                     }
                     "call.constructor" => {
-                        location = self.node_to_location(node);
+                        location = self.node_to_location(node, &file_path_str);
                         call_type = CallType::Direct;
                     }
                     // 参数列表仅用于标记，不单独处理
