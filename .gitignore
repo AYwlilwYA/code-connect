@@ -15,6 +15,21 @@
 # OS
 .DS_Store
 Thumbs.db
+*~
+
+# 敏感信息
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials*
+
+# 临时文件
+*.log
+*.tmp
 
 # Claude Code 本地配置（含权限密钥，不应提交）
 .claude/settings.local.json
