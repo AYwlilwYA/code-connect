@@ -13,6 +13,8 @@ pub mod query_loader;
 pub mod r#trait;
 
 // 语言解析器
+pub mod c;
+pub mod cpp;
 pub mod csharp;
 pub mod java;
 pub mod javascript;

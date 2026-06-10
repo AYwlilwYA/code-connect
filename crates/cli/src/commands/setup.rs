@@ -114,19 +114,17 @@ fn setup_project(
     Ok(())
 }
 
-/// 全局配置 — 写入 `~/.claude.json` 顶层 `mcpServers`
+/// 全局配置 — 写入 `~/.claude.json` 顶层 `mcpServers`，并尝试添加到 PATH
 fn setup_global(current_exe: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let home_dir = dirs::home_dir().ok_or("无法获取用户主目录")?;
     let claude_json_path = home_dir.join(".claude.json");
 
-    let exe_path = current_exe
-        .to_str()
-        .ok_or("无法将可执行文件路径转换为 UTF-8 字符串")?
-        .to_string();
+    // 自动添加到 PATH
+    add_to_path(current_exe);
 
     let server_config = serde_json::json!({
         "type": "stdio",
-        "command": exe_path,
+        "command": "codeconnect",
         "args": ["serve"]
     });
 
@@ -176,8 +174,73 @@ fn setup_global(current_exe: &Path) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("无法写入 {}: {}", claude_json_path.display(), e))?;
 
     eprintln!("✓ 全局 MCP 配置已写入: {}", claude_json_path.display());
-    eprintln!("  命令:  \"{}\"", exe_path);
+    eprintln!("  命令:  codeconnect");
     eprintln!("  参数:  serve");
 
     Ok(())
+}
+
+/// 尝试将当前 exe 所在目录添加到系统 PATH（Windows）
+fn add_to_path(current_exe: &Path) {
+    #[cfg(target_os = "windows")]
+    {
+        let Some(parent) = current_exe.parent() else { return };
+        let Some(dir) = parent.to_str() else { return };
+        let dir = dir.replace("/", "\\");
+
+        // 用 PowerShell 永久添加到用户 PATH
+        let script = format!(
+            r#"[Environment]::SetEnvironmentVariable('PATH', ([Environment]::GetEnvironmentVariable('PATH', 'User') + ';{}'), 'User')"#,
+            dir
+        );
+
+        match std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                eprintln!("✓ 已将 {} 添加到用户 PATH", dir);
+                eprintln!("  重新打开终端后 codeconnect 命令即可全局使用");
+            }
+            Ok(_) => {
+                eprintln!("⚠ 添加 PATH 失败，请手动将以下路径添加到 PATH:");
+                eprintln!("  {}", dir);
+            }
+            Err(_) => {
+                eprintln!("⚠ 无法自动添加 PATH，请手动添加以下路径:");
+                eprintln!("  {}", dir);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let Some(parent) = current_exe.parent() else { return };
+        let Some(dir) = parent.to_str() else { return };
+
+        let bashrc = dirs::home_dir()
+            .map(|h| h.join(".bashrc"))
+            .unwrap_or_default();
+        let export_line = format!("\nexport PATH=\"$PATH:{}\" # codeconnect\n", dir);
+
+        match std::fs::read_to_string(&bashrc) {
+            Ok(content) if content.contains(&export_line.trim()) => {
+                eprintln!("✓ PATH 已包含: {}", dir);
+            }
+            Ok(mut content) => {
+                if let Err(e) = std::fs::write(&bashrc, format!("{}{}", content, export_line)) {
+                    eprintln!("⚠ 写入 .bashrc 失败: {}", e);
+                } else {
+                    eprintln!("✓ 已将 {} 添加到 ~/.bashrc 的 PATH", dir);
+                }
+            }
+            Err(_) => {
+                if let Err(e) = std::fs::write(&bashrc, export_line) {
+                    eprintln!("⚠ 写入 .bashrc 失败: {}", e);
+                } else {
+                    eprintln!("✓ 已将 {} 添加到 ~/.bashrc 的 PATH", dir);
+                }
+            }
+        }
+    }
 }

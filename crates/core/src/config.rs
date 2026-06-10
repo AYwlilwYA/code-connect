@@ -124,6 +124,14 @@ pub struct LanguagesConfig {
     /// C# 语言支持
     #[serde(default)]
     pub csharp: bool,
+
+    /// C 语言支持
+    #[serde(default = "default_true")]
+    pub c: bool,
+
+    /// C++ 语言支持
+    #[serde(default = "default_true")]
+    pub cpp: bool,
 }
 
 fn default_true() -> bool {
@@ -139,6 +147,8 @@ impl Default for LanguagesConfig {
             java: true,
             kotlin: false,
             csharp: true,
+            c: true,
+            cpp: true,
         }
     }
 }
@@ -343,6 +353,8 @@ fn merge_configs(base: &mut CodeConnectConfig, overlay: CodeConnectConfig) {
     base.languages.java = overlay.languages.java;
     base.languages.kotlin = overlay.languages.kotlin;
     base.languages.csharp = overlay.languages.csharp;
+    base.languages.c = overlay.languages.c;
+    base.languages.cpp = overlay.languages.cpp;
 
     // 索引配置
     if overlay.index.data_dir != default_data_dir() {
@@ -415,6 +427,8 @@ mod tests {
         assert!(config.java);
         assert!(!config.kotlin);
         assert!(config.csharp);
+        assert!(config.c);
+        assert!(config.cpp);
     }
 
     #[test]
