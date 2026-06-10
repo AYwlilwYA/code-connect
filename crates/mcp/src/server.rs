@@ -202,7 +202,12 @@ impl CodeConnectServer {
     }
 
     /// 架构规则验证 — 验证自定义架构规则
-    #[rmcp::tool(description = "验证指定的架构规则，检测层间依赖违规和层次隔离破坏")]
+    ///
+    /// 注意：依赖图底层 `ArchQuery.check_rules()` 逻辑已就绪，
+    /// 但当前 MCP 参数仅接受 `rule_names`（名称列表），不含
+    /// `source_pattern`/`target_pattern`/`rule_type` 等完整规则定义，
+    /// 因此尚无法执行规则验证。待 API 参数扩展后启用。
+    #[rmcp::tool(description = "验证依赖图结构，检测循环依赖。注意：完整规则验证需参数接口扩展后启用")]
     #[allow(clippy::needless_pass_by_value)]
     async fn check_arch_rules(
         &self,
@@ -213,8 +218,11 @@ impl CodeConnectServer {
     }
 
     /// 语义搜索 — 基于自然语言描述搜索符号
+    ///
+    /// 注意：当前实现回退为 `search_by_name`（名称匹配），
+    /// 尚未接入真正的语义向量搜索。待 embedding 索引完成后启用。
     #[rmcp::tool(
-        description = "基于自然语言描述在符号名称、签名和文档注释中进行语义匹配搜索"
+        description = "基于自然语言描述搜索符号。注意：当前为名称匹配模式，语义搜索开发中"
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn semantic_search(
@@ -247,7 +255,7 @@ impl CodeConnectServer {
         &self,
         Parameters(params): Parameters<ReindexParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let response = tools::handle_reindex(&self.registry, params);
+        let response = tools::handle_reindex(&self.registry, params).await;
         response_to_call_tool_result(response)
     }
 

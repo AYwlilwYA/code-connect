@@ -126,10 +126,13 @@ enum Commands {
 #[tokio::main]
 async fn main() {
     // 初始化日志系统（输出到 stderr，避免干扰 MCP stdio 协议）
+    // debug 构建默认 info，release 构建默认 warn（可通过 RUST_LOG 环境变量覆盖）
+    let default_level = if cfg!(debug_assertions) { "info" } else { "warn" };
     fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(default_level)),
         )
         .init();
 
