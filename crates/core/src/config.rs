@@ -136,9 +136,9 @@ impl Default for LanguagesConfig {
             rust: true,
             typescript: true,
             javascript: true,
-            java: false,
+            java: true,
             kotlin: false,
-            csharp: false,
+            csharp: true,
         }
     }
 }
@@ -397,7 +397,7 @@ mod tests {
         let config = CodeConnectConfig::default();
         assert_eq!(config.workspace.roots.len(), 1);
         assert!(config.languages.rust);
-        assert!(!config.languages.java);
+        assert!(config.languages.java);
         assert!(config.index.incremental);
         assert_eq!(config.search.max_results, 100);
         assert_eq!(config.complexity.warning_threshold, 15);
@@ -412,9 +412,9 @@ mod tests {
         assert!(config.rust);
         assert!(config.typescript);
         assert!(config.javascript);
-        assert!(!config.java);
+        assert!(config.java);
         assert!(!config.kotlin);
-        assert!(!config.csharp);
+        assert!(config.csharp);
     }
 
     #[test]
