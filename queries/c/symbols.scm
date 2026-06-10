@@ -22,5 +22,13 @@
   name: (identifier) @name
   value: (preproc_arg) @value) @macro
 
-(typedef
-  declarator: (type_identifier) @name) @typedef
+(preproc_function_def
+  name: (identifier) @name
+  parameters: (preproc_params) @params
+  value: (preproc_arg) @value) @macro
+
+(type_definition
+  declarator: (type_identifier) @name) @type_definition
+
+(type_definition
+  declarator: (primitive_type) @name) @type_definition

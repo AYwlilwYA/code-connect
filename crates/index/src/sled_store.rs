@@ -42,7 +42,13 @@ impl SledStore {
     /// # 参数
     /// - `path` — 数据库目录路径，目录不存在时会自动创建
     pub fn open(path: &Path) -> Result<Self, CodeConnectError> {
-        let db = sled::open(path)
+        let config = sled::Config::new()
+            .path(path)
+            .use_compression(true)
+            .cache_capacity(64 * 1024 * 1024) // 64MB 缓存
+            .mode(sled::Mode::HighThroughput);
+        let db = config
+            .open()
             .map_err(|e| CodeConnectError::Index(format!("无法打开 sled: {}", e)))?;
         Ok(Self { db })
     }
