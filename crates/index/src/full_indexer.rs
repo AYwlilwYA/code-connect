@@ -365,14 +365,10 @@ impl FullIndexer {
         let mut file_symbol_ids: Vec<String> = Vec::with_capacity(parsed.symbols.len());
 
         // ---- 写入每个符号定义 ----
+        // 注意：符号数据只存入 tantivy 全文索引（Schema 中所有字段均为 STORED）。
+        // sled 不再冗余存储符号定义，避免磁盘膨胀（sled 是 append-only）。
         for symbol in &parsed.symbols {
             file_symbol_ids.push(symbol.id.clone());
-
-            let sym_bytes = serde_json::to_vec(symbol)
-                .map_err(|e| CodeConnectError::Index(format!("序列化符号失败: {}", e)))?;
-            self.sled.put_symbol(&symbol.id, &sym_bytes)?;
-
-            // ---- 写入 tantivy 全文索引 ----
             Self::add_symbol_to_tantivy(&self.tantivy, symbol, parsed, file_path_str)?;
         }
 
@@ -509,6 +505,10 @@ impl FullIndexer {
             symbol.complexity.unwrap_or(0),
             "", // ast_hash — 暂不在此阶段计算
             symbol.is_exported,
+            symbol.location.line,
+            symbol.location.column,
+            symbol.location.end_line,
+            symbol.location.end_column,
         )
     }
 }

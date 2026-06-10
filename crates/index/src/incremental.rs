@@ -226,20 +226,10 @@ impl IncrementalIndexer {
 
     /// 从索引中移除文件的所有关联数据
     ///
-    /// 包括：文件元信息、符号定义、文件→符号映射、文件指纹。
+    /// 包括：文件元信息、文件→符号映射、文件指纹。
+    /// 符号定义存储在 tantivy 中，需要全量重建才能清理（tantivy 不支持按 ID 删除）。
     /// 通常在文件被删除或即将重索引前调用。
     fn remove_file_from_index(&self, relative_path: &str) -> Result<(), CodeConnectError> {
-        // 获取文件内所有符号 ID
-        if let Ok(Some(bytes)) = self.sled.get_file_symbols(relative_path) {
-            let symbol_ids: Vec<String> =
-                serde_json::from_slice(&bytes).unwrap_or_default();
-
-            // 删除每个符号的定义
-            for sid in &symbol_ids {
-                let _ = self.sled.delete_symbol(sid);
-            }
-        }
-
         // 删除文件→符号映射
         let _ = self.sled.remove_file_symbols(relative_path);
 
@@ -283,15 +273,10 @@ impl IncrementalIndexer {
         let mut file_symbol_ids: Vec<String> = Vec::with_capacity(symbols.len());
 
         // ---- 写入每个符号定义 ----
+        // 符号数据只存入 tantivy，sled 不再冗余存储。
         for symbol in symbols {
             file_symbol_ids.push(symbol.id.clone());
-
-            let sym_bytes = serde_json::to_vec(symbol)
-                .map_err(|e| CodeConnectError::Index(format!("序列化符号失败: {}", e)))?;
-            self.sled.put_symbol(&symbol.id, &sym_bytes)?;
-
-            // 写入 tantivy 全文索引
-           Self::add_symbol_to_tantivy(&self.tantivy, symbol, language, relative_path)?;
+            Self::add_symbol_to_tantivy(&self.tantivy, symbol, language, relative_path)?;
         }
 
         // ---- 写入文件→符号映射 ----
@@ -348,6 +333,10 @@ impl IncrementalIndexer {
             symbol.complexity.unwrap_or(0),
             "",
             symbol.is_exported,
+            symbol.location.line,
+            symbol.location.column,
+            symbol.location.end_line,
+            symbol.location.end_column,
         )
     }
 }
