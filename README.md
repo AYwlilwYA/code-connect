@@ -21,7 +21,7 @@
 
 > Kotlin 支持待其 tree-sitter grammar 稳定后启用。
 
-## 安装方法
+## 编译安装方法
 
 ### 前置要求
 
@@ -58,7 +58,43 @@ setx PATH "%PATH%;F:\_other\code-connect\target\release"
 sudo cp target/release/code-connect /usr/local/bin/
 ```
 
-## 快速开始
+
+## CLI 命令参考
+
+| 子命令 | 说明 |
+|--------|------|
+| `serve` | 启动 MCP 服务器（stdio 模式），供 AI 助手直接调用 |
+| `index` | 遍历项目目录，解析源文件并构建全文索引 |
+| `search <query>` | 按名称搜索符号，返回位置、类型和签名信息 |
+| `analyze` | 离线分析：圈复杂度、死代码检测、指标统计等 |
+| `status` | 查看索引状态：文档数、存储占用、各语言分布 |
+| `check-rules` | 架构规则验证：层依赖、循环依赖等，退出码反馈结果 |
+
+所有命令均支持 `-p <路径>` 指定项目根目录。
+
+## 接入 AI 工具（MCP 配置）
+
+CodeConnect 支持接入任何遵循 MCP（Model Context Protocol）的 AI 编程助手，包括 **Claude Code**、**Claude Desktop**、**VS Code / Cursor** 等。
+
+📖 **完整配置教程请参见：[docs/mcp-setup.md](docs/mcp-setup.md)**
+
+### 快速上手
+
+``全局配置``
+
+```bash
+codeconnect mcp-setup --global
+```
+
+``局部配置``
+
+```bash
+codeconnect mcp-setup
+```
+
+Claude Code 将自动加载此配置。详细步骤、其他工具配置、故障排查请查看上方链接。
+
+## 应用配置
 
 ### 1. 创建配置文件
 
@@ -112,41 +148,6 @@ codeconnect search "函数名"
 codeconnect search "handle_request" --language rust --kind function
 ```
 
-## CLI 命令参考
-
-| 子命令 | 说明 |
-|--------|------|
-| `serve` | 启动 MCP 服务器（stdio 模式），供 AI 助手直接调用 |
-| `index` | 遍历项目目录，解析源文件并构建全文索引 |
-| `search <query>` | 按名称搜索符号，返回位置、类型和签名信息 |
-| `analyze` | 离线分析：圈复杂度、死代码检测、指标统计等 |
-| `status` | 查看索引状态：文档数、存储占用、各语言分布 |
-| `check-rules` | 架构规则验证：层依赖、循环依赖等，退出码反馈结果 |
-
-所有命令均支持 `-p <路径>` 指定项目根目录。
-
-## 接入 AI 工具（MCP 配置）
-
-CodeConnect 支持接入任何遵循 MCP（Model Context Protocol）的 AI 编程助手，包括 **Claude Code**、**Claude Desktop**、**VS Code / Cursor** 等。
-
-📖 **完整配置教程请参见：[docs/mcp-setup.md](docs/mcp-setup.md)**
-
-### 快速上手
-
-在项目根目录创建 `.mcp.json`：
-
-```json
-{
-  "mcpServers": {
-    "codeconnect": {
-      "command": "codeconnect",
-      "args": ["serve", "-p", "."]
-    }
-  }
-}
-```
-
-Claude Code 将自动加载此配置。详细步骤、其他工具配置、故障排查请查看上方链接。
 
 ## 配置参考
 
