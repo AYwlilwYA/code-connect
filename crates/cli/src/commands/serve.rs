@@ -25,11 +25,10 @@ pub async fn run(
     config: &CodeConnectConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = config;
-    println!("CodeConnect MCP 服务器正在启动...");
-    println!("  项目根目录: {}", project_root.display());
-    println!("  数据目录:   {}", data_dir.display());
-    println!("  模式:       stdio");
-    println!();
+    eprintln!("CodeConnect MCP 服务器正在启动... (stderr, 不会影响 MCP 协议)");
+    eprintln!("  项目根目录: {}", project_root.display());
+    eprintln!("  数据目录:   {}", data_dir.display());
+    eprintln!("  模式:       stdio");
 
     let tantivy_dir = data_dir.join("tantivy");
     let sled_dir = data_dir.join("sled");
@@ -46,7 +45,7 @@ pub async fn run(
     );
 
     let doc_count = tantivy.doc_count().unwrap_or(0);
-    println!("已加载索引: {} 个符号文档", doc_count);
+    eprintln!("已加载索引: {} 个符号文档", doc_count);
 
     if doc_count == 0 {
         tracing::warn!("索引为空！请先运行 `codeconnect index` 构建索引。");

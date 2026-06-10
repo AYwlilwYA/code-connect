@@ -125,11 +125,15 @@ codeconnect search "handle_request" --language rust --kind function
 
 所有命令均支持 `-p <路径>` 指定项目根目录。
 
-## 接入 Claude Code
+## 接入 AI 工具（MCP 配置）
 
-### 方式一：项目级 MCP 配置
+CodeConnect 支持接入任何遵循 MCP（Model Context Protocol）的 AI 编程助手，包括 **Claude Code**、**Claude Desktop**、**VS Code / Cursor** 等。
 
-在项目根目录创建或编辑 `.mcp.json`：
+📖 **完整配置教程请参见：[docs/mcp-setup.md](docs/mcp-setup.md)**
+
+### 快速上手
+
+在项目根目录创建 `.mcp.json`：
 
 ```json
 {
@@ -142,22 +146,7 @@ codeconnect search "handle_request" --language rust --kind function
 }
 ```
 
-### 方式二：全局 Claude Desktop 配置
-
-编辑 `~/.claude/claude_desktop_config.json`（Windows 上路径为 `%APPDATA%\Claude\claude_desktop_config.json`）：
-
-```json
-{
-  "mcpServers": {
-    "codeconnect": {
-      "command": "codeconnect",
-      "args": ["serve", "-p", "/你的/项目/路径"]
-    }
-  }
-}
-```
-
-配置完成后重启 Claude Desktop，即可在对话中调用 CodeConnect 提供的代码分析工具。
+Claude Code 将自动加载此配置。详细步骤、其他工具配置、故障排查请查看上方链接。
 
 ## 配置参考
 

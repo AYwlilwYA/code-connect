@@ -80,9 +80,15 @@ impl CodeConnectServer {
     /// 启动 MCP stdio 服务器
     ///
     /// 使用 tokio::io::stdin/stdout 作为传输通道。
+    ///
+    /// `serve_server` 返回的 `RunningService` 在后台运行事件循环，
+    /// 必须通过 `waiting()` 等待其完成，否则 `RunningService` 被 drop
+    /// 时会立即触发取消令牌，导致服务尚未处理请求就被终止。
     pub async fn start_stdio(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let transport = (tokio::io::stdin(), tokio::io::stdout());
-        serve_server(self, transport).await?;
+        let running = serve_server(self, transport).await?;
+        // 等待服务完成（阻塞直到传输关闭或取消）
+        running.waiting().await?;
         Ok(())
     }
 }
