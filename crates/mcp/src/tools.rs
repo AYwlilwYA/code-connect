@@ -98,25 +98,20 @@ pub fn handle_search_symbol(
 ) -> McpResponse<Vec<Symbol>> {
     let start = Instant::now();
 
-    let tantivy = match &registry.tantivy {
-        Some(t) => t,
-        None => return McpResponse::error("全文搜索索引未初始化"),
+    let query_engine = match &registry.query_engine {
+        Some(q) => q,
+        None => return McpResponse::error("查询引擎未初始化"),
     };
 
     // 默认限制
     let limit = params.limit.min(100);
 
-    let results = match tantivy.search_by_name(&params.query, limit) {
+    let results = match query_engine.search_by_name(&params.query, None, None, limit) {
         Ok(r) => r,
         Err(e) => return McpResponse::error(&format!("搜索失败: {}", e)),
     };
 
-    // 从 sled 加载每个搜索结果的完整 Symbol 信息
-    let sled = match &registry.sled {
-        Some(s) => s,
-        None => return McpResponse::error("存储未初始化"),
-    };
-
+    // 搜索结果已包含完整的符号信息（从 tantivy STORED 字段），直接转换即可
     let mut symbols: Vec<Symbol> = Vec::new();
     for result in &results {
         // 过滤类型
@@ -126,19 +121,16 @@ pub fn handle_search_symbol(
             }
         }
 
-        if let Ok(Some(bytes)) = sled.get_symbol(&result.stable_id) {
-            if let Ok(symbol) = serde_json::from_slice::<Symbol>(&bytes) {
-                // 语言过滤
-                if let Some(ref lang_filter) = params.language {
-                    // 从 symbol id 中推断语言（格式: language::path::kind::name::fingerprint）
-                    let lang = symbol.id.split("::").next().unwrap_or("");
-                    if lang != lang_filter.as_str() {
-                        continue;
-                    }
-                }
-                symbols.push(symbol);
+        // 语言过滤（从 stable_id 推断，格式: language::path::kind::name::fingerprint）
+        if let Some(ref lang_filter) = params.language {
+            let lang = result.stable_id.split("::").next().unwrap_or("");
+            if lang != lang_filter.as_str() {
+                continue;
             }
         }
+
+        let symbol = codeconnect_index::query_engine::symbol_search_result_to_symbol(result);
+        symbols.push(symbol);
     }
 
     let total = symbols.len();
@@ -154,21 +146,18 @@ pub fn handle_get_symbol(
 ) -> McpResponse<Symbol> {
     let start = Instant::now();
 
-    let sled = match &registry.sled {
-        Some(s) => s,
-        None => return McpResponse::error("存储未初始化"),
+    let query_engine = match &registry.query_engine {
+        Some(q) => q,
+        None => return McpResponse::error("查询引擎未初始化"),
     };
 
-    match sled.get_symbol(&params.symbol_id) {
-        Ok(Some(bytes)) => match serde_json::from_slice::<Symbol>(&bytes) {
-            Ok(symbol) => {
-                let elapsed = start.elapsed().as_millis() as u64;
-                McpResponse::success(symbol, 1, 1, elapsed)
-            }
-            Err(e) => McpResponse::error(&format!("反序列化符号失败: {}", e)),
-        },
+    match query_engine.get_symbol_by_id(&params.symbol_id) {
+        Ok(Some(symbol)) => {
+            let elapsed = start.elapsed().as_millis() as u64;
+            McpResponse::success(symbol, 1, 1, elapsed)
+        }
         Ok(None) => McpResponse::error(&format!("未找到符号: {}", params.symbol_id)),
-        Err(e) => McpResponse::error(&format!("读取存储失败: {}", e)),
+        Err(e) => McpResponse::error(&format!("查询失败: {}", e)),
     }
 }
 
@@ -181,24 +170,32 @@ pub fn handle_trace_callers(
 ) -> McpResponse<serde_json::Value> {
     let start = Instant::now();
 
-    // 从 sled 构建调用图
     let sled = match &registry.sled {
         Some(s) => s,
         None => return McpResponse::error("存储未初始化"),
     };
 
-    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_sled(sled) {
+    // 从 tantivy 构建调用图（不再依赖 sled symbols 命名空间）
+    let all_ids = match &registry.query_engine {
+        Some(q) => match q.scan_all_ids() {
+            Ok(ids) => ids,
+            Err(e) => return McpResponse::error(&format!("扫描符号 ID 失败: {}", e)),
+        },
+        None => return McpResponse::error("查询引擎未初始化"),
+    };
+
+    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy(sled, &all_ids) {
         Ok(g) => g,
         Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
     };
 
-    // 从 sled 获取符号以获取符号名称
-    let symbol_name = match sled.get_symbol(&params.symbol_id) {
-        Ok(Some(bytes)) => match serde_json::from_slice::<Symbol>(&bytes) {
-            Ok(sym) => sym.name,
-            Err(_) => params.symbol_id.clone(),
+    // 从 tantivy 获取符号以获取符号名称
+    let symbol_name = match &registry.query_engine {
+        Some(q) => match q.get_symbol_by_id(&params.symbol_id) {
+            Ok(Some(sym)) => sym.name,
+            _ => params.symbol_id.clone(),
         },
-        _ => params.symbol_id.clone(),
+        None => params.symbol_id.clone(),
     };
 
     let callers = call_graph.trace_callers(&symbol_name, params.max_depth);
@@ -239,17 +236,25 @@ pub fn handle_trace_callees(
         None => return McpResponse::error("存储未初始化"),
     };
 
-    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_sled(sled) {
+    let all_ids = match &registry.query_engine {
+        Some(q) => match q.scan_all_ids() {
+            Ok(ids) => ids,
+            Err(e) => return McpResponse::error(&format!("扫描符号 ID 失败: {}", e)),
+        },
+        None => return McpResponse::error("查询引擎未初始化"),
+    };
+
+    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy(sled, &all_ids) {
         Ok(g) => g,
         Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
     };
 
-    let symbol_name = match sled.get_symbol(&params.symbol_id) {
-        Ok(Some(bytes)) => match serde_json::from_slice::<Symbol>(&bytes) {
-            Ok(sym) => sym.name,
-            Err(_) => params.symbol_id.clone(),
+    let symbol_name = match &registry.query_engine {
+        Some(q) => match q.get_symbol_by_id(&params.symbol_id) {
+            Ok(Some(sym)) => sym.name,
+            _ => params.symbol_id.clone(),
         },
-        _ => params.symbol_id.clone(),
+        None => params.symbol_id.clone(),
     };
 
     let callees = call_graph.trace_callees(&symbol_name, params.max_depth);
@@ -290,20 +295,28 @@ pub fn handle_analyze_impact(
         None => return McpResponse::error("存储未初始化"),
     };
 
-    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_sled(sled) {
+    let all_ids = match &registry.query_engine {
+        Some(q) => match q.scan_all_ids() {
+            Ok(ids) => ids,
+            Err(e) => return McpResponse::error(&format!("扫描符号 ID 失败: {}", e)),
+        },
+        None => return McpResponse::error("查询引擎未初始化"),
+    };
+
+    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy(sled, &all_ids) {
         Ok(g) => g,
         Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
     };
 
-    // 解析符号 ID → 名称
+    // 解析符号 ID → 名称（从 tantivy 获取）
     let mut symbol_names: Vec<String> = Vec::new();
     for sid in &params.symbol_ids {
-        let name = match sled.get_symbol(sid) {
-            Ok(Some(bytes)) => match serde_json::from_slice::<Symbol>(&bytes) {
-                Ok(sym) => sym.name,
-                Err(_) => sid.clone(),
+        let name = match &registry.query_engine {
+            Some(q) => match q.get_symbol_by_id(sid) {
+                Ok(Some(sym)) => sym.name,
+                _ => sid.clone(),
             },
-            _ => sid.clone(),
+            None => sid.clone(),
         };
         symbol_names.push(name);
     }
@@ -361,17 +374,25 @@ pub fn handle_get_call_graph(
         None => return McpResponse::error("存储未初始化"),
     };
 
-    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_sled(sled) {
+    let all_ids = match &registry.query_engine {
+        Some(q) => match q.scan_all_ids() {
+            Ok(ids) => ids,
+            Err(e) => return McpResponse::error(&format!("扫描符号 ID 失败: {}", e)),
+        },
+        None => return McpResponse::error("查询引擎未初始化"),
+    };
+
+    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy(sled, &all_ids) {
         Ok(g) => g,
         Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
     };
 
-    let symbol_name = match sled.get_symbol(&params.symbol_id) {
-        Ok(Some(bytes)) => match serde_json::from_slice::<Symbol>(&bytes) {
-            Ok(sym) => sym.name,
-            Err(_) => params.symbol_id.clone(),
+    let symbol_name = match &registry.query_engine {
+        Some(q) => match q.get_symbol_by_id(&params.symbol_id) {
+            Ok(Some(sym)) => sym.name,
+            _ => params.symbol_id.clone(),
         },
-        _ => params.symbol_id.clone(),
+        None => params.symbol_id.clone(),
     };
 
     let callers = call_graph.trace_callers(&symbol_name, params.caller_depth);
@@ -418,30 +439,30 @@ pub fn handle_get_metrics(
         None => return McpResponse::error("存储未初始化"),
     };
 
+    let query_engine = match &registry.query_engine {
+        Some(q) => q,
+        None => return McpResponse::error("查询引擎未初始化"),
+    };
+
+    let all_ids = query_engine.scan_all_ids().unwrap_or_default();
+
+    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy(sled, &all_ids) {
+        Ok(g) => g,
+        Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
+    };
+
     // 如果指定了 file_path，则获取文件内所有符号后再计算指标
     if let Some(ref file_path) = params.file_path {
-        let symbol_ids: Vec<String> = match sled.get_file_symbols(file_path) {
-            Ok(Some(bytes)) => {
-                serde_json::from_slice(&bytes).unwrap_or_default()
-            }
-            _ => return McpResponse::error(&format!("未找到文件: {}", file_path)),
+        let symbols: Vec<Symbol> = match query_engine.get_file_symbols_tantivy(file_path) {
+            Ok(syms) => syms,
+            Err(e) => return McpResponse::error(&format!("查询文件符号失败: {}", e)),
         };
 
-        let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_sled(sled) {
-            Ok(g) => g,
-            Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
-        };
+        if symbols.is_empty() {
+            return McpResponse::error(&format!("文件内无符号: {}", file_path));
+        }
 
         let type_hierarchy = codeconnect_graph::type_hierarchy::TypeHierarchy::new();
-
-        let mut symbols: Vec<Symbol> = Vec::new();
-        for sid in &symbol_ids {
-            if let Ok(Some(bytes)) = sled.get_symbol(sid) {
-                if let Ok(sym) = serde_json::from_slice::<Symbol>(&bytes) {
-                    symbols.push(sym);
-                }
-            }
-        }
 
         let metrics = codeconnect_graph::metrics::MetricCalculator::compute_all(
             &symbols,
@@ -472,18 +493,10 @@ pub fn handle_get_metrics(
 
     // 如果指定了单个符号 ID
     if let Some(ref symbol_id) = params.symbol_id {
-        let symbol = match sled.get_symbol(symbol_id) {
-            Ok(Some(bytes)) => match serde_json::from_slice::<Symbol>(&bytes) {
-                Ok(sym) => sym,
-                Err(e) => return McpResponse::error(&format!("反序列化失败: {}", e)),
-            },
+        let symbol = match query_engine.get_symbol_by_id(symbol_id) {
+            Ok(Some(sym)) => sym,
             Ok(None) => return McpResponse::error(&format!("未找到符号: {}", symbol_id)),
-            Err(e) => return McpResponse::error(&format!("读取失败: {}", e)),
-        };
-
-        let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_sled(sled) {
-            Ok(g) => g,
-            Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
+            Err(e) => return McpResponse::error(&format!("查询失败: {}", e)),
         };
 
         let type_hierarchy = codeconnect_graph::type_hierarchy::TypeHierarchy::new();
@@ -535,30 +548,21 @@ pub fn handle_detect_dead_code(
         None => return McpResponse::error("存储未初始化"),
     };
 
-    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_sled(sled) {
-        Ok(g) => g,
-        Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
+    // 收集所有已知的符号 ID 和名称（从 tantivy 获取，不再从 sled 扫描）
+    let all_ids = match &registry.query_engine {
+        Some(q) => match q.scan_all_ids() {
+            Ok(ids) => ids,
+            Err(e) => return McpResponse::error(&format!("扫描符号 ID 失败: {}", e)),
+        },
+        None => return McpResponse::error("查询引擎未初始化"),
     };
 
-    // 收集所有已知的符号名称
-    let all_symbols: Vec<String> = {
-        // 从 sled 扫描所有符号
-        let mut names = Vec::new();
-        let prefix = "symbols:";
-        for item in sled.scan_prefix(prefix.as_bytes()) {
-            if let Ok((_key_bytes, value_bytes)) = item {
-                let key = String::from_utf8_lossy(&_key_bytes);
-                // 键格式: symbols:{symbol_id}
-                let symbol_id = key.strip_prefix(prefix).unwrap_or(&key);
-                if let Ok(sym) = serde_json::from_slice::<Symbol>(&value_bytes) {
-                    names.push(sym.name);
-                } else {
-                    // 反序列化失败，直接使用 ID
-                    names.push(symbol_id.to_string());
-                }
-            }
-        }
-        names
+    // 提取所有符号名称供死代码检测使用
+    let all_symbols: Vec<String> = all_ids.iter().map(|(_, name)| name.clone()).collect();
+
+    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy(sled, &all_ids) {
+        Ok(g) => g,
+        Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
     };
 
     // 确定入口点：优先用参数指定，其次用配置文件
@@ -617,18 +621,13 @@ pub fn handle_semantic_search(
 ) -> McpResponse<Vec<Symbol>> {
     let start = Instant::now();
 
-    let tantivy = match &registry.tantivy {
-        Some(t) => t,
-        None => return McpResponse::error("全文搜索索引未初始化"),
-    };
-
-    let sled = match &registry.sled {
-        Some(s) => s,
-        None => return McpResponse::error("存储未初始化"),
+    let query_engine = match &registry.query_engine {
+        Some(q) => q,
+        None => return McpResponse::error("查询引擎未初始化"),
     };
 
     let limit = params.limit.min(50);
-    let results = match tantivy.search_by_name(&params.description, limit) {
+    let results = match query_engine.search_by_name(&params.description, None, None, limit) {
         Ok(r) => r,
         Err(e) => return McpResponse::error(&format!("语义搜索失败: {}", e)),
     };
@@ -643,11 +642,8 @@ pub fn handle_semantic_search(
             }
         }
 
-        if let Ok(Some(bytes)) = sled.get_symbol(&result.stable_id) {
-            if let Ok(symbol) = serde_json::from_slice::<Symbol>(&bytes) {
-                symbols.push(symbol);
-            }
-        }
+        let symbol = codeconnect_index::query_engine::symbol_search_result_to_symbol(result);
+        symbols.push(symbol);
     }
 
     let total = symbols.len();
@@ -667,17 +663,24 @@ pub fn handle_find_references(
         None => return McpResponse::error("存储未初始化"),
     };
 
-    // 获取符号名称
-    let symbol_name = match sled.get_symbol(&params.symbol_id) {
-        Ok(Some(bytes)) => match serde_json::from_slice::<Symbol>(&bytes) {
-            Ok(sym) => sym.name,
-            Err(_) => params.symbol_id.clone(),
+    // 获取符号名称（从 tantivy 获取）
+    let symbol_name = match &registry.query_engine {
+        Some(q) => match q.get_symbol_by_id(&params.symbol_id) {
+            Ok(Some(sym)) => sym.name,
+            _ => params.symbol_id.clone(),
         },
-        _ => params.symbol_id.clone(),
+        None => params.symbol_id.clone(),
     };
 
-    // 从调用图获取所有调用者
-    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_sled(sled) {
+    // 从调用图获取所有调用者（从 tantivy 构建）
+    let all_ids = match &registry.query_engine {
+        Some(q) => match q.scan_all_ids() {
+            Ok(ids) => ids,
+            Err(e) => return McpResponse::error(&format!("扫描符号 ID 失败: {}", e)),
+        },
+        None => return McpResponse::error("查询引擎未初始化"),
+    };
+    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy(sled, &all_ids) {
         Ok(g) => g,
         Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
     };
@@ -847,17 +850,13 @@ pub fn handle_get_type_hierarchy(
 ) -> McpResponse<serde_json::Value> {
     let start = Instant::now();
 
-    let sled = match &registry.sled {
-        Some(s) => s,
-        None => return McpResponse::error("存储未初始化"),
-    };
-
-    let symbol_name = match sled.get_symbol(&params.symbol_id) {
-        Ok(Some(bytes)) => match serde_json::from_slice::<Symbol>(&bytes) {
-            Ok(sym) => sym.name,
-            Err(_) => params.symbol_id.clone(),
+    // 从 tantivy 获取符号名称
+    let symbol_name = match &registry.query_engine {
+        Some(q) => match q.get_symbol_by_id(&params.symbol_id) {
+            Ok(Some(sym)) => sym.name,
+            _ => params.symbol_id.clone(),
         },
-        _ => params.symbol_id.clone(),
+        None => params.symbol_id.clone(),
     };
 
     let type_hierarchy = codeconnect_graph::type_hierarchy::TypeHierarchy::new();
@@ -907,30 +906,26 @@ pub fn handle_get_type_hierarchy(
 }
 
 /// 获取文件内所有符号 handler
+///
+/// 直接从 tantivy 按 file_path 精确搜索，不再通过 sled 的 file_symbols 映射。
 pub fn handle_get_file_symbols(
     registry: &ToolRegistry,
     params: GetFileSymbolsParams,
 ) -> McpResponse<Vec<Symbol>> {
     let start = Instant::now();
 
-    let sled = match &registry.sled {
-        Some(s) => s,
-        None => return McpResponse::error("存储未初始化"),
+    let query_engine = match &registry.query_engine {
+        Some(q) => q,
+        None => return McpResponse::error("查询引擎未初始化"),
     };
 
-    let symbol_ids: Vec<String> = match sled.get_file_symbols(&params.file_path) {
-        Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_default(),
-        Ok(None) => return McpResponse::error(&format!("未找到文件: {}", params.file_path)),
-        Err(e) => return McpResponse::error(&format!("读取失败: {}", e)),
+    let symbols = match query_engine.get_file_symbols_tantivy(&params.file_path) {
+        Ok(syms) => syms,
+        Err(e) => return McpResponse::error(&format!("查询文件符号失败: {}", e)),
     };
 
-    let mut symbols: Vec<Symbol> = Vec::new();
-    for sid in &symbol_ids {
-        if let Ok(Some(bytes)) = sled.get_symbol(sid) {
-            if let Ok(sym) = serde_json::from_slice::<Symbol>(&bytes) {
-                symbols.push(sym);
-            }
-        }
+    if symbols.is_empty() {
+        return McpResponse::error(&format!("文件内无符号: {}", params.file_path));
     }
 
     let total = symbols.len();
@@ -997,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_get_symbol_no_sled() {
+    fn test_handle_get_symbol_no_query_engine() {
         let registry = ToolRegistry::new();
         let params = GetSymbolParams {
             symbol_id: "test_id".to_string(),

@@ -10,6 +10,8 @@ use codeconnect_graph::call_graph::CallGraph;
 use codeconnect_graph::metrics::MetricCalculator;
 use codeconnect_graph::type_hierarchy::TypeHierarchy;
 use codeconnect_index::sled_store::SledStore;
+use codeconnect_index::query_engine::symbol_search_result_to_symbol;
+use codeconnect_index::tantivy_index::TantivyIndex;
 
 /// 执行离线分析
 ///
@@ -25,18 +27,23 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = project_root;
 
+    let tantivy_dir = data_dir.join("tantivy");
     let sled_dir = data_dir.join("sled");
+    let tantivy = TantivyIndex::open_or_create(&tantivy_dir)
+        .map_err(|e| format!("无法打开 tantivy 索引: {}", e))?;
     let sled = SledStore::open(&sled_dir)
         .map_err(|e| format!("无法打开 sled 存储: {}", e))?;
 
-    // 收集所有符号
+    // 从 tantivy 扫描所有符号（不再从 sled 扫描）
+    let all_ids = tantivy.scan_all_ids()
+        .map_err(|e| format!("扫描符号 ID 失败: {}", e))?;
+
+    // 收集所有 Symbol（从 tantivy 搜索结果）
     let mut all_symbols: Vec<Symbol> = Vec::new();
-    let prefix = "symbols:";
-    for item in sled.scan_prefix(prefix.as_bytes()) {
-        if let Ok((_key, value)) = item {
-            if let Ok(sym) = serde_json::from_slice::<Symbol>(&value) {
-                all_symbols.push(sym);
-            }
+    // 对每个 ID 通过 tantivy 精确搜索获取完整信息
+    for (stable_id, _name) in &all_ids {
+        if let Ok(Some(result)) = tantivy.search_by_id(stable_id) {
+            all_symbols.push(symbol_search_result_to_symbol(&result));
         }
     }
 
@@ -48,8 +55,8 @@ pub async fn run(
     println!("符号总数: {}", all_symbols.len());
     println!();
 
-    // 构建调用图
-    let call_graph = CallGraph::build_from_sled(&sled)
+    // 构建调用图（从 tantivy + sled）
+    let call_graph = CallGraph::build_from_tantivy(&sled, &all_ids)
         .map_err(|e| format!("构建调用图失败: {}", e))?;
 
     let type_hierarchy = TypeHierarchy::new();

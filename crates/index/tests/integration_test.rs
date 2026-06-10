@@ -8,7 +8,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use codeconnect_core::types::Symbol;
 use codeconnect_index::full_indexer::FullIndexer;
 use codeconnect_index::query_engine::QueryEngine;
 use codeconnect_index::sled_store::SledStore;
@@ -115,24 +114,21 @@ fn test_full_index_and_search_rust_sample() {
     );
 
     // =====================================================================
-    // 第 5 步：通过 sled 读取符号验证反序列化
+    // 第 5 步：通过 tantivy 读取符号验证
     // =====================================================================
     for result in &search_results {
-        let symbol_bytes = query_engine
+        let symbol_opt = query_engine
             .get_symbol_by_id(&result.stable_id)
-            .expect("读取符号字节失败");
+            .expect("从 tantivy 读取符号失败");
 
         assert!(
-            symbol_bytes.is_some(),
-            "sled 中应存在符号 {}, ID: {}",
+            symbol_opt.is_some(),
+            "tantivy 中应存在符号 {}, ID: {}",
             result.name,
             result.stable_id
         );
 
-        let symbol_bytes = symbol_bytes.unwrap();
-        let symbol: Symbol = serde_json::from_slice(&symbol_bytes)
-            .unwrap_or_else(|e| panic!("反序列化符号 {} 失败: {}", result.name, e));
-
+        let symbol = symbol_opt.unwrap();
         assert_eq!(symbol.id, result.stable_id, "Symbol ID 应一致");
         assert_eq!(symbol.name, result.name, "符号名应一致");
     }

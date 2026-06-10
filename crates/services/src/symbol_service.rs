@@ -54,7 +54,7 @@ impl<'a> SymbolService<'a> {
 
     /// 按稳定符号 ID 精确查找符号
     ///
-    /// 从 sled 存储中读取符号的序列化字节并反序列化。
+    /// 从 tantivy STORED 字段中读取符号信息。
     ///
     /// # 参数
     /// - `stable_id` — 符号的稳定标识符
@@ -62,18 +62,12 @@ impl<'a> SymbolService<'a> {
     /// # 返回
     /// - `Ok(Some(symbol))` — 找到符号
     /// - `Ok(None)` — 符号不存在
-    /// - `Err(...)` — 反序列化等错误
+    /// - `Err(...)` — 查询错误
     pub fn search_by_id(
         &self,
         stable_id: &str,
     ) -> Result<Option<Symbol>, CodeConnectError> {
-        match self.engine.get_symbol_by_id(stable_id)? {
-            Some(data) => {
-                let symbol: Symbol = serde_json::from_slice(&data)?;
-                Ok(Some(symbol))
-            }
-            None => Ok(None),
-        }
+        self.engine.get_symbol_by_id(stable_id)
     }
 
     // =========================================================================
@@ -115,15 +109,15 @@ impl<'a> SymbolService<'a> {
         self.engine.total_symbols()
     }
 
-    /// 获取指定文件中的所有符号 ID 列表
+    /// 获取指定文件中所有符号的 ID 列表
     ///
-    /// 返回该文件内已索引的符号稳定 ID 列表。
+    /// 从 sled 的 file_symbols 映射中读取。
     /// 如果文件尚未索引，返回空列表。
     ///
     /// # 参数
     /// - `file_path` — 源文件路径
-    pub fn get_file_symbols(&self, file_path: &str) -> Result<Vec<String>, CodeConnectError> {
-        match self.engine.get_file_symbols(file_path)? {
+    pub fn get_file_symbol_ids(&self, file_path: &str) -> Result<Vec<String>, CodeConnectError> {
+        match self.engine.get_file_symbol_ids(file_path)? {
             Some(data) => {
                 let ids: Vec<String> = serde_json::from_slice(&data)?;
                 Ok(ids)

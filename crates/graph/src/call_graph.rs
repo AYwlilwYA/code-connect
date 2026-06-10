@@ -413,6 +413,71 @@ impl CallGraph {
         Ok(call_graph)
     }
 
+    /// 从 tantivy + sled 构建调用图（不依赖 sled symbols 命名空间）
+    ///
+    /// 与 `build_from_sled` 的功能相同，但第一步的符号扫描改为从 tantivy 读取。
+    /// sled 中的 symbols 命名空间已废弃（符号只存 tantivy），
+    /// 此方法从 tantivy 的 STORED 字段读取所有符号并重建调用图。
+    ///
+    /// # 参数
+    /// - `sled` — 已打开的 sled 数据库实例（用于读取调用边）
+    /// - `all_symbol_ids` — 从 tantivy 扫描到的所有 (stable_id, name) 对
+    pub fn build_from_tantivy(
+        sled: &SledStore,
+        all_symbol_ids: &[(String, String)],
+    ) -> Result<Self, CodeConnectError> {
+        // 从 tantivy 读取不需要 TantivyIndex 实例，因为我们已经通过 scan_all_ids 拿到了所有 ID
+        // 然后对每个 ID 通过 sled 的 get_call_edges_from 读取调用边
+        let mut call_graph = CallGraph::new();
+
+        // ================================================================
+        // 第一步：将 tantivy 扫描到的所有符号作为节点加入图
+        // ================================================================
+        let mut name_to_stable: HashMap<String, Vec<String>> = HashMap::new();
+
+        for (stable_id, name) in all_symbol_ids {
+            let node = SymbolNode {
+                symbol_id: stable_id.clone(),
+                name: name.clone(),
+                kind: SymbolKind::Function, // 占位，后续可忽略
+                file_path: String::new(),
+            };
+            call_graph.add_node(node);
+            name_to_stable.entry(name.clone()).or_default().push(stable_id.clone());
+        }
+
+        // ================================================================
+        // 第二步：扫描所有调用边，解析 caller/callee，并添加边
+        // ================================================================
+        let edges_prefix = b"edges:";
+
+        for item in sled.scan_prefix(edges_prefix) {
+            let (_key, value) = item?;
+
+            let call_edge: CallEdge = serde_json::from_slice(&value).map_err(|e| {
+                CodeConnectError::Serialization(e)
+            })?;
+
+            let caller_key = &call_edge.caller_id;
+            let callee_key = &call_edge.callee_id;
+
+            let caller_id = Self::resolve_symbol_ref(
+                &call_graph, &name_to_stable, caller_key,
+            );
+
+            let callee_id = Self::resolve_symbol_ref(
+                &call_graph, &name_to_stable, callee_key,
+            );
+
+            Self::ensure_node_exists(&mut call_graph, &caller_id, caller_key);
+            Self::ensure_node_exists(&mut call_graph, &callee_id, callee_key);
+
+            call_graph.add_edge(&caller_id, &callee_id, call_edge);
+        }
+
+        Ok(call_graph)
+    }
+
     /// 解析 edges 键中的符号引用
     ///
     /// 如果 key 已经在图中按稳定 ID 找到，直接返回 key。

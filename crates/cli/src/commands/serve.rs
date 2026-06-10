@@ -33,16 +33,11 @@ pub async fn run(
     let tantivy_dir = data_dir.join("tantivy");
     let sled_dir = data_dir.join("sled");
 
-    // 打开或创建索引
-    let tantivy = Arc::new(
-        TantivyIndex::open_or_create(&tantivy_dir)
-            .map_err(|e| format!("无法打开 tantivy 索引: {}", e))?,
-    );
-
-    let sled = Arc::new(
-        SledStore::open(&sled_dir)
-            .map_err(|e| format!("无法打开 sled 存储: {}", e))?,
-    );
+    // 打开索引（为 query_engine 创建）
+    let tantivy = TantivyIndex::open_or_create(&tantivy_dir)
+        .map_err(|e| format!("无法打开 tantivy 索引: {}", e))?;
+    let sled = SledStore::open(&sled_dir)
+        .map_err(|e| format!("无法打开 sled 存储: {}", e))?;
 
     let doc_count = tantivy.doc_count().unwrap_or(0);
     eprintln!("已加载索引: {} 个符号文档", doc_count);
@@ -51,10 +46,13 @@ pub async fn run(
         tracing::warn!("索引为空！请先运行 `codeconnect index` 构建索引。");
     }
 
-    // 构建工具注册表
+    // 构建查询引擎（拥有 tantivy 和 sled）
+    let query_engine = Arc::new(codeconnect_index::query_engine::QueryEngine::new(tantivy, sled));
+
+    // 注意：query_engine 已消费 tantivy 和 sled 的所有权，
+    // ToolRegistry 通过 query_engine 访问它们。
     let registry = ToolRegistry::new()
-        .with_sled(sled)
-        .with_tantivy(tantivy);
+        .with_query_engine(query_engine);
 
     // 创建并启动服务器
     let server = CodeConnectServer::new(registry);

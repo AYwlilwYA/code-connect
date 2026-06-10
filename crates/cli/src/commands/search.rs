@@ -5,9 +5,7 @@
 
 use std::path::Path;
 
-use codeconnect_index::sled_store::SledStore;
 use codeconnect_index::tantivy_index::TantivyIndex;
-use codeconnect_core::types::Symbol;
 
 /// 执行符号搜索
 ///
@@ -30,14 +28,11 @@ pub async fn run(
     let _ = project_root;
 
     let tantivy_dir = data_dir.join("tantivy");
-    let sled_dir = data_dir.join("sled");
 
     let tantivy = TantivyIndex::open_or_create(&tantivy_dir)
         .map_err(|e| format!("无法打开 tantivy 索引: {}", e))?;
-    let sled = SledStore::open(&sled_dir)
-        .map_err(|e| format!("无法打开 sled 存储: {}", e))?;
 
-    // 搜索符号
+    // 搜索符号（符号数据只存 tantivy，sled 仅用于调用边/文件指纹）
     let search_results = tantivy
         .search_by_name(query, limit)
         .map_err(|e| format!("搜索失败: {}", e))?;
@@ -67,24 +62,20 @@ pub async fn run(
             }
         }
 
-        // 从 sled 获取完整符号信息
-        if let Ok(Some(bytes)) = sled.get_symbol(&result.stable_id) {
-            if let Ok(symbol) = serde_json::from_slice::<Symbol>(&bytes) {
-                println!(
-                    "  {}  [{}]  (相关度: {:.2})",
-                    symbol.name, result.kind, result.score
-                );
-                println!(
-                    "    文件: {}:{}",
-                    symbol.location.file_path, symbol.location.line
-                );
-                if let Some(ref sig) = symbol.signature {
-                    println!("    签名: {}", sig);
-                }
-                println!();
-                shown += 1;
-            }
+        // 搜索结果已包含完整的符号信息（从 tantivy STORED 字段）
+        println!(
+            "  {}  [{}]  (相关度: {:.2})",
+            result.name, result.kind, result.score
+        );
+        println!(
+            "    文件: {}:{}",
+            result.file_path, result.line
+        );
+        if !result.signature.is_empty() {
+            println!("    签名: {}", result.signature);
         }
+        println!();
+        shown += 1;
     }
 
     if shown == 0 {
