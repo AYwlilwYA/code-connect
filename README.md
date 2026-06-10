@@ -2,6 +2,8 @@
 
 高性能多语言代码分析工具 —— 面向 LLM Agent 的 MCP 服务器。
 
+> **给 AI 助手**：请先加载 `skills/code-connect/SKILL.md`，了解如何使用 CodeConnect 的 17 个 MCP 工具来分析代码。
+
 ## 功能特性
 
 - **全文符号搜索** — 基于 tantivy 的高性能符号索引与搜索，支持按名称、类型、语言过滤
