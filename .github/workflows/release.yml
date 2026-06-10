@@ -18,12 +18,15 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: codeconnect.exe
+            artifact_name: codeconnect-windows-x64.exe
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: codeconnect
+            artifact_name: codeconnect-linux-x64
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact: codeconnect
+            artifact_name: codeconnect-macos-x64
 
     steps:
       - name: 检出代码
@@ -50,17 +53,17 @@ jobs:
       - name: 准备产物 (Unix)
         if: matrix.os != 'windows-latest'
         run: |
-          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} .
-          chmod +x ${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} ${{ matrix.artifact_name }}
+          chmod +x ${{ matrix.artifact_name }}
 
       - name: 准备产物 (Windows)
         if: matrix.os == 'windows-latest'
-        run: cp target/${{ matrix.target }}/release/${{ matrix.artifact }} .
+        run: cp target/${{ matrix.target }}/release/${{ matrix.artifact }} ${{ matrix.artifact_name }}
 
       - name: 上传产物
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.artifact }}
+          files: ${{ matrix.artifact_name }}
           body: |
             ## 安装方法
 
@@ -68,9 +71,9 @@ jobs:
 
             | 平台 | 文件 |
             |------|------|
-            | Windows (x64) | `codeconnect.exe` |
-            | Linux (x64) | `codeconnect` |
-            | macOS (x64) | `codeconnect` |
+            | Windows (x64) | `codeconnect-windows-x64.exe` |
+            | Linux (x64) | `codeconnect-linux-x64` |
+            | macOS (x64) | `codeconnect-macos-x64` |
 
             ### 从源码编译
 
