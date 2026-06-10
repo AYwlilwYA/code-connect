@@ -187,35 +187,49 @@ impl FullIndexer {
         }
 
         // ====================================================================
-        // 第二步：使用 rayon 并行解析所有文件
-        // 通过 crossbeam channel 收集解析结果和失败信息
+        // 第二步：流水线模式 — 生产者（rayon 并行解析）与消费者（批量写入）同时运行
+        // 使用有界 channel (容量 1024) 限制内存中的 ParsedFile 数量，实现背压控制：
+        // 当 channel 满时 write 端阻塞，自动暂停解析，避免 29 万文件同时积压
         // ====================================================================
-        let (success_tx, success_rx) = channel::unbounded::<ParsedFile>();
-        let (failure_tx, failure_rx) = channel::unbounded::<ParseFailure>();
+        let (success_tx, success_rx) = channel::bounded::<ParsedFile>(1024);
+        let (failure_tx, failure_rx) = channel::bounded::<ParseFailure>(1024);
 
         let project_root = Arc::new(self.project_root.clone());
         let parser_registry = Arc::clone(&self.parser_registry);
 
-        files.par_iter().for_each(|file_path| {
-            match parse_single_file(file_path, &parser_registry, &project_root) {
-                Ok(parsed) => {
-                    let _ = success_tx.send(parsed);
+        // 生产者：在 rayon 线程池中并行解析所有文件
+        // 使用 rayon::spawn 使解析任务异步执行，主线程作为消费者同时运行
+        // 用 Arc 共享文件列表，避免克隆 29 万个 PathBuf
+        let files_arc = Arc::new(files);
+        let success_tx_prod = success_tx.clone();
+        let failure_tx_prod = failure_tx.clone();
+        rayon::spawn(move || {
+            files_arc.par_iter().for_each(|file_path| {
+                match parse_single_file(file_path, &parser_registry, &project_root) {
+                    Ok(parsed) => {
+                        // 有界 channel：缓冲区满时阻塞，自动限制并发
+                        let _ = success_tx_prod.send(parsed);
+                    }
+                    Err(error) => {
+                        let _ = failure_tx_prod.send(ParseFailure {
+                            file_path: file_path.clone(),
+                            error,
+                        });
+                    }
                 }
-                Err(error) => {
-                    let _ = failure_tx.send(ParseFailure {
-                        file_path: file_path.clone(),
-                        error,
-                    });
-                }
-            }
+            });
+            // par_iter 完成后关闭发送端，通知消费者结束
+            // drop here after clone was moved into the closure
         });
 
-        // 关闭发送端，以便接收端的迭代可以自然结束
+        // 关闭主线程持有的发送端引用，只保留生产者闭包内的引用
+        // 当生产者闭包完成时，tx 会被自动 drop，接收端迭代自然结束
         drop(success_tx);
         drop(failure_tx);
 
         // ====================================================================
-        // 第三步：收集结果并批量写入存储
+        // 第三步：流水线消费 — 边收边写入，解析和写入同时进行
+        // ParsedFile 写入存储后立即 drop，释放内存
         // ====================================================================
         let mut files_parsed: u64 = 0;
         let mut symbols_found: u64 = 0;
@@ -233,7 +247,7 @@ impl FullIndexer {
             let calls_count = parsed.stats.calls;
             let imports_count = parsed.stats.imports;
 
-            // 写入 sled 和 tantivy
+            // 写入 sled 和 tantivy — 写入完成后 parsed 在此次迭代结束时 drop
             self.write_parsed_file(&parsed)?;
 
             files_parsed += 1;
@@ -538,14 +552,16 @@ fn parse_single_file(
         .parse(&source)
         .map_err(|e| format!("解析失败 {}: {}", file_path.display(), e))?;
 
-    // 提取符号
+    // 提取符号、调用、导入 — tree-sitter 解析完成后 source 仍然需要，
+    // 用于获取符号名称等文本内容（通过 AST 节点在 source 上的 slice）
     let symbols = parser.extract_symbols(&tree, &source, file_path);
-
-    // 提取调用
     let calls = parser.extract_calls(&tree, &source, file_path);
-
-    // 提取导入
     let imports = parser.extract_imports(&tree, &source, file_path);
+
+    // 提取完成后立即释放 source 和 tree，减少内存峰值
+    // source 字符串可能很大（几 MB），早释放 = 早归还给 allocator
+    drop(tree);
+    drop(source);
 
     let stats = FileIndexStats {
         symbols: symbols.len() as u64,

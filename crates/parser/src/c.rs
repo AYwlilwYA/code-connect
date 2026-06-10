@@ -142,7 +142,7 @@ impl LanguageParser for CParser {
                         kind = SymbolKind::Macro;
                         location = self.node_to_location(node, &file_path_str);
                     }
-                    "typedef" => {
+                    "type_definition" => {
                         kind = SymbolKind::TypeAlias;
                         location = self.node_to_location(node, &file_path_str);
                     }
@@ -283,9 +283,13 @@ impl LanguageParser for CParser {
 
                 match capture_name {
                     "path" => {
-                        // #include 中的路径，去掉引号保留原始字符串
+                        // #include 中的路径，去掉引号或尖括号
                         let raw = self.node_text(node, source);
-                        import_path = raw.trim_matches('"').to_string();
+                        import_path = raw
+                            .trim_matches('"')
+                            .trim_start_matches('<')
+                            .trim_end_matches('>')
+                            .to_string();
                     }
                     "include" => {
                         import_line = node.start_position().row as u64 + 1;
