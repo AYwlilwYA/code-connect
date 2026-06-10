@@ -540,23 +540,24 @@ fn parse_single_file(
     // 计算内容哈希（blake3::Hash 实现了 Display，输出十六进制字符串）
     let content_hash = blake3::hash(source.as_bytes()).to_string();
 
-    // 计算相对于项目根目录的路径
+    // 计算相对于项目根目录的路径（统一使用正斜杠）
     let relative_path = file_path
         .strip_prefix(project_root)
         .unwrap_or(file_path)
         .to_string_lossy()
-        .to_string();
+        .replace('\\', "/");
 
     // 解析源码为 AST
     let tree = parser
         .parse(&source)
         .map_err(|e| format!("解析失败 {}: {}", file_path.display(), e))?;
 
-    // 提取符号、调用、导入 — tree-sitter 解析完成后 source 仍然需要，
-    // 用于获取符号名称等文本内容（通过 AST 节点在 source 上的 slice）
-    let symbols = parser.extract_symbols(&tree, &source, file_path);
-    let calls = parser.extract_calls(&tree, &source, file_path);
-    let imports = parser.extract_imports(&tree, &source, file_path);
+    // 提取符号、调用、导入
+    // 使用相对路径生成 StableSymbolId，确保索引在不同机器上可移植
+    let relative_path_ref = Path::new(&relative_path);
+    let symbols = parser.extract_symbols(&tree, &source, relative_path_ref);
+    let calls = parser.extract_calls(&tree, &source, relative_path_ref);
+    let imports = parser.extract_imports(&tree, &source, relative_path_ref);
 
     // 提取完成后立即释放 source 和 tree，减少内存峰值
     // source 字符串可能很大（几 MB），早释放 = 早归还给 allocator

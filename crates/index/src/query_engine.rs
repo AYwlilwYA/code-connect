@@ -2,10 +2,16 @@
 //!
 //! 将上层查询请求路由到适当的存储后端（tantivy / sled），
 //! 并组合结果。支持全文搜索、精确查找、分页。
+//!
+//! 注意：符号定义数据只存储在 tantivy 的 STORED 字段中，
+//! sled 不再冗余存储符号定义（sled 的 append-only 架构会导致磁盘膨胀）。
 
 use crate::sled_store::SledStore;
 use crate::tantivy_index::{SymbolSearchResult, TantivyIndex};
 use codeconnect_core::error::CodeConnectError;
+use codeconnect_core::types::{
+    Symbol, SymbolKind, SourceLocation,
+};
 
 /// 查询引擎 — 组合 tantivy 全文索引和 sled K/V 存储
 ///
@@ -48,19 +54,53 @@ impl QueryEngine {
         self.tantivy.search_by_name(name, limit)
     }
 
-    /// 按稳定 ID 获取符号的完整序列化数据
+    /// 按稳定 ID 获取符号的完整信息（从 tantivy STORED 字段反序列化）
+    ///
+    /// 返回 `None` 表示该 ID 对应的符号不存在。
     ///
     /// # 参数
     /// - `stable_id` — 符号的稳定标识符
-    ///
-    /// # 返回值
-    /// - `Some(Vec<u8>)` 表示符号存在，返回序列化字节（由调用方反序列化）
-    /// - `None` 表示该 ID 对应的符号不存在
-    pub fn get_symbol_by_id(&self, stable_id: &str) -> Result<Option<Vec<u8>>, CodeConnectError> {
-        self.sled.get_symbol(stable_id)
+    pub fn get_symbol_by_id(&self, stable_id: &str) -> Result<Option<Symbol>, CodeConnectError> {
+        self.tantivy.search_by_id(stable_id).map(|opt| {
+            opt.map(|result| symbol_search_result_to_symbol(&result))
+        })
     }
 
-    /// 获取文件内所有符号的 ID 列表（序列化字节）
+    /// 按稳定 ID 获取符号的原始 JSON 字节（兼容旧接口）
+    ///
+    /// 从 tantivy STORED 字段读取 SymbolSearchResult 后重新序列化为 JSON 字节。
+    /// 返回 `None` 表示该 ID 对应的符号不存在。
+    ///
+    /// # 参数
+    /// - `stable_id` — 符号的稳定标识符
+    pub fn get_symbol_bytes_by_id(&self, stable_id: &str) -> Result<Option<Vec<u8>>, CodeConnectError> {
+        self.tantivy.search_by_id(stable_id).map(|opt| {
+            opt.map(|result| {
+                let symbol = symbol_search_result_to_symbol(&result);
+                serde_json::to_vec(&symbol).unwrap_or_default()
+            })
+        })
+    }
+
+    /// 搜索指定文件路径中的所有符号
+    ///
+    /// 对 tantivy 的 `file_path` 字段进行精确匹配，返回该文件下的所有符号。
+    ///
+    /// # 参数
+    /// - `file_path` — 源文件的相对路径
+    /// 搜索指定文件路径中的所有符号
+    ///
+    /// 对 tantivy 的 `file_path` 字段进行精确匹配，返回该文件下的所有符号。
+    ///
+    /// # 参数
+    /// - `file_path` — 源文件的相对路径
+    pub fn get_file_symbols_tantivy(&self, file_path: &str) -> Result<Vec<Symbol>, CodeConnectError> {
+        self.tantivy.search_by_file_path(file_path).map(|results| {
+            results.iter().map(|r| symbol_search_result_to_symbol(r)).collect()
+        })
+    }
+
+    /// 获取文件内所有符号的 ID 列表（从 sled 读文件→符号映射）
     ///
     /// # 参数
     /// - `file_path` — 源文件的绝对路径
@@ -68,7 +108,7 @@ impl QueryEngine {
     /// # 返回值
     /// - `Some(Vec<u8>)` 表示该文件有已索引的符号
     /// - `None` 表示该文件尚未索引或无符号
-    pub fn get_file_symbols(&self, file_path: &str) -> Result<Option<Vec<u8>>, CodeConnectError> {
+    pub fn get_file_symbol_ids(&self, file_path: &str) -> Result<Option<Vec<u8>>, CodeConnectError> {
         self.sled.get_file_symbols(file_path)
     }
 
@@ -85,5 +125,78 @@ impl QueryEngine {
     /// 返回 tantivy 索引中的文档数（每个文档对应一个符号）。
     pub fn total_symbols(&self) -> Result<u64, CodeConnectError> {
         self.tantivy.doc_count()
+    }
+
+    /// 扫描所有符号的 ID 和名称
+    ///
+    /// 用于死代码检测等需要遍历所有符号的场景。
+    pub fn scan_all_ids(&self) -> Result<Vec<(String, String)>, CodeConnectError> {
+        self.tantivy.scan_all_ids()
+    }
+}
+
+/// 将 tantivy 搜索结果转换为完整的 Symbol 结构
+///
+/// 从 Schema 的 STORED 字段中提取所有符号信息并构造 Symbol。
+pub fn symbol_search_result_to_symbol(result: &SymbolSearchResult) -> Symbol {
+    // 将 kind 字符串解析为 SymbolKind 枚举
+    let kind = match result.kind.as_str() {
+        "function" => SymbolKind::Function,
+        "method" => SymbolKind::Method,
+        "class" => SymbolKind::Class,
+        "interface" => SymbolKind::Interface,
+        "struct" => SymbolKind::Struct,
+        "enum" => SymbolKind::Enum,
+        "trait" => SymbolKind::Trait,
+        "type_alias" => SymbolKind::TypeAlias,
+        "variable" => SymbolKind::Variable,
+        "field" => SymbolKind::Field,
+        "parameter" => SymbolKind::Parameter,
+        "module" => SymbolKind::Module,
+        "macro" => SymbolKind::Macro,
+        other => SymbolKind::Unknown(other.to_string()),
+    };
+
+    // 解析修饰符字符串（以 ", " 分隔）
+    let modifiers: Vec<String> = result
+        .modifiers
+        .split(", ")
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+
+    Symbol {
+        id: result.stable_id.clone(),
+        name: result.name.clone(),
+        kind,
+        location: SourceLocation {
+            file_path: result.file_path.clone(),
+            line: result.line,
+            column: result.column,
+            end_line: result.end_line,
+            end_column: result.end_column,
+        },
+        signature: if result.signature.is_empty() {
+            None
+        } else {
+            Some(result.signature.clone())
+        },
+        doc_comment: if result.doc_comment.is_empty() {
+            None
+        } else {
+            Some(result.doc_comment.clone())
+        },
+        parent_id: if result.parent_type.is_empty() {
+            None
+        } else {
+            Some(result.parent_type.clone())
+        },
+        modifiers,
+        is_exported: result.is_exported,
+        complexity: if result.complexity > 0 {
+            Some(result.complexity)
+        } else {
+            None
+        },
     }
 }

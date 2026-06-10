@@ -377,6 +377,78 @@ impl TantivyIndex {
         }))
     }
 
+    /// 按文件路径精确搜索符号
+    ///
+    /// 对 `file_path` 字段（STRING 类型，不分词）进行精确匹配，
+    /// 返回该文件下的所有符号。用于替代原来从 sled 读取 file→symbols 映射。
+    ///
+    /// # 参数
+    /// - `file_path` — 文件的相对路径
+    pub fn search_by_file_path(
+        &self,
+        file_path: &str,
+    ) -> Result<Vec<SymbolSearchResult>, CodeConnectError> {
+        self.reader
+            .reload()
+            .map_err(|e| CodeConnectError::Index(format!("重新加载失败: {}", e)))?;
+
+        let searcher = self.reader.searcher();
+
+        use tantivy::query::TermQuery;
+        use tantivy::Term;
+        let term = Term::from_field_text(self.schema.file_path, file_path);
+        let query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+
+        let top_docs = searcher
+            .search(&query, &TopDocs::with_limit(10000))
+            .map_err(|e| CodeConnectError::Query(format!("文件路径搜索失败: {}", e)))?;
+
+        let get_text = |doc: &TantivyDocument, field: Field| -> String {
+            doc.get_first(field)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let get_u64 = |doc: &TantivyDocument, field: Field| -> u64 {
+            doc.get_first(field)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        };
+        let get_bool = |doc: &TantivyDocument, field: Field| -> bool {
+            doc.get_first(field)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        };
+
+        let results: Vec<SymbolSearchResult> = top_docs
+            .iter()
+            .map(|(score, doc_addr)| {
+                let doc: TantivyDocument = searcher.doc(*doc_addr).unwrap();
+                SymbolSearchResult {
+                    stable_id: get_text(&doc, self.schema.stable_id),
+                    name: get_text(&doc, self.schema.name),
+                    kind: get_text(&doc, self.schema.kind),
+                    language: get_text(&doc, self.schema.language),
+                    file_path: get_text(&doc, self.schema.file_path),
+                    signature: get_text(&doc, self.schema.signature),
+                    doc_comment: get_text(&doc, self.schema.doc_comment),
+                    parent_type: get_text(&doc, self.schema.parent_type),
+                    modifiers: get_text(&doc, self.schema.modifiers),
+                    complexity: get_u64(&doc, self.schema.complexity),
+                    ast_hash: get_text(&doc, self.schema.ast_hash),
+                    is_exported: get_bool(&doc, self.schema.is_exported),
+                    line: get_u64(&doc, self.schema.line),
+                    column: get_u64(&doc, self.schema.column),
+                    end_line: get_u64(&doc, self.schema.end_line),
+                    end_column: get_u64(&doc, self.schema.end_column),
+                    score: *score,
+                }
+            })
+            .collect();
+
+        Ok(results)
+    }
+
     /// 扫描所有符号的 ID 和名称
     ///
     /// 用于死代码检测等需要遍历所有符号的场景。
