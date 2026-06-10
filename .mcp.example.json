@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "codeconnect": {
+      "type": "stdio",
+      "command": "codeconnect",
+      "args": ["serve"]
+    }
+  }
+}

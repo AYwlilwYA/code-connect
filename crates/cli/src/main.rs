@@ -1,12 +1,13 @@
 //! CodeConnect CLI 入口
 //!
-//! 提供六个子命令：
+//! 提供七个子命令：
 //! - `serve` — 启动 MCP 服务器（stdio 模式）
 //! - `index` — 触发代码全量索引
 //! - `search` — 快速符号搜索
 //! - `analyze` — 离线分析（复杂度、死代码检测等）
 //! - `status` — 查看索引进度与统计
 //! - `check-rules` — 架构规则验证（CI 适用）
+//! - `mcp-setup` — MCP 一键配置
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -103,6 +104,19 @@ enum Commands {
         #[arg(long)]
         rules: Option<Vec<String>>,
     },
+
+    /// MCP 一键配置
+    ///
+    /// 自动将 CodeConnect 注册到 Claude Code 的 MCP 配置中。
+    /// 默认创建项目级 `.mcp.json`，使用 `--global` 则写入全局 `~/.claude.json`。
+    McpSetup {
+        /// 全局配置（写入 ~/.claude.json），默认项目级
+        #[arg(long)]
+        global: bool,
+        /// 项目路径（全局配置时可选，不传则用当前目录）
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
 }
 
 // ============================================================================
@@ -111,8 +125,9 @@ enum Commands {
 
 #[tokio::main]
 async fn main() {
-    // 初始化日志系统
+    // 初始化日志系统（输出到 stderr，避免干扰 MCP stdio 协议）
     fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
@@ -168,6 +183,13 @@ async fn run_command(
 
         Commands::CheckRules { rules } => {
             commands::analyze::run_check_rules(&cli.project_root, &data_dir, rules).await?;
+        }
+
+        Commands::McpSetup {
+            global,
+            project_root,
+        } => {
+            commands::setup::run(global, project_root)?;
         }
     }
 
