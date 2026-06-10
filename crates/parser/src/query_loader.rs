@@ -68,6 +68,24 @@ pub fn load_csharp_queries() -> LanguageQueries {
     )
 }
 
+/// 为 C 加载编译期查询文件
+pub fn load_c_queries() -> LanguageQueries {
+    LanguageQueries::new(
+        include_str!("../../../queries/c/symbols.scm"),
+        include_str!("../../../queries/c/calls.scm"),
+        include_str!("../../../queries/c/imports.scm"),
+    )
+}
+
+/// 为 C++ 加载编译期查询文件（复用 queries/c/ 下的 query 文件）
+pub fn load_cpp_queries() -> LanguageQueries {
+    LanguageQueries::new(
+        include_str!("../../../queries/c/symbols.scm"),
+        include_str!("../../../queries/c/calls.scm"),
+        include_str!("../../../queries/c/imports.scm"),
+    )
+}
+
 /// 为 Kotlin 加载编译期查询文件
 pub fn load_kotlin_queries() -> LanguageQueries {
     LanguageQueries::new(

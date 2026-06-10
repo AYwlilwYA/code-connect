@@ -15,6 +15,8 @@ tree-sitter-typescript.workspace = true
 tree-sitter-java.workspace = true
 # tree-sitter-kotlin.workspace = true
 tree-sitter-c-sharp.workspace = true
+tree-sitter-c = { workspace = true }
+tree-sitter-cpp = { workspace = true }
 
 rayon.workspace = true
 serde.workspace = true

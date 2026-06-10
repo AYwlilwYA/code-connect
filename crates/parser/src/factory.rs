@@ -55,6 +55,8 @@ impl ParserRegistry {
             "java" => "java",
             "kt" | "kts" => "kotlin",
             "cs" => "csharp",
+            "c" | "h" => "c",
+            "cpp" | "hpp" | "cc" | "cxx" | "c++" | "h++" | "hh" | "hxx" => "cpp",
             other => other,
         };
 

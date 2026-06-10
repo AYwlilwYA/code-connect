@@ -38,6 +38,8 @@ tree-sitter-typescript = "0.23"
 tree-sitter-java = "0.23"
 # tree-sitter-kotlin = { git = "https://github.com/fwcd/tree-sitter-kotlin" }  # 待后续启用
 tree-sitter-c-sharp = "0.23"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
 
 # === 存储 ===
 tantivy = "0.22"
