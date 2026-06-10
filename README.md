@@ -23,30 +23,37 @@
 
 > Kotlin 支持待其 tree-sitter grammar 稳定后启用。
 
-## 编译安装方法
+## 安装
 
-### 前置要求
+### 下载预编译版本（推荐）
 
-- **Rust 1.80+**（[安装 rustup](https://rustup.rs)）
-- **C 编译器**（tree-sitter grammar 以 C 源码编译，需要系统安装 C 工具链）：
-  - **Windows**：安装 [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)（选"使用 C++ 的桌面开发"工作负载）或 [LLVM/Clang](https://releases.llvm.org/)
-  - **Linux**：`sudo apt install build-essential`（Debian/Ubuntu）或 `sudo dnf install gcc`（Fedora）
-  - **macOS**：`xcode-select --install`（自动安装命令行工具含 clang）
-- **Git**（可选，变更对比功能需要）
+从 [Releases](https://github.com/AYwlilwYA/code-connect/releases) 下载对应平台的最新版本：
 
-### 直接下载预编译版本
+| 平台 | 文件 |
+|------|------|
+| Windows (x64) | `codeconnect-windows-x64.exe` |
+| Linux (x64) | `codeconnect-linux-x64` |
+| macOS (x64) | `codeconnect-macos-x64` |
 
-从 [Releases](https://github.com/AYwlilwYA/code-connect/releases) 页面下载对应平台的二进制文件：
+**Windows**：将 `.exe` 放到任意 PATH 目录（如 `C:\Windows`），或在系统环境变量中添加所在目录。
 
-| 平台 | 文件名 |
-|------|--------|
-| Windows (x64) | `codeconnect.exe` |
-| Linux (x64) | `codeconnect` |
-| macOS (x64) | `codeconnect` |
+**Linux / macOS**：
+```bash
+chmod +x codeconnect-linux-x64
+sudo cp codeconnect-linux-x64 /usr/local/bin/codeconnect
+```
 
-下载后放到 PATH 中即可使用。
+### 接入 Claude Code
 
-### 从源码编译安装
+```bash
+codeconnect mcp-setup --global
+```
+
+重启 Claude Code，然后 `/mcp` 确认 codeconnect 已连接。即可在对话中用自然语言分析代码。
+
+### 从源码编译
+
+需要 Rust 1.80+ 和 C 编译器。
 
 ```bash
 git clone https://github.com/AYwlilwYA/code-connect.git
