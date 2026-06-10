@@ -32,10 +32,22 @@
   - **macOS**：`xcode-select --install`（自动安装命令行工具含 clang）
 - **Git**（可选，变更对比功能需要）
 
+### 直接下载预编译版本
+
+从 [Releases](https://github.com/AYwlilwYA/code-connect/releases) 页面下载对应平台的二进制文件：
+
+| 平台 | 文件名 |
+|------|--------|
+| Windows (x64) | `codeconnect.exe` |
+| Linux (x64) | `codeconnect` |
+| macOS (x64) | `codeconnect` |
+
+下载后放到 PATH 中即可使用。
+
 ### 从源码编译安装
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/AYwlilwYA/code-connect.git
 cd code-connect
 cargo build --release
 ```
