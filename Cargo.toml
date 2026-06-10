@@ -19,7 +19,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/user/code-connect"
+repository = "https://github.com/AYwlilwYA/code-connect"
 description = "高性能多语言代码分析工具 — 面向 LLM Agent 的 MCP 服务器"
 
 [workspace.dependencies]

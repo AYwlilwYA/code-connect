@@ -51,8 +51,11 @@ pub async fn run(
 
     // 注意：query_engine 已消费 tantivy 和 sled 的所有权，
     // ToolRegistry 通过 query_engine 访问它们。
+    // 同时传入 project_root 和 data_dir，供 handle_reindex 调用 CLI 索引命令。
     let registry = ToolRegistry::new()
-        .with_query_engine(query_engine);
+        .with_query_engine(query_engine)
+        .with_project_root(project_root.to_path_buf())
+        .with_data_dir(data_dir.to_path_buf());
 
     // 创建并启动服务器
     let server = CodeConnectServer::new(registry);

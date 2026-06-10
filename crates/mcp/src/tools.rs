@@ -25,6 +25,7 @@
 //! | `get_file_symbols` | 文件内符号列表 | [`GetFileSymbolsParams`] |
 //! | `get_dependency_graph` | 获取依赖图 | [`GetDependencyGraphParams`] |
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -48,6 +49,10 @@ pub struct ToolRegistry {
     pub tantivy: Option<Arc<codeconnect_index::tantivy_index::TantivyIndex>>,
     /// 查询引擎（组合 sled + tantivy）
     pub query_engine: Option<Arc<codeconnect_index::query_engine::QueryEngine>>,
+    /// 项目根目录路径（用于重新索引时传递给 CLI）
+    pub project_root: Option<PathBuf>,
+    /// 索引数据目录路径（用于重新索引时传递给 CLI）
+    pub data_dir: Option<PathBuf>,
 }
 
 impl ToolRegistry {
@@ -57,6 +62,8 @@ impl ToolRegistry {
             sled: None,
             tantivy: None,
             query_engine: None,
+            project_root: None,
+            data_dir: None,
         }
     }
 
@@ -75,6 +82,18 @@ impl ToolRegistry {
     /// 设置查询引擎实例
     pub fn with_query_engine(mut self, qe: Arc<codeconnect_index::query_engine::QueryEngine>) -> Self {
         self.query_engine = Some(qe);
+        self
+    }
+
+    /// 设置项目根目录路径
+    pub fn with_project_root(mut self, path: PathBuf) -> Self {
+        self.project_root = Some(path);
+        self
+    }
+
+    /// 设置索引数据目录路径
+    pub fn with_data_dir(mut self, path: PathBuf) -> Self {
+        self.data_dir = Some(path);
         self
     }
 }
@@ -444,7 +463,10 @@ pub fn handle_get_metrics(
         None => return McpResponse::error("查询引擎未初始化"),
     };
 
-    let all_ids = query_engine.scan_all_ids().unwrap_or_default();
+    let all_ids = match query_engine.scan_all_ids() {
+        Ok(ids) => ids,
+        Err(e) => return McpResponse::error(&format!("扫描符号 ID 失败: {}", e)),
+    };
 
     let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy(sled, &all_ids) {
         Ok(g) => g,
@@ -596,22 +618,47 @@ pub fn handle_detect_dead_code(
 }
 
 /// 架构规则验证 handler
+///
+/// 检查依赖图是否违反架构约束规则。
+/// 当前 `CheckArchRulesParams` 仅接受 `rule_names`（名称列表），
+/// 不包含规则的 source_pattern / target_pattern 等具体定义，
+/// 因此无法执行实际规则检查。此功能预留待后续扩展启用了规则定义的 API 后启用。
 pub fn handle_check_arch_rules(
     registry: &ToolRegistry,
     params: CheckArchRulesParams,
 ) -> McpResponse<serde_json::Value> {
-    let _ = registry;
     let start = Instant::now();
 
+    let sled = match &registry.sled {
+        Some(s) => s,
+        None => return McpResponse::error("存储未初始化"),
+    };
+
+    // 构建依赖图以验证底层基础设施可用
+    let arch_query = match codeconnect_services::arch_query::ArchQuery::new(sled) {
+        Ok(aq) => aq,
+        Err(e) => return McpResponse::error(&format!("构建依赖图失败: {}", e)),
+    };
+
+    let has_cycle = arch_query.has_cycle();
+    let cycles = if has_cycle { arch_query.detect_cycles() } else { Vec::new() };
+
     let result = serde_json::json!({
-        "checked_rules": params.rule_names.unwrap_or_default(),
+        "status": "pending",
+        "requested_rules": params.rule_names.unwrap_or_default(),
+        "graph_stats": {
+            "node_count": arch_query.get_dependency_graph().0.len(),
+            "edge_count": arch_query.get_dependency_graph().1.len(),
+            "has_cycle": has_cycle,
+            "cycle_count": cycles.len(),
+        },
         "violations": [],
-        "status": "pass",
-        "hint": "架构规则验证需要在完整索引和依赖图之上运行",
+        "hint": "该功能需要在 MCP 工具参数中提供完整的规则定义（source_pattern、target_pattern、rule_type），当前仅支持依赖图结构查询。请使用 get_dependency_graph 获取依赖关系。",
     });
 
+    let total = 0;
     let elapsed = start.elapsed().as_millis() as u64;
-    McpResponse::success(result, 0, 0, elapsed)
+    McpResponse::success(result, total, total, elapsed)
 }
 
 /// 语义搜索 handler
@@ -715,34 +762,57 @@ pub fn handle_find_references(
 }
 
 /// 重新索引 handler
-pub fn handle_reindex(
+///
+/// 通过调用 `codeconnect index` CLI 命令来执行索引构建。
+/// 这样可以复用 CLI 中已有的完整索引逻辑，避免将整个索引引擎引入 MCP server 的依赖。
+pub async fn handle_reindex(
     registry: &ToolRegistry,
     params: ReindexParams,
 ) -> McpResponse<serde_json::Value> {
-    let _ = registry;
     let start = Instant::now();
 
-    let result = if params.full {
-        serde_json::json!({
-            "status": "full_reindex_in_progress",
-            "hint": "全量重建索引正在进行，请在 get_index_status 中查看进度",
-        })
-    } else if let Some(ref file_paths) = params.file_paths {
-        serde_json::json!({
-            "status": "incremental_reindex",
-            "file_count": file_paths.len(),
-            "files": file_paths,
-            "hint": "增量索引更新中",
-        })
-    } else {
-        serde_json::json!({
-            "status": "reindex",
-            "hint": "未指定文件，使用全量重建",
-        })
+    // 检查必要的路径参数是否已配置
+    let project_root = match &registry.project_root {
+        Some(p) => p.clone(),
+        None => return McpResponse::error("项目根目录未配置，无法执行重新索引"),
     };
 
-    let elapsed = start.elapsed().as_millis() as u64;
-    McpResponse::success(result, 0, 0, elapsed)
+    // 构建 CLI 命令参数（data_dir 由 CLI 根据配置文件自动推断，无需显式传入）
+    let mut cmd = tokio::process::Command::new("codeconnect");
+    cmd.arg("index");
+    cmd.arg("--project-root");
+    cmd.arg(project_root.to_string_lossy().as_ref());
+
+    // 全量重建模式
+    if params.full {
+        cmd.arg("--force");
+    }
+
+    // 执行命令
+    let output = match cmd.output().await {
+        Ok(o) => o,
+        Err(e) => {
+            return McpResponse::<serde_json::Value>::error(
+                &format!("执行 codeconnect index 失败: {}", e),
+            );
+        }
+    };
+
+    if output.status.success() {
+        let result = serde_json::json!({
+            "status": "reindex_complete",
+            "mode": if params.full { "full" } else { "incremental" },
+        });
+        let elapsed = start.elapsed().as_millis() as u64;
+        McpResponse::success(result, 1, 1, elapsed)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        McpResponse::error(
+            &format!("codeconnect index 命令执行失败 (exit code: {}): {}",
+                output.status.code().unwrap_or(-1),
+                stderr.trim()),
+        )
+    }
 }
 
 /// 获取索引状态 handler
@@ -844,13 +914,26 @@ pub fn handle_list_files(
 }
 
 /// 获取类型继承链 handler
+///
+/// 从 sled 存储中的符号构建类型层次图，然后查询目标符号的祖先/后代。
 pub fn handle_get_type_hierarchy(
     registry: &ToolRegistry,
     params: GetTypeHierarchyParams,
 ) -> McpResponse<serde_json::Value> {
     let start = Instant::now();
 
-    // 从 tantivy 获取符号名称
+    let sled = match &registry.sled {
+        Some(s) => s,
+        None => return McpResponse::error("存储未初始化"),
+    };
+
+    // 从 sled 符号存储构建完整的类型层次图
+    let type_hierarchy = match codeconnect_graph::type_hierarchy::TypeHierarchy::build_from_sled(sled) {
+        Ok(h) => h,
+        Err(e) => return McpResponse::error(&format!("构建类型层次图失败: {}", e)),
+    };
+
+    // 从 tantivy 获取符号名称（用于在层次图中查找）
     let symbol_name = match &registry.query_engine {
         Some(q) => match q.get_symbol_by_id(&params.symbol_id) {
             Ok(Some(sym)) => sym.name,
@@ -858,8 +941,6 @@ pub fn handle_get_type_hierarchy(
         },
         None => params.symbol_id.clone(),
     };
-
-    let type_hierarchy = codeconnect_graph::type_hierarchy::TypeHierarchy::new();
 
     let mut ancestors = Vec::new();
     let mut descendants = Vec::new();
@@ -899,10 +980,15 @@ pub fn handle_get_type_hierarchy(
         },
         "ancestors": ancestors,
         "descendants": descendants,
+        "graph_stats": {
+            "total_types": type_hierarchy.node_count(),
+            "total_edges": type_hierarchy.edge_count(),
+        },
     });
 
+    let total = ancestors.len() + descendants.len();
     let elapsed = start.elapsed().as_millis() as u64;
-    McpResponse::success(result, 0, 0, elapsed)
+    McpResponse::success(result, total, total, elapsed)
 }
 
 /// 获取文件内所有符号 handler
@@ -934,26 +1020,78 @@ pub fn handle_get_file_symbols(
 }
 
 /// 获取依赖图 handler
+///
+/// 从 sled 的 import 记录构建文件级依赖图并返回。
 pub fn handle_get_dependency_graph(
     registry: &ToolRegistry,
     params: GetDependencyGraphParams,
 ) -> McpResponse<serde_json::Value> {
-    let _ = registry;
     let start = Instant::now();
 
-    let _level = params.level;
-    let _file_path = params.file_path;
+    let sled = match &registry.sled {
+        Some(s) => s,
+        None => return McpResponse::error("存储未初始化"),
+    };
 
-    // 依赖图构建需要完整的导入解析和模块分析
+    let arch_query = match codeconnect_services::arch_query::ArchQuery::new(sled) {
+        Ok(aq) => aq,
+        Err(e) => return McpResponse::error(&format!("构建依赖图失败: {}", e)),
+    };
+
+    let (nodes, edges) = arch_query.get_dependency_graph();
+
+    // 如果指定了 file_path，过滤只包含与该文件相关的节点和边
+    let (filtered_nodes, filtered_edges) = if let Some(ref file_path) = params.file_path {
+        // 包含该文件本身及其直接依赖和被依赖节点
+        let mut relevant_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        relevant_ids.insert(file_path.clone());
+
+        // 该文件的直接依赖
+        for dep in arch_query.get_dependencies(file_path) {
+            relevant_ids.insert(dep.id.clone());
+        }
+        // 该文件的被依赖节点
+        for dep in arch_query.get_dependents(file_path) {
+            relevant_ids.insert(dep.id.clone());
+        }
+
+        let filtered_nodes: Vec<_> = nodes
+            .into_iter()
+            .filter(|n| relevant_ids.contains(&n.id))
+            .collect();
+        let filtered_edges: Vec<_> = edges
+            .into_iter()
+            .filter(|(src, tgt, _)| relevant_ids.contains(&src.id) && relevant_ids.contains(&tgt.id))
+            .collect();
+        (filtered_nodes, filtered_edges)
+    } else {
+        (nodes, edges)
+    };
+
     let result = serde_json::json!({
-        "level": _level,
-        "nodes": [],
-        "edges": [],
-        "hint": "依赖图功能需要在导入解析（后续 Phase）完成后可用",
+        "level": params.level,
+        "nodes": filtered_nodes.iter().map(|n| {
+            serde_json::json!({
+                "id": n.id,
+                "name": n.name,
+                "kind": format!("{:?}", n.kind),
+            })
+        }).collect::<Vec<_>>(),
+        "edges": filtered_edges.iter().map(|(src, tgt, edge)| {
+            serde_json::json!({
+                "source": src.id,
+                "target": tgt.id,
+                "edge_type": edge.edge_type,
+                "count": edge.count,
+            })
+        }).collect::<Vec<_>>(),
+        "total_nodes": filtered_nodes.len(),
+        "total_edges": filtered_edges.len(),
     });
 
+    let total = filtered_nodes.len();
     let elapsed = start.elapsed().as_millis() as u64;
-    McpResponse::success(result, 0, 0, elapsed)
+    McpResponse::success(result, total, total, elapsed)
 }
 
 // ============================================================================
