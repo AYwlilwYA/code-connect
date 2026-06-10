@@ -10,7 +10,8 @@ use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocumen
 use codeconnect_core::error::CodeConnectError;
 
 /// 当前 Schema 版本号（用于迁移检测）
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+/// v2: 新增位置字段 (line, column, end_line, end_column)，doc_comment 改为 STORED
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// 符号文档 Schema 定义
 ///
@@ -31,7 +32,7 @@ pub struct SymbolSchema {
     pub file_path: Field,
     /// 签名（索引 + 存储）
     pub signature: Field,
-    /// 文档注释（索引）
+    /// 文档注释（索引 + 存储 — v2 改为 STORED）
     pub doc_comment: Field,
     /// 定义文本（索引）
     pub definition: Field,
@@ -47,6 +48,14 @@ pub struct SymbolSchema {
     pub ast_hash: Field,
     /// 是否公开 API（存储 + 快速字段）
     pub is_exported: Field,
+    /// 起始行号（存储，v2 新增）
+    pub line: Field,
+    /// 起始列号（存储，v2 新增）
+    pub column: Field,
+    /// 结束行号（存储，v2 新增）
+    pub end_line: Field,
+    /// 结束列号（存储，v2 新增）
+    pub end_column: Field,
 }
 
 impl SymbolSchema {
@@ -66,7 +75,7 @@ impl SymbolSchema {
         let language = schema_builder.add_text_field("language", STRING | STORED);
         let file_path = schema_builder.add_text_field("file_path", STRING | STORED);
         let signature = schema_builder.add_text_field("signature", TEXT | STORED);
-        let doc_comment = schema_builder.add_text_field("doc_comment", TEXT);
+        let doc_comment = schema_builder.add_text_field("doc_comment", TEXT | STORED);
         let definition = schema_builder.add_text_field("definition", TEXT);
         let body_text = schema_builder.add_text_field("body_text", TEXT);
         let parent_type = schema_builder.add_text_field("parent_type", STRING | STORED);
@@ -74,6 +83,10 @@ impl SymbolSchema {
         let complexity = schema_builder.add_u64_field("complexity", STORED | FAST);
         let ast_hash = schema_builder.add_text_field("ast_hash", STRING | STORED);
         let is_exported = schema_builder.add_bool_field("is_exported", STORED | FAST);
+        let line = schema_builder.add_u64_field("line", STORED);
+        let column = schema_builder.add_u64_field("column", STORED);
+        let end_line = schema_builder.add_u64_field("end_line", STORED);
+        let end_column = schema_builder.add_u64_field("end_column", STORED);
 
         let schema = schema_builder.build();
 
@@ -93,6 +106,10 @@ impl SymbolSchema {
             complexity,
             ast_hash,
             is_exported,
+            line,
+            column,
+            end_line,
+            end_column,
         }
     }
 }
@@ -175,6 +192,10 @@ impl TantivyIndex {
         complexity: u64,
         ast_hash: &str,
         is_exported: bool,
+        line: u64,
+        column: u64,
+        end_line: u64,
+        end_column: u64,
     ) -> Result<(), CodeConnectError> {
         let doc = doc!(
             self.schema.stable_id => stable_id,
@@ -191,6 +212,10 @@ impl TantivyIndex {
             self.schema.complexity => complexity,
             self.schema.ast_hash => ast_hash,
             self.schema.is_exported => is_exported,
+            self.schema.line => line,
+            self.schema.column => column,
+            self.schema.end_line => end_line,
+            self.schema.end_column => end_column,
         );
 
         self.writer
@@ -240,29 +265,159 @@ impl TantivyIndex {
             .iter()
             .map(|(score, doc_addr)| {
                 let doc: TantivyDocument = searcher.doc(*doc_addr).unwrap();
+                // 辅助函数：从文档中提取 STORED 文本字段，缺失时返回空字符串
+                let get_text = |field: Field| -> String {
+                    doc.get_first(field)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                // 辅助函数：从文档中提取 u64 字段
+                let get_u64 = |field: Field| -> u64 {
+                    doc.get_first(field)
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                };
+                // 辅助函数：从文档中提取 bool 字段
+                let get_bool = |field: Field| -> bool {
+                    doc.get_first(field)
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                };
+
                 SymbolSearchResult {
-                    stable_id: doc
-                        .get_first(self.schema.stable_id)
-                        .unwrap()
-                        .as_str()
-                        .unwrap()
-                        .to_string(),
-                    name: doc
-                        .get_first(self.schema.name)
-                        .unwrap()
-                        .as_str()
-                        .unwrap()
-                        .to_string(),
-                    kind: doc
-                        .get_first(self.schema.kind)
-                        .unwrap()
-                        .as_str()
-                        .unwrap()
-                        .to_string(),
+                    stable_id: get_text(self.schema.stable_id),
+                    name: get_text(self.schema.name),
+                    kind: get_text(self.schema.kind),
+                    language: get_text(self.schema.language),
+                    file_path: get_text(self.schema.file_path),
+                    signature: get_text(self.schema.signature),
+                    doc_comment: get_text(self.schema.doc_comment),
+                    parent_type: get_text(self.schema.parent_type),
+                    modifiers: get_text(self.schema.modifiers),
+                    complexity: get_u64(self.schema.complexity),
+                    ast_hash: get_text(self.schema.ast_hash),
+                    is_exported: get_bool(self.schema.is_exported),
+                    line: get_u64(self.schema.line),
+                    column: get_u64(self.schema.column),
+                    end_line: get_u64(self.schema.end_line),
+                    end_column: get_u64(self.schema.end_column),
                     score: *score,
                 }
             })
             .collect();
+
+        Ok(results)
+    }
+
+    /// 按稳定 ID 精确搜索符号
+    ///
+    /// 使用 tantivy term query 对 `stable_id` 字段（STRING 类型，不分词）进行精确匹配。
+    /// 返回 None 表示该符号不存在。
+    pub fn search_by_id(&self, stable_id: &str) -> Result<Option<SymbolSearchResult>, CodeConnectError> {
+        self.reader
+            .reload()
+            .map_err(|e| CodeConnectError::Index(format!("重新加载失败: {}", e)))?;
+
+        let searcher = self.reader.searcher();
+
+        // 对 STRING 类型的 stable_id 字段使用 Term 查询（精确匹配）
+        use tantivy::query::TermQuery;
+        use tantivy::Term;
+        let term = Term::from_field_text(self.schema.stable_id, stable_id);
+        let query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+
+        let top_docs = searcher
+            .search(&query, &TopDocs::with_limit(1))
+            .map_err(|e| CodeConnectError::Query(format!("精确查询失败: {}", e)))?;
+
+        if top_docs.is_empty() {
+            return Ok(None);
+        }
+
+        let (_score, doc_addr) = &top_docs[0];
+        let doc: TantivyDocument = searcher.doc(*doc_addr)
+            .map_err(|e| CodeConnectError::Index(format!("读取文档失败: {}", e)))?;
+
+        let get_text = |field: Field| -> String {
+            doc.get_first(field)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let get_u64 = |field: Field| -> u64 {
+            doc.get_first(field)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        };
+        let get_bool = |field: Field| -> bool {
+            doc.get_first(field)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        };
+
+        Ok(Some(SymbolSearchResult {
+            stable_id: get_text(self.schema.stable_id),
+            name: get_text(self.schema.name),
+            kind: get_text(self.schema.kind),
+            language: get_text(self.schema.language),
+            file_path: get_text(self.schema.file_path),
+            signature: get_text(self.schema.signature),
+            doc_comment: get_text(self.schema.doc_comment),
+            parent_type: get_text(self.schema.parent_type),
+            modifiers: get_text(self.schema.modifiers),
+            complexity: get_u64(self.schema.complexity),
+            ast_hash: get_text(self.schema.ast_hash),
+            is_exported: get_bool(self.schema.is_exported),
+            line: get_u64(self.schema.line),
+            column: get_u64(self.schema.column),
+            end_line: get_u64(self.schema.end_line),
+            end_column: get_u64(self.schema.end_column),
+            score: *_score,
+        }))
+    }
+
+    /// 扫描所有符号的 ID 和名称
+    ///
+    /// 用于死代码检测等需要遍历所有符号的场景。
+    /// 返回 (stable_id, name) 对列表。
+    pub fn scan_all_ids(&self) -> Result<Vec<(String, String)>, CodeConnectError> {
+        self.reader
+            .reload()
+            .map_err(|e| CodeConnectError::Index(format!("重新加载失败: {}", e)))?;
+
+        let searcher = self.reader.searcher();
+        let mut results = Vec::new();
+
+        for doc_addr in searcher
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .flat_map(|(segment_ord, reader)| {
+                reader
+                    .doc_ids_alive()
+                    .map(move |doc_id| tantivy::DocAddress {
+                        segment_ord: segment_ord as u32,
+                        doc_id,
+                    })
+            })
+        {
+            if let Ok(doc) = searcher.doc::<TantivyDocument>(doc_addr) {
+                let id = doc
+                    .get_first(self.schema.stable_id)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = doc
+                    .get_first(self.schema.name)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !id.is_empty() {
+                    results.push((id, name));
+                }
+            }
+        }
 
         Ok(results)
     }
@@ -279,7 +434,9 @@ impl TantivyIndex {
 
 /// 搜索结果
 ///
-/// 包含符号标识信息和相关度评分。
+/// 包含符号标识信息、相关度评分，以及完整的符号文档字段。
+/// 从 tantivy 的 STORED 字段中提取所有数据，调用方无需
+/// 再查询 sled 即可获得完整的 Symbol 信息。
 #[derive(Debug, Clone)]
 pub struct SymbolSearchResult {
     /// 稳定符号 ID
@@ -288,6 +445,32 @@ pub struct SymbolSearchResult {
     pub name: String,
     /// 符号类型
     pub kind: String,
+    /// 编程语言
+    pub language: String,
+    /// 文件路径
+    pub file_path: String,
+    /// 函数签名
+    pub signature: String,
+    /// 文档注释
+    pub doc_comment: String,
+    /// 所属类型/类
+    pub parent_type: String,
+    /// 修饰符
+    pub modifiers: String,
+    /// 圈复杂度
+    pub complexity: u64,
+    /// AST 结构哈希
+    pub ast_hash: String,
+    /// 是否公开 API
+    pub is_exported: bool,
+    /// 起始行号（1-based）
+    pub line: u64,
+    /// 起始列号（1-based）
+    pub column: u64,
+    /// 结束行号（1-based）
+    pub end_line: u64,
+    /// 结束列号（1-based）
+    pub end_column: u64,
     /// 相关度评分（BM25）
     pub score: f32,
 }
