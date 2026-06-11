@@ -27,6 +27,7 @@ use petgraph::Direction;
 use codeconnect_core::types::{CallEdge, CallType, Symbol, SymbolKind};
 use codeconnect_core::error::CodeConnectError;
 use codeconnect_index::sled_store::SledStore;
+use codeconnect_index::tantivy_index::CallEdgeIndex;
 
 // ============================================================================
 // 图节点
@@ -422,6 +423,7 @@ impl CallGraph {
     /// # 参数
     /// - `sled` — 已打开的 sled 数据库实例（用于读取调用边）
     /// - `all_symbol_ids` — 从 tantivy 扫描到的所有 (stable_id, name) 对
+    #[deprecated(note = "调用边已迁入 tantivy 调用边索引，请使用 build_from_tantivy_edges")]
     pub fn build_from_tantivy(
         sled: &SledStore,
         all_symbol_ids: &[(String, String)],
@@ -455,6 +457,71 @@ impl CallGraph {
             let (_key, value) = item?;
 
             let call_edge: CallEdge = serde_json::from_slice(&value).map_err(|e| {
+                CodeConnectError::Serialization(e)
+            })?;
+
+            let caller_key = &call_edge.caller_id;
+            let callee_key = &call_edge.callee_id;
+
+            let caller_id = Self::resolve_symbol_ref(
+                &call_graph, &name_to_stable, caller_key,
+            );
+
+            let callee_id = Self::resolve_symbol_ref(
+                &call_graph, &name_to_stable, callee_key,
+            );
+
+            Self::ensure_node_exists(&mut call_graph, &caller_id, caller_key);
+            Self::ensure_node_exists(&mut call_graph, &callee_id, callee_key);
+
+            call_graph.add_edge(&caller_id, &callee_id, call_edge);
+        }
+
+        Ok(call_graph)
+    }
+
+    /// 从 tantivy 符号索引 + tantivy 调用边索引构建调用图
+    ///
+    /// 这是构建调用图的**新主方法**。调用边已从 sled 迁入 tantivy 调用边索引，
+    /// 避免 sled append-only 导致的磁盘膨胀。
+    ///
+    /// # 构建过程
+    /// 1. 将 tantivy 扫描到的所有符号作为节点加入图
+    /// 2. 从 tantivy 调用边索引扫描所有调用边，反序列化 CallEdge
+    /// 3. 解析 caller/callee 并添加边
+    ///
+    /// # 参数
+    /// - `call_edge_index` — tantivy 调用边索引（替代 sled edges 命名空间）
+    /// - `all_symbol_ids` — 从 tantivy 扫描到的所有 (stable_id, name) 对
+    pub fn build_from_tantivy_edges(
+        call_edge_index: &CallEdgeIndex,
+        all_symbol_ids: &[(String, String)],
+    ) -> Result<Self, CodeConnectError> {
+        let mut call_graph = CallGraph::new();
+
+        // ================================================================
+        // 第一步：将 tantivy 扫描到的所有符号作为节点加入图
+        // ================================================================
+        let mut name_to_stable: HashMap<String, Vec<String>> = HashMap::new();
+
+        for (stable_id, name) in all_symbol_ids {
+            let node = SymbolNode {
+                symbol_id: stable_id.clone(),
+                name: name.clone(),
+                kind: SymbolKind::Function, // 占位
+                file_path: String::new(),
+            };
+            call_graph.add_node(node);
+            name_to_stable.entry(name.clone()).or_default().push(stable_id.clone());
+        }
+
+        // ================================================================
+        // 第二步：从 tantivy 调用边索引扫描所有调用边
+        // ================================================================
+        let edge_jsons = call_edge_index.scan_all_edges()?;
+
+        for edge_json_str in &edge_jsons {
+            let call_edge: CallEdge = serde_json::from_str(edge_json_str).map_err(|e| {
                 CodeConnectError::Serialization(e)
             })?;
 

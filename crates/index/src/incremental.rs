@@ -19,12 +19,12 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use codeconnect_core::error::CodeConnectError;
 use codeconnect_core::types::{FileMeta, SymbolKind};
 use crate::sled_store::SledStore;
-use crate::tantivy_index::TantivyIndex;
+use crate::tantivy_index::{CallEdgeIndex, TantivyIndex};
 use codeconnect_parser::factory::ParserRegistry;
 use codeconnect_watcher::watcher::FileWatcher;
 use tokio::sync::mpsc;
@@ -34,7 +34,7 @@ use tokio::sync::mpsc;
 /// 封装文件监控和增量索引更新逻辑，提供统一的启动入口。
 ///
 /// 持有所有索引和解析所需的共享资源：项目根目录、
-/// sled 存储、tantivy 索引、解析器注册表。
+/// sled 存储、tantivy 符号索引、tantivy 调用边索引、解析器注册表。
 pub struct IncrementalIndexer {
     /// 项目根目录
     project_root: PathBuf,
@@ -42,6 +42,9 @@ pub struct IncrementalIndexer {
     sled: Arc<SledStore>,
     /// tantivy 全文搜索索引
     tantivy: Arc<TantivyIndex>,
+    /// tantivy 调用边索引（替代 sled edges 命名空间）
+    /// 使用 Mutex 包装以支持内部可变性（commit 需要 &mut self）
+    call_edge_index: Mutex<CallEdgeIndex>,
     /// 解析器注册表
     parser_registry: Arc<ParserRegistry>,
 }
@@ -53,18 +56,21 @@ impl IncrementalIndexer {
     ///
     /// - `project_root` — 项目根目录路径
     /// - `sled` — 已打开的 sled 存储实例
-    /// - `tantivy` — 已初始化的 tantivy 索引实例
+    /// - `tantivy` — 已初始化的 tantivy 符号索引实例
+    /// - `call_edge_index` — 已初始化的 tantivy 调用边索引实例
     /// - `parser_registry` — 已注册所有语言解析器的注册表
     pub fn new(
         project_root: &Path,
         sled: Arc<SledStore>,
         tantivy: Arc<TantivyIndex>,
+        call_edge_index: CallEdgeIndex,
         parser_registry: Arc<ParserRegistry>,
     ) -> Self {
         Self {
             project_root: project_root.to_path_buf(),
             sled,
             tantivy,
+            call_edge_index: Mutex::new(call_edge_index),
             parser_registry,
         }
     }
@@ -197,11 +203,11 @@ impl IncrementalIndexer {
             };
 
             let symbols = parser.extract_symbols(&tree, &source, file_path);
-            let _calls = parser.extract_calls(&tree, &source, file_path);
+            let calls = parser.extract_calls(&tree, &source, file_path);
             let _imports = parser.extract_imports(&tree, &source, file_path);
 
             // ---- 第六步：写入新索引数据 ----
-            self.write_file_index(&relative_path, &new_hash, language, &symbols)?;
+            self.write_file_index(&relative_path, &new_hash, language, &symbols, &calls)?;
 
             tracing::debug!(
                 "重索引完成: {} ({} 个符号)",
@@ -211,9 +217,14 @@ impl IncrementalIndexer {
             reindexed_count += 1;
         }
 
-        // 提交 tantivy 并刷写 sled
-        // 注意: 由于我们持有 Arc<TantivyIndex> 而非 &mut，这里的 commit 是有限制的
-        // 在主流程中由 FullIndexer 或外部调用者负责 commit
+        // 提交 tantivy 调用边索引
+        // 注意：由于我们持有 Arc<TantivyIndex> 而非 &mut，符号索引的 commit 有受限。
+        // 符号索引的提交在 run() 中通过外部调用者负责。
+        if let Ok(mut edge_index) = self.call_edge_index.lock() {
+            if let Err(e) = edge_index.commit() {
+                tracing::error!("提交调用边索引失败: {}", e);
+            }
+        }
 
         tracing::info!(
             "增量索引完成: {} 重索引 / {} 跳过",
@@ -226,13 +237,10 @@ impl IncrementalIndexer {
 
     /// 从索引中移除文件的所有关联数据
     ///
-    /// 包括：文件元信息、文件→符号映射、文件指纹。
+    /// 包括：文件元信息、文件指纹。
     /// 符号定义存储在 tantivy 中，需要全量重建才能清理（tantivy 不支持按 ID 删除）。
-    /// 通常在文件被删除或即将重索引前调用。
+    /// 文件→符号映射不再存 sled，通过 tantivy search_by_file_path 查询。
     fn remove_file_from_index(&self, relative_path: &str) -> Result<(), CodeConnectError> {
-        // 删除文件→符号映射
-        let _ = self.sled.remove_file_symbols(relative_path);
-
         // 删除文件元信息
         let _ = self.sled.remove_file_meta(relative_path);
 
@@ -244,16 +252,19 @@ impl IncrementalIndexer {
 
     /// 将文件的解析结果写入索引存储
     ///
-    /// 包括：文件元信息、符号定义、文件指纹、文件→符号映射。
-    /// 亦将每个符号通过 tantivy 添加到全文搜索索引。
+    /// 包括：文件元信息（sled）、符号定义（tantivy 符号索引）、
+    /// 调用边（tantivy 调用边索引）、文件指纹（sled）。
+    /// sled 不再存储文件→符号映射（file_symbols），该映射可通过 tantivy 的
+    /// search_by_file_path 直接查询，且无需维护两边一致性。
     fn write_file_index(
         &self,
         relative_path: &str,
         content_hash: &str,
         language: &str,
         symbols: &[codeconnect_core::types::Symbol],
+        calls: &[codeconnect_core::types::CallSite],
     ) -> Result<(), CodeConnectError> {
-        // ---- 写入文件元信息 ----
+        // ---- 写入文件元信息（sled） ----
         let file_meta = FileMeta {
             file_path: relative_path.to_string(),
             language: language.to_string(),
@@ -269,23 +280,92 @@ impl IncrementalIndexer {
             .map_err(|e| CodeConnectError::Index(format!("序列化文件元信息失败: {}", e)))?;
         self.sled.put_file_meta(relative_path, &meta_bytes)?;
 
-        // ---- 收集文件内所有符号 ID ----
-        let mut file_symbol_ids: Vec<String> = Vec::with_capacity(symbols.len());
-
-        // ---- 写入每个符号定义 ----
+        // ---- 写入每个符号定义（tantivy 符号索引） ----
         // 符号数据只存入 tantivy，sled 不再冗余存储。
+        // 文件→符号映射通过 tantivy 的 search_by_file_path 查询。
         for symbol in symbols {
-            file_symbol_ids.push(symbol.id.clone());
             Self::add_symbol_to_tantivy(&self.tantivy, symbol, language, relative_path)?;
         }
 
-        // ---- 写入文件→符号映射 ----
-        let file_symbol_bytes = serde_json::to_vec(&file_symbol_ids)
-            .map_err(|e| CodeConnectError::Index(format!("序列化文件符号映射失败: {}", e)))?;
-        self.sled
-            .put_file_symbols(relative_path, &file_symbol_bytes)?;
+        // ---- 写入调用边（tantivy 调用边索引） ----
+        // 建立从符号名到 StableSymbolId 的快速查找表
+        let name_to_sym_id: std::collections::HashMap<&str, &str> = symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.id.as_str()))
+            .collect();
 
-        // ---- 写入文件指纹 ----
+        for call in calls {
+            if call.callee_name.is_empty() {
+                continue;
+            }
+
+            // 被调用方 ID：优先匹配文件内符号的 StableSymbolId，否则直接用 callee_name
+            let callee_id = name_to_sym_id
+                .get(call.callee_name.as_str())
+                .map(|&id| id.to_string())
+                .unwrap_or_else(|| call.callee_name.clone());
+
+            // 如果 CallSite 已有 caller_id，直接使用
+            if !call.caller_id.is_empty() {
+                let edge = codeconnect_core::types::CallEdge {
+                    caller_id: call.caller_id.clone(),
+                    callee_id: callee_id.clone(),
+                    location: call.location.clone(),
+                    call_type: call.call_type.clone(),
+                    confidence: call.confidence,
+                };
+                let edge_json = serde_json::to_string(&edge)
+                    .map_err(|e| CodeConnectError::Index(format!("序列化调用边失败: {}", e)))?;
+                self.call_edge_index.lock().unwrap().add_call_edge(
+                    &call.caller_id,
+                    &call.callee_name,
+                    &callee_id,
+                    &call.location.file_path,
+                    call.location.line,
+                    call.location.column,
+                    &format!("{:?}", call.call_type),
+                    call.confidence,
+                    &edge_json,
+                )?;
+            } else {
+                // 无 caller_id 时，通过行号范围匹配找到包含此调用的函数
+                let call_line = call.location.line;
+                for symbol in symbols {
+                    if !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method) {
+                        continue;
+                    }
+                    if call_line > 0
+                        && symbol.location.line > 0
+                        && symbol.location.end_line > 0
+                        && call_line >= symbol.location.line
+                        && call_line <= symbol.location.end_line
+                    {
+                        let edge = codeconnect_core::types::CallEdge {
+                            caller_id: symbol.id.clone(),
+                            callee_id: callee_id.clone(),
+                            location: call.location.clone(),
+                            call_type: call.call_type.clone(),
+                            confidence: call.confidence,
+                        };
+                        let edge_json = serde_json::to_string(&edge)
+                            .map_err(|e| CodeConnectError::Index(format!("序列化调用边失败: {}", e)))?;
+                        self.call_edge_index.lock().unwrap().add_call_edge(
+                            &symbol.id,
+                            &call.callee_name,
+                            &callee_id,
+                            &call.location.file_path,
+                            call.location.line,
+                            call.location.column,
+                            &format!("{:?}", call.call_type),
+                            call.confidence,
+                            &edge_json,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        // ---- 写入文件指纹（sled） ----
         self.sled
             .put_fingerprint(relative_path, content_hash.as_bytes())?;
 
@@ -360,12 +440,16 @@ mod tests {
             TantivyIndex::open_or_create(&tmp.path().join("tantivy"))
                 .expect("创建 tantivy 失败"),
         );
+        let call_edge_index = CallEdgeIndex::open_or_create(
+            &tmp.path().join("tantivy_edges"),
+        ).expect("创建调用边索引失败");
         let parser_registry = Arc::new(ParserRegistry::new());
 
         let indexer = IncrementalIndexer::new(
             &tmp.path().join("project"),
             sled,
             tantivy,
+            call_edge_index,
             parser_registry,
         );
 
@@ -382,9 +466,12 @@ mod tests {
             TantivyIndex::open_or_create(&tmp.path().join("tantivy"))
                 .expect("创建 tantivy 失败"),
         );
+        let call_edge_index = CallEdgeIndex::open_or_create(
+            &tmp.path().join("tantivy_edges"),
+        ).expect("创建调用边索引失败");
         let parser_registry = Arc::new(ParserRegistry::new());
 
-        let indexer = IncrementalIndexer::new(&tmp.path(), sled, tantivy, parser_registry);
+        let indexer = IncrementalIndexer::new(&tmp.path(), sled, tantivy, call_edge_index, parser_registry);
 
         // 空文件列表不应出错
         let result = indexer.reindex_files(&[]);

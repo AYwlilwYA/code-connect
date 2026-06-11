@@ -74,12 +74,15 @@ impl QueryEngine {
     /// # 参数
     /// - `stable_id` — 符号的稳定标识符
     pub fn get_symbol_bytes_by_id(&self, stable_id: &str) -> Result<Option<Vec<u8>>, CodeConnectError> {
-        self.tantivy.search_by_id(stable_id).map(|opt| {
-            opt.map(|result| {
+        match self.tantivy.search_by_id(stable_id)? {
+            Some(result) => {
                 let symbol = symbol_search_result_to_symbol(&result);
-                serde_json::to_vec(&symbol).unwrap_or_default()
-            })
-        })
+                let bytes = serde_json::to_vec(&symbol)
+                    .map_err(|e| CodeConnectError::Serialization(e))?;
+                Ok(Some(bytes))
+            }
+            None => Ok(None),
+        }
     }
 
     /// 搜索指定文件路径中的所有符号
@@ -108,6 +111,8 @@ impl QueryEngine {
     /// # 返回值
     /// - `Some(Vec<u8>)` 表示该文件有已索引的符号
     /// - `None` 表示该文件尚未索引或无符号
+    #[deprecated(note = "文件→符号映射已可从 tantivy search_by_file_path 查询")]
+    #[allow(deprecated)]
     pub fn get_file_symbol_ids(&self, file_path: &str) -> Result<Option<Vec<u8>>, CodeConnectError> {
         self.sled.get_file_symbols(file_path)
     }

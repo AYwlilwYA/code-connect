@@ -47,6 +47,8 @@ pub struct ToolRegistry {
     pub sled: Option<Arc<codeconnect_index::sled_store::SledStore>>,
     /// tantivy 全文搜索索引实例
     pub tantivy: Option<Arc<codeconnect_index::tantivy_index::TantivyIndex>>,
+    /// tantivy 调用边索引实例（替代 sled edges 命名空间）
+    pub call_edge_index: Option<Arc<codeconnect_index::tantivy_index::CallEdgeIndex>>,
     /// 查询引擎（组合 sled + tantivy）
     pub query_engine: Option<Arc<codeconnect_index::query_engine::QueryEngine>>,
     /// 项目根目录路径（用于重新索引时传递给 CLI）
@@ -61,6 +63,7 @@ impl ToolRegistry {
         Self {
             sled: None,
             tantivy: None,
+            call_edge_index: None,
             query_engine: None,
             project_root: None,
             data_dir: None,
@@ -76,6 +79,15 @@ impl ToolRegistry {
     /// 设置 tantivy 搜索索引实例
     pub fn with_tantivy(mut self, tantivy: Arc<codeconnect_index::tantivy_index::TantivyIndex>) -> Self {
         self.tantivy = Some(tantivy);
+        self
+    }
+
+    /// 设置 tantivy 调用边索引实例
+    pub fn with_call_edge_index(
+        mut self,
+        call_edge_index: Arc<codeconnect_index::tantivy_index::CallEdgeIndex>,
+    ) -> Self {
+        self.call_edge_index = Some(call_edge_index);
         self
     }
 
@@ -189,12 +201,12 @@ pub fn handle_trace_callers(
 ) -> McpResponse<serde_json::Value> {
     let start = Instant::now();
 
-    let sled = match &registry.sled {
-        Some(s) => s,
-        None => return McpResponse::error("存储未初始化"),
+    let call_edge_index = match &registry.call_edge_index {
+        Some(e) => e,
+        None => return McpResponse::error("调用边索引未初始化"),
     };
 
-    // 从 tantivy 构建调用图（不再依赖 sled symbols 命名空间）
+    // 从 tantivy 构建调用图（调用边从 tantivy 调用边索引读取）
     let all_ids = match &registry.query_engine {
         Some(q) => match q.scan_all_ids() {
             Ok(ids) => ids,
@@ -203,7 +215,7 @@ pub fn handle_trace_callers(
         None => return McpResponse::error("查询引擎未初始化"),
     };
 
-    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy(sled, &all_ids) {
+    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy_edges(call_edge_index, &all_ids) {
         Ok(g) => g,
         Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
     };
@@ -250,9 +262,9 @@ pub fn handle_trace_callees(
 ) -> McpResponse<serde_json::Value> {
     let start = Instant::now();
 
-    let sled = match &registry.sled {
-        Some(s) => s,
-        None => return McpResponse::error("存储未初始化"),
+    let call_edge_index = match &registry.call_edge_index {
+        Some(e) => e,
+        None => return McpResponse::error("调用边索引未初始化"),
     };
 
     let all_ids = match &registry.query_engine {
@@ -263,7 +275,7 @@ pub fn handle_trace_callees(
         None => return McpResponse::error("查询引擎未初始化"),
     };
 
-    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy(sled, &all_ids) {
+    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy_edges(call_edge_index, &all_ids) {
         Ok(g) => g,
         Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
     };
@@ -309,9 +321,9 @@ pub fn handle_analyze_impact(
 ) -> McpResponse<serde_json::Value> {
     let start = Instant::now();
 
-    let sled = match &registry.sled {
-        Some(s) => s,
-        None => return McpResponse::error("存储未初始化"),
+    let call_edge_index = match &registry.call_edge_index {
+        Some(e) => e,
+        None => return McpResponse::error("调用边索引未初始化"),
     };
 
     let all_ids = match &registry.query_engine {
@@ -322,7 +334,7 @@ pub fn handle_analyze_impact(
         None => return McpResponse::error("查询引擎未初始化"),
     };
 
-    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy(sled, &all_ids) {
+    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy_edges(call_edge_index, &all_ids) {
         Ok(g) => g,
         Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
     };
@@ -388,9 +400,9 @@ pub fn handle_get_call_graph(
 ) -> McpResponse<serde_json::Value> {
     let start = Instant::now();
 
-    let sled = match &registry.sled {
-        Some(s) => s,
-        None => return McpResponse::error("存储未初始化"),
+    let call_edge_index = match &registry.call_edge_index {
+        Some(e) => e,
+        None => return McpResponse::error("调用边索引未初始化"),
     };
 
     let all_ids = match &registry.query_engine {
@@ -401,7 +413,7 @@ pub fn handle_get_call_graph(
         None => return McpResponse::error("查询引擎未初始化"),
     };
 
-    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy(sled, &all_ids) {
+    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy_edges(call_edge_index, &all_ids) {
         Ok(g) => g,
         Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
     };
@@ -453,9 +465,9 @@ pub fn handle_get_metrics(
 ) -> McpResponse<serde_json::Value> {
     let start = Instant::now();
 
-    let sled = match &registry.sled {
-        Some(s) => s,
-        None => return McpResponse::error("存储未初始化"),
+    let call_edge_index = match &registry.call_edge_index {
+        Some(e) => e,
+        None => return McpResponse::error("调用边索引未初始化"),
     };
 
     let query_engine = match &registry.query_engine {
@@ -468,7 +480,7 @@ pub fn handle_get_metrics(
         Err(e) => return McpResponse::error(&format!("扫描符号 ID 失败: {}", e)),
     };
 
-    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy(sled, &all_ids) {
+    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy_edges(call_edge_index, &all_ids) {
         Ok(g) => g,
         Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
     };
@@ -565,9 +577,9 @@ pub fn handle_detect_dead_code(
 ) -> McpResponse<serde_json::Value> {
     let start = Instant::now();
 
-    let sled = match &registry.sled {
-        Some(s) => s,
-        None => return McpResponse::error("存储未初始化"),
+    let call_edge_index = match &registry.call_edge_index {
+        Some(e) => e,
+        None => return McpResponse::error("调用边索引未初始化"),
     };
 
     // 收集所有已知的符号 ID 和名称（从 tantivy 获取，不再从 sled 扫描）
@@ -582,7 +594,7 @@ pub fn handle_detect_dead_code(
     // 提取所有符号名称供死代码检测使用
     let all_symbols: Vec<String> = all_ids.iter().map(|(_, name)| name.clone()).collect();
 
-    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy(sled, &all_ids) {
+    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy_edges(call_edge_index, &all_ids) {
         Ok(g) => g,
         Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
     };
@@ -705,9 +717,9 @@ pub fn handle_find_references(
 ) -> McpResponse<serde_json::Value> {
     let start = Instant::now();
 
-    let sled = match &registry.sled {
-        Some(s) => s,
-        None => return McpResponse::error("存储未初始化"),
+    let call_edge_index = match &registry.call_edge_index {
+        Some(e) => e,
+        None => return McpResponse::error("调用边索引未初始化"),
     };
 
     // 获取符号名称（从 tantivy 获取）
@@ -727,7 +739,7 @@ pub fn handle_find_references(
         },
         None => return McpResponse::error("查询引擎未初始化"),
     };
-    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy(sled, &all_ids) {
+    let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy_edges(call_edge_index, &all_ids) {
         Ok(g) => g,
         Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
     };
@@ -915,31 +927,45 @@ pub fn handle_list_files(
 
 /// 获取类型继承链 handler
 ///
-/// 从 sled 存储中的符号构建类型层次图，然后查询目标符号的祖先/后代。
+/// 从 tantivy 存储中的符号构建类型层次图，然后查询目标符号的祖先/后代。
 pub fn handle_get_type_hierarchy(
     registry: &ToolRegistry,
     params: GetTypeHierarchyParams,
 ) -> McpResponse<serde_json::Value> {
     let start = Instant::now();
 
-    let sled = match &registry.sled {
-        Some(s) => s,
-        None => return McpResponse::error("存储未初始化"),
+    let query_engine = match &registry.query_engine {
+        Some(q) => q,
+        None => return McpResponse::error("查询引擎未初始化"),
     };
 
-    // 从 sled 符号存储构建完整的类型层次图
-    let type_hierarchy = match codeconnect_graph::type_hierarchy::TypeHierarchy::build_from_sled(sled) {
+    // 从 tantivy 扫描所有符号的 ID，然后按 ID 逐个获取完整符号信息
+    let all_ids = match query_engine.scan_all_ids() {
+        Ok(ids) => ids,
+        Err(e) => return McpResponse::error(&format!("扫描符号 ID 失败: {}", e)),
+    };
+
+    let mut all_symbols: Vec<codeconnect_core::types::Symbol> = Vec::new();
+    for (stable_id, _name) in &all_ids {
+        match query_engine.get_symbol_by_id(stable_id) {
+            Ok(Some(sym)) => all_symbols.push(sym),
+            Ok(None) => {} // 符号可能已被删除，跳过
+            Err(e) => {
+                tracing::warn!("获取符号 {} 失败: {}", stable_id, e);
+            }
+        }
+    }
+
+    // 从 tantivy 符号列表构建完整的类型层次图
+    let type_hierarchy = match codeconnect_graph::type_hierarchy::TypeHierarchy::build_from_symbols(&all_symbols) {
         Ok(h) => h,
         Err(e) => return McpResponse::error(&format!("构建类型层次图失败: {}", e)),
     };
 
     // 从 tantivy 获取符号名称（用于在层次图中查找）
-    let symbol_name = match &registry.query_engine {
-        Some(q) => match q.get_symbol_by_id(&params.symbol_id) {
-            Ok(Some(sym)) => sym.name,
-            _ => params.symbol_id.clone(),
-        },
-        None => params.symbol_id.clone(),
+    let symbol_name = match query_engine.get_symbol_by_id(&params.symbol_id) {
+        Ok(Some(sym)) => sym.name,
+        _ => params.symbol_id.clone(),
     };
 
     let mut ancestors = Vec::new();
@@ -1107,6 +1133,7 @@ mod tests {
         let registry = ToolRegistry::new();
         assert!(registry.sled.is_none());
         assert!(registry.tantivy.is_none());
+        assert!(registry.call_edge_index.is_none());
         assert!(registry.query_engine.is_none());
     }
 

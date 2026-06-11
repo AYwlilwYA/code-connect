@@ -116,6 +116,8 @@ impl<'a> SymbolService<'a> {
     ///
     /// # 参数
     /// - `file_path` — 源文件路径
+    #[deprecated(note = "文件→符号映射已可从 tantivy search_by_file_path 查询")]
+    #[allow(deprecated)]
     pub fn get_file_symbol_ids(&self, file_path: &str) -> Result<Vec<String>, CodeConnectError> {
         match self.engine.get_file_symbol_ids(file_path)? {
             Some(data) => {

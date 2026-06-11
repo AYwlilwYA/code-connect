@@ -10,7 +10,7 @@ use std::time::Instant;
 use codeconnect_core::config::CodeConnectConfig;
 use codeconnect_index::full_indexer::FullIndexer;
 use codeconnect_index::sled_store::SledStore;
-use codeconnect_index::tantivy_index::TantivyIndex;
+use codeconnect_index::tantivy_index::{CallEdgeIndex, TantivyIndex};
 use codeconnect_parser::factory::ParserRegistry;
 use codeconnect_parser::c::CParser;
 use codeconnect_parser::cpp::CppParser;
@@ -47,11 +47,13 @@ pub async fn run(
     std::fs::create_dir_all(data_dir)?;
 
     let tantivy_dir = data_dir.join("tantivy");
+    let tantivy_edges_dir = data_dir.join("tantivy_edges");
     let sled_dir = data_dir.join("sled");
 
-    // 强制重建时清理旧索引
+    // 强制重建时清理旧索引（包括旧的 sled edges 数据）
     if force {
         let _ = std::fs::remove_dir_all(&tantivy_dir);
+        let _ = std::fs::remove_dir_all(&tantivy_edges_dir);
         let _ = std::fs::remove_dir_all(&sled_dir);
     }
 
@@ -59,52 +61,57 @@ pub async fn run(
     let tantivy = TantivyIndex::open_or_create(&tantivy_dir)
         .map_err(|e| format!("无法创建 tantivy 索引: {}", e))?;
 
+    let call_edge_index = CallEdgeIndex::open_or_create(&tantivy_edges_dir)
+        .map_err(|e| format!("无法创建调用边索引: {}", e))?;
+
     let sled = SledStore::open(&sled_dir)
         .map_err(|e| format!("无法创建 sled 存储: {}", e))?;
 
     // 注册解析器（按配置开关）
-    eprintln!("[DEBUG] languages: rust={}, ts={}, js={}, java={}, csharp={}, c={}, cpp={}, kotlin={}",
+    tracing::debug!(
+        "语言开关: rust={}, ts={}, js={}, java={}, csharp={}, c={}, cpp={}, kotlin={}",
         config.languages.rust, config.languages.typescript, config.languages.javascript,
         config.languages.java, config.languages.csharp, config.languages.c, config.languages.cpp,
-        config.languages.kotlin);
+        config.languages.kotlin
+    );
     let mut registry = ParserRegistry::new();
 
     if config.languages.rust {
         registry.register(Arc::new(RustParser::new()));
-        println!("  已注册: Rust 解析器");
+        tracing::info!("已注册: Rust 解析器");
     }
     if config.languages.typescript {
         registry.register(Arc::new(TypeScriptParser::new()));
-        println!("  已注册: TypeScript 解析器");
+        tracing::info!("已注册: TypeScript 解析器");
     }
     if config.languages.javascript {
         registry.register(Arc::new(TypeScriptParser::new()));
-        println!("  已注册: JavaScript 解析器");
+        tracing::info!("已注册: JavaScript 解析器");
     }
     if config.languages.java {
         registry.register(Arc::new(JavaParser::new()));
-        println!("  已注册: Java 解析器");
+        tracing::info!("已注册: Java 解析器");
     }
     if config.languages.csharp {
         registry.register(Arc::new(CSharpParser::new()));
-        println!("  已注册: C# 解析器");
+        tracing::info!("已注册: C# 解析器");
     }
     if config.languages.c {
         registry.register(Arc::new(CParser::new()));
-        println!("  已注册: C 解析器");
+        tracing::info!("已注册: C 解析器");
     }
     if config.languages.cpp {
         registry.register(Arc::new(CppParser::new()));
-        println!("  已注册: C++ 解析器");
+        tracing::info!("已注册: C++ 解析器");
     }
     if config.languages.kotlin {
-        tracing::info!("Kotlin 解析器已注册");
+        tracing::info!("已注册: Kotlin 解析器");
     }
 
     let parser_registry = Arc::new(registry);
 
     // 创建并运行全量索引器
-    let mut indexer = FullIndexer::new(project_root, tantivy, sled, parser_registry);
+    let mut indexer = FullIndexer::new(project_root, tantivy, call_edge_index, sled, parser_registry);
 
     println!();
     println!("正在扫描并解析源文件...");

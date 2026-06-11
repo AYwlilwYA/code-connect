@@ -24,7 +24,7 @@ use codeconnect_parser::factory::ParserRegistry;
 use ignore::WalkBuilder;
 
 use crate::sled_store::SledStore;
-use crate::tantivy_index::{TantivyIndex, CURRENT_SCHEMA_VERSION};
+use crate::tantivy_index::{CallEdgeIndex, TantivyIndex, CURRENT_SCHEMA_VERSION};
 
 // ============================================================================
 // 统计结构
@@ -121,8 +121,9 @@ struct ParseFailure {
 /// let mut registry = Arc::new(ParserRegistry::new());
 /// // ... 注册解析器 ...
 /// let tantivy = TantivyIndex::open_or_create(index_dir)?;
+/// let call_edge_index = CallEdgeIndex::open_or_create(edges_dir)?;
 /// let sled = SledStore::open(sled_dir)?;
-/// let indexer = FullIndexer::new(project_root, tantivy, sled, registry);
+/// let indexer = FullIndexer::new(project_root, tantivy, call_edge_index, sled, registry);
 /// let stats = indexer.run()?;
 /// println!("索引完成: {:?}", stats);
 /// ```
@@ -131,7 +132,9 @@ pub struct FullIndexer {
     pub project_root: PathBuf,
     /// tantivy 全文搜索索引
     pub tantivy: TantivyIndex,
-    /// sled 键值存储
+    /// tantivy 调用边索引（替代 sled edges 命名空间，避免 sled 磁盘膨胀）
+    pub call_edge_index: CallEdgeIndex,
+    /// sled 键值存储（只存 meta + fingerprint + neighbors）
     sled: SledStore,
     /// 解析器注册表
     parser_registry: Arc<ParserRegistry>,
@@ -143,17 +146,20 @@ impl FullIndexer {
     /// # 参数
     /// - `project_root` — 项目根目录路径
     /// - `tantivy` — 已初始化的 tantivy 索引实例
+    /// - `call_edge_index` — 已初始化的调用边 tantivy 索引实例
     /// - `sled` — 已打开的 sled 存储实例
     /// - `parser_registry` — 已注册所有语言解析器的注册表
     pub fn new(
         project_root: &Path,
         tantivy: TantivyIndex,
+        call_edge_index: CallEdgeIndex,
         sled: SledStore,
         parser_registry: Arc<ParserRegistry>,
     ) -> Self {
         Self {
             project_root: project_root.to_path_buf(),
             tantivy,
+            call_edge_index,
             sled,
             parser_registry,
         }
@@ -268,9 +274,11 @@ impl FullIndexer {
         }
 
         // ====================================================================
-        // 第四步：提交 tantivy 写入
+        // 第四步：提交 tantivy 写入（符号索引 + 调用边索引）
         // ====================================================================
-        self.tantivy.commit()?;
+        let symbol_count = self.tantivy.commit()?;
+        let edge_count = self.call_edge_index.commit()?;
+        tracing::info!("提交完成: {} 个符号文档, {} 条调用边", symbol_count, edge_count);
 
         // ====================================================================
         // 第五步：写入 Schema 版本并刷盘
@@ -340,12 +348,13 @@ impl FullIndexer {
 
     /// 将单个文件的解析结果写入存储
     ///
-    /// 包括：文件元信息、符号定义、文件指纹、文件→符号映射，
-    /// 以及将每个符号写入 tantivy 全文索引。
+    /// 包括：文件元信息、符号定义（tantivy）、调用边（tantivy 调用边索引）、文件指纹。
+    /// sled 只保留 meta + fingerprint + neighbors，不再存储 file_symbols 和 call_edge，
+    /// 从根本上消除 sled append-only 导致的磁盘膨胀问题。
     fn write_parsed_file(&self, parsed: &ParsedFile) -> Result<(), CodeConnectError> {
         let file_path_str = &parsed.relative_path;
 
-        // ---- 写入文件元信息 ----
+        // ---- 写入文件元信息（sled） ----
         let file_meta = FileMeta {
             file_path: file_path_str.clone(),
             language: parsed.language.to_string(),
@@ -361,36 +370,19 @@ impl FullIndexer {
             .map_err(|e| CodeConnectError::Index(format!("序列化文件元信息失败: {}", e)))?;
         self.sled.put_file_meta(file_path_str, &meta_bytes)?;
 
-        // ---- 收集文件内所有符号 ID ----
-        let mut file_symbol_ids: Vec<String> = Vec::with_capacity(parsed.symbols.len());
-
-        // ---- 写入每个符号定义 ----
-        // 注意：符号数据只存入 tantivy 全文索引（Schema 中所有字段均为 STORED）。
-        // sled 不再冗余存储符号定义，避免磁盘膨胀（sled 是 append-only）。
+        // ---- 写入每个符号定义（tantivy 符号索引） ----
+        // 符号数据只存入 tantivy 全文索引，sled 不再冗余存储。
         for symbol in &parsed.symbols {
-            file_symbol_ids.push(symbol.id.clone());
             Self::add_symbol_to_tantivy(&self.tantivy, symbol, parsed, file_path_str)?;
         }
 
-        // ---- 写入文件→符号映射 ----
-        let file_symbol_bytes = serde_json::to_vec(&file_symbol_ids)
-            .map_err(|e| CodeConnectError::Index(format!("序列化文件符号映射失败: {}", e)))?;
-        self.sled
-            .put_file_symbols(file_path_str, &file_symbol_bytes)?;
+        // ---- 写入调用边（tantivy 调用边索引，不再写入 sled） ----
+        // 只对 Function / Method 类型的符号创建出边（调用者）。
+        // 调用者匹配策略：按 CallSite 的行号范围与文件内 Function/Method 符号的行号范围做包含匹配。
 
-        // ---- 写入调用边 ----
-        // 只对 Function / Method 类型的符号创建出边（调用者），
-        // 避免为局部变量、字段、类等非可执行符号创建无意义的边。
-        // 对于每个 CallSite，如果能匹配到文件内的符号，使用其 StableSymbolId；
-        // 否则直接用 callee_name 作为 callee_id。
-        //
-        // 调用者匹配策略：
-        // 按 CallSite 的行号范围与文件内 Function/Method 符号的行号范围做包含匹配。
-        // 只有行号在符号范围内的调用才会被绑定到该符号，
-        // 避免将所有调用都错误地绑定到文件中所有函数。
-
-        // 先建立一个从符号名到 StableSymbolId 的快速查找表
-        let name_to_sym_id: HashMap<&str, &str> = parsed.symbols
+        // 建立从符号名到 StableSymbolId 的快速查找表
+        let name_to_sym_id: HashMap<&str, &str> = parsed
+            .symbols
             .iter()
             .map(|s| (s.name.as_str(), s.id.as_str()))
             .collect();
@@ -415,19 +407,27 @@ impl FullIndexer {
                     call_type: call.call_type.clone(),
                     confidence: call.confidence,
                 };
-                let edge_bytes = serde_json::to_vec(&edge)
+                // 将调用边序列化为 JSON 写入 tantivy 调用边索引
+                let edge_json = serde_json::to_string(&edge)
                     .map_err(|e| CodeConnectError::Index(format!("序列化调用边失败: {}", e)))?;
-                // 用 caller_id 和 callee_name 作为键写入
-                self.sled.put_call_edge(&call.caller_id, &call.callee_name, &edge_bytes)?;
+                self.call_edge_index.add_call_edge(
+                    &call.caller_id,
+                    &call.callee_name,
+                    &callee_id,
+                    &call.location.file_path,
+                    call.location.line,
+                    call.location.column,
+                    &format!("{:?}", call.call_type),
+                    call.confidence,
+                    &edge_json,
+                )?;
             } else {
                 // 无 caller_id 时，通过行号范围匹配找到包含此调用的函数
-                // 调用行号必须在符号的 line..=end_line 范围内
                 let call_line = call.location.line;
                 for symbol in &parsed.symbols {
                     if !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method) {
                         continue;
                     }
-                    // 检查调用是否在此符号的行号范围内
                     if call_line > 0
                         && symbol.location.line > 0
                         && symbol.location.end_line > 0
@@ -441,21 +441,25 @@ impl FullIndexer {
                             call_type: call.call_type.clone(),
                             confidence: call.confidence,
                         };
-                        // 如果 callee_id 本身也是一个稳定 ID，且已在 name_to_sym_id 中
-                        // 用 callee_id 替代 callee_name 作为键，以便 sled 中正确关联
-                        let callee_key = name_to_sym_id
-                            .get(callee_id.as_str())
-                            .copied()
-                            .unwrap_or(&callee_id);
-                        let edge_bytes = serde_json::to_vec(&edge)
+                        let edge_json = serde_json::to_string(&edge)
                             .map_err(|e| CodeConnectError::Index(format!("序列化调用边失败: {}", e)))?;
-                        self.sled.put_call_edge(&symbol.id, callee_key, &edge_bytes)?;
+                        self.call_edge_index.add_call_edge(
+                            &symbol.id,
+                            &call.callee_name,
+                            &callee_id,
+                            &call.location.file_path,
+                            call.location.line,
+                            call.location.column,
+                            &format!("{:?}", call.call_type),
+                            call.confidence,
+                            &edge_json,
+                        )?;
                     }
                 }
             }
         }
 
-        // ---- 写入文件指纹 ----
+        // ---- 写入文件指纹（sled） ----
         self.sled
             .put_fingerprint(file_path_str, parsed.content_hash.as_bytes())?;
 

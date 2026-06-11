@@ -70,7 +70,7 @@ impl TypeHierarchy {
         }
     }
 
-    /// 从 sled 存储构建类型层次图
+    /// 从 sled 存储构建类型层次图（已废弃）
     ///
     /// 遍历 symbol 命名空间中的所有符号，提取 Class/Interface/Trait/Enum
     /// 类型，根据 `parent_id` 和符号自身的 `kind` 推断继承关系。
@@ -79,6 +79,11 @@ impl TypeHierarchy {
     /// - `parent_id` 存在且父符号为 Class/Struct/Enum → "extends" 关系
     /// - `parent_id` 存在且父符号为 Interface/Trait → "implements" 关系
     /// - 无 `parent_id` 的 Class/Interface/Trait → 继承树根节点
+    ///
+    /// # 已废弃
+    /// 符号定义已不再存储于 sled（只存 tantivy），此方法读不到符号。
+    /// 请改用 [`build_from_symbols`] 传入从 tantivy 查询到的符号列表。
+    #[deprecated(note = "符号定义已不再存储于 sled，请使用 build_from_symbols")]
     pub fn build_from_sled(sled: &SledStore) -> Result<Self, CodeConnectError> {
         let mut hierarchy = Self::new();
         let mut all_symbols: HashMap<String, Symbol> = HashMap::new();
@@ -123,6 +128,80 @@ impl TypeHierarchy {
                     // 父符号可以不直接在当前层次中（可能尚未索引），也要尝试添加
                     if let Some(parent_symbol) = all_symbols.get(parent_id) {
                         // 确保父节点已存在，若不存在则添加
+                        if !hierarchy.name_to_id.contains_key(&parent_symbol.name) {
+                            hierarchy.add_node(TypeNode {
+                                symbol_id: parent_symbol.id.clone(),
+                                name: parent_symbol.name.clone(),
+                                kind: kind_to_string(&parent_symbol.kind),
+                                file_path: parent_symbol.location.file_path.clone(),
+                            });
+                        }
+
+                        let (relation, confidence) =
+                            infer_inherit_relation(&symbol.kind, &parent_symbol.kind);
+
+                        hierarchy.add_edge(
+                            &symbol.name,
+                            &parent_symbol.name,
+                            InheritEdge {
+                                relation,
+                                confidence,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(hierarchy)
+    }
+
+    /// 从符号列表构建类型层次图（新主方法，替代已废弃的 `build_from_sled`）
+    ///
+    /// 接收从 tantivy 查询到的所有符号列表（例如从 `QueryEngine::scan_all_ids`
+    /// 配合 `get_symbol_by_id` 获取），提取 Class/Interface/Struct/Enum/Trait
+    /// 等类型，根据 `parent_id` 和符号自身的 `kind` 推断继承关系。
+    ///
+    /// ## 继承推断规则
+    /// - `parent_id` 存在且父符号为 Class/Struct/Enum → "extends" 关系
+    /// - `parent_id` 存在且父符号为 Interface/Trait → "implements" 关系
+    /// - 无 `parent_id` 的 Class/Interface/Trait → 继承树根节点
+    pub fn build_from_symbols(symbols: &[Symbol]) -> Result<Self, CodeConnectError> {
+        let mut hierarchy = Self::new();
+
+        // 按符号 ID 建立索引，方便按 parent_id 查找
+        let symbol_map: HashMap<&str, &Symbol> = symbols
+            .iter()
+            .map(|s| (s.id.as_str(), s))
+            .collect();
+
+        // 类型类型的集合
+        let type_kinds: &[SymbolKind] = &[
+            SymbolKind::Class,
+            SymbolKind::Interface,
+            SymbolKind::Struct,
+            SymbolKind::Enum,
+            SymbolKind::Trait,
+        ];
+
+        // --- 第一步：添加所有属于类型层次范畴的符号节点 ---
+        for symbol in symbols {
+            if type_kinds.contains(&symbol.kind) {
+                hierarchy.add_node(TypeNode {
+                    symbol_id: symbol.id.clone(),
+                    name: symbol.name.clone(),
+                    kind: kind_to_string(&symbol.kind),
+                    file_path: symbol.location.file_path.clone(),
+                });
+            }
+        }
+
+        // --- 第二步：建立继承边 ---
+        for symbol in symbols {
+            if let Some(ref parent_id) = symbol.parent_id {
+                if type_kinds.contains(&symbol.kind) {
+                    // 确保父节点已存在，若不存在则添加
+                    if let Some(&parent_symbol) = symbol_map.get(parent_id.as_str()) {
                         if !hierarchy.name_to_id.contains_key(&parent_symbol.name) {
                             hierarchy.add_node(TypeNode {
                                 symbol_id: parent_symbol.id.clone(),

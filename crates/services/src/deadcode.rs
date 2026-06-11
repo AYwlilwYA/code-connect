@@ -21,10 +21,15 @@ pub struct DeadCodeDetector {
 }
 
 impl DeadCodeDetector {
-    /// 从 sled 存储构建死代码检测器
+    /// 从 sled 存储构建死代码检测器（已废弃）
     ///
     /// # 参数
     /// - `sled` — 已打开的 sled 数据库实例
+    ///
+    /// # 已废弃
+    /// 调用边已迁入 tantivy 调用边索引。请使用 [`from_graph`] 配合
+    /// `CallGraph::build_from_tantivy_edges` 来构建。
+    #[deprecated(note = "调用边已迁入 tantivy，请使用 from_graph 配合 CallGraph::build_from_tantivy_edges")]
     pub fn new(
         sled: &codeconnect_index::sled_store::SledStore,
     ) -> Result<Self, CodeConnectError> {
