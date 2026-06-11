@@ -11,7 +11,7 @@ use std::sync::Arc;
 use codeconnect_index::full_indexer::FullIndexer;
 use codeconnect_index::query_engine::QueryEngine;
 use codeconnect_index::sled_store::SledStore;
-use codeconnect_index::tantivy_index::TantivyIndex;
+use codeconnect_index::tantivy_index::{CallEdgeIndex, TantivyIndex};
 use codeconnect_parser::factory::ParserRegistry;
 use codeconnect_parser::java::JavaParser;
 use codeconnect_parser::rust::RustParser;
@@ -36,6 +36,7 @@ fn test_full_index_and_search_rust_sample() {
     // =====================================================================
     let tmp_dir = tempfile::tempdir().expect("创建临时目录失败");
     let tantivy_dir = tmp_dir.path().join("tantivy");
+    let tantivy_edges_dir = tmp_dir.path().join("tantivy_edges");
     let sled_dir = tmp_dir.path().join("sled");
 
     // =====================================================================
@@ -46,6 +47,8 @@ fn test_full_index_and_search_rust_sample() {
 
     let tantivy = TantivyIndex::open_or_create(&tantivy_dir)
         .expect("创建 tantivy 索引失败");
+    let call_edge_index = CallEdgeIndex::open_or_create(&tantivy_edges_dir)
+        .expect("创建调用边索引失败");
     let sled = SledStore::open(&sled_dir)
         .expect("打开 sled 存储失败");
 
@@ -53,6 +56,7 @@ fn test_full_index_and_search_rust_sample() {
     let mut indexer = FullIndexer::new(
         &project_root,
         tantivy,
+        call_edge_index,
         sled,
         Arc::new(registry),
     );
@@ -157,12 +161,15 @@ fn test_index_stats_has_all_fields() {
 
     let tantivy = TantivyIndex::open_or_create(&tmp_dir.path().join("tantivy"))
         .expect("创建 tantivy 索引失败");
+    let call_edge_index = CallEdgeIndex::open_or_create(&tmp_dir.path().join("tantivy_edges"))
+        .expect("创建调用边索引失败");
     let sled = SledStore::open(&tmp_dir.path().join("sled"))
         .expect("打开 sled 存储失败");
 
     let mut indexer = FullIndexer::new(
         &project_root,
         tantivy,
+        call_edge_index,
         sled,
         Arc::new(registry),
     );
@@ -196,6 +203,7 @@ fn ts_fixtures_dir() -> PathBuf {
 fn test_full_index_and_search_typescript_sample() {
     let tmp_dir = tempfile::tempdir().expect("创建临时目录失败");
     let tantivy_dir = tmp_dir.path().join("tantivy_ts");
+    let tantivy_edges_dir = tmp_dir.path().join("tantivy_edges_ts");
     let sled_dir = tmp_dir.path().join("sled_ts");
 
     // 注册 TypeScriptParser → 创建 FullIndexer
@@ -204,6 +212,8 @@ fn test_full_index_and_search_typescript_sample() {
 
     let tantivy = TantivyIndex::open_or_create(&tantivy_dir)
         .expect("创建 tantivy 索引失败");
+    let call_edge_index = CallEdgeIndex::open_or_create(&tantivy_edges_dir)
+        .expect("创建调用边索引失败");
     let sled = SledStore::open(&sled_dir)
         .expect("打开 sled 存储失败");
 
@@ -211,6 +221,7 @@ fn test_full_index_and_search_typescript_sample() {
     let mut indexer = FullIndexer::new(
         &project_root,
         tantivy,
+        call_edge_index,
         sled,
         Arc::new(registry),
     );
@@ -276,12 +287,15 @@ fn test_typescript_finds_class_and_interface() {
 
     let tantivy = TantivyIndex::open_or_create(&tmp_dir.path().join("tantivy_ts2"))
         .expect("创建索引失败");
+    let call_edge_index = CallEdgeIndex::open_or_create(&tmp_dir.path().join("tantivy_edges_ts2"))
+        .expect("创建调用边索引失败");
     let sled = SledStore::open(&tmp_dir.path().join("sled_ts2"))
         .expect("打开存储失败");
 
     let mut indexer = FullIndexer::new(
         &ts_fixtures_dir(),
         tantivy,
+        call_edge_index,
         sled,
         Arc::new(registry),
     );
@@ -326,6 +340,7 @@ fn java_fixtures_dir() -> PathBuf {
 fn test_full_index_and_search_java_sample() {
     let tmp_dir = tempfile::tempdir().expect("创建临时目录失败");
     let tantivy_dir = tmp_dir.path().join("tantivy_java");
+    let tantivy_edges_dir = tmp_dir.path().join("tantivy_edges_java");
     let sled_dir = tmp_dir.path().join("sled_java");
 
     // 注册 JavaParser → 创建 FullIndexer
@@ -334,6 +349,8 @@ fn test_full_index_and_search_java_sample() {
 
     let tantivy = TantivyIndex::open_or_create(&tantivy_dir)
         .expect("创建 tantivy 索引失败");
+    let call_edge_index = CallEdgeIndex::open_or_create(&tantivy_edges_dir)
+        .expect("创建调用边索引失败");
     let sled = SledStore::open(&sled_dir)
         .expect("打开 sled 存储失败");
 
@@ -341,6 +358,7 @@ fn test_full_index_and_search_java_sample() {
     let mut indexer = FullIndexer::new(
         &project_root,
         tantivy,
+        call_edge_index,
         sled,
         Arc::new(registry),
     );
@@ -406,12 +424,15 @@ fn test_java_finds_class_and_interface() {
 
     let tantivy = TantivyIndex::open_or_create(&tmp_dir.path().join("tantivy_java2"))
         .expect("创建索引失败");
+    let call_edge_index = CallEdgeIndex::open_or_create(&tmp_dir.path().join("tantivy_edges_java2"))
+        .expect("创建调用边索引失败");
     let sled = SledStore::open(&tmp_dir.path().join("sled_java2"))
         .expect("打开存储失败");
 
     let mut indexer = FullIndexer::new(
         &java_fixtures_dir(),
         tantivy,
+        call_edge_index,
         sled,
         Arc::new(registry),
     );

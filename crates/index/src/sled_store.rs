@@ -86,6 +86,7 @@ impl SledStore {
     /// 存储符号定义
     ///
     /// `data` 应为 `Symbol` 的序列化字节。
+    #[deprecated(note = "符号定义已只存 tantivy，sled 不再冗余存储")]
     pub fn put_symbol(&self, stable_id: &str, data: &[u8]) -> Result<(), CodeConnectError> {
         let key = format!("{}{}", PREFIX_SYMBOLS, stable_id);
         self.db
@@ -97,6 +98,7 @@ impl SledStore {
     /// 读取符号定义
     ///
     /// 返回 `None` 表示该符号不存在。
+    #[deprecated(note = "符号定义已只存 tantivy，请使用 TantivyIndex::search_by_id")]
     pub fn get_symbol(&self, stable_id: &str) -> Result<Option<Vec<u8>>, CodeConnectError> {
         let key = format!("{}{}", PREFIX_SYMBOLS, stable_id);
         Ok(self
@@ -107,6 +109,7 @@ impl SledStore {
     }
 
     /// 删除符号定义
+    #[deprecated(note = "符号定义已只存 tantivy，sled 不再管理符号生命周期")]
     pub fn delete_symbol(&self, stable_id: &str) -> Result<(), CodeConnectError> {
         let key = format!("{}{}", PREFIX_SYMBOLS, stable_id);
         self.db
@@ -116,6 +119,7 @@ impl SledStore {
     }
 
     /// 批量存储符号（使用原子批处理）
+    #[deprecated(note = "符号定义已只存 tantivy，sled 不再批量管理符号")]
     pub fn put_symbols_batch(
         &self,
         entries: &[(&str, &[u8])],
@@ -136,6 +140,7 @@ impl SledStore {
     /// 存储调用边
     ///
     /// `data` 应为 `CallEdge` 的序列化字节。
+    #[deprecated(note = "调用边已迁入 tantivy 调用边索引，请使用 CallEdgeIndex::add_call_edge")]
     pub fn put_call_edge(
         &self,
         caller_id: &str,
@@ -150,6 +155,7 @@ impl SledStore {
     }
 
     /// 读取调用边
+    #[deprecated(note = "调用边已迁入 tantivy，请使用 CallEdgeIndex")]
     pub fn get_call_edge(
         &self,
         caller_id: &str,
@@ -164,6 +170,7 @@ impl SledStore {
     }
 
     /// 删除调用边
+    #[deprecated(note = "调用边已迁入 tantivy，sled 不再管理调用边生命周期")]
     pub fn remove_call_edge(
         &self,
         caller_id: &str,
@@ -179,6 +186,7 @@ impl SledStore {
     /// 获取某个调用者的所有出边
     ///
     /// 遍历以 `edges:{caller_id}::` 为前缀的所有键。
+    #[deprecated(note = "调用边已迁入 tantivy，请使用 CallEdgeIndex::search_edges_by_caller")]
     pub fn get_call_edges_from(
         &self,
         caller_id: &str,
@@ -263,6 +271,7 @@ impl SledStore {
     /// 存储文件→符号列表的映射
     ///
     /// `data` 应为符号 ID 列表的序列化字节（如 JSON 数组）。
+    #[deprecated(note = "文件→符号映射可通过 tantivy search_by_file_path 查询，不再冗余存储")]
     pub fn put_file_symbols(
         &self,
         file_path: &str,
@@ -276,6 +285,7 @@ impl SledStore {
     }
 
     /// 读取文件→符号列表的映射
+    #[deprecated(note = "文件→符号映射可通过 tantivy search_by_file_path 查询")]
     pub fn get_file_symbols(&self, file_path: &str) -> Result<Option<Vec<u8>>, CodeConnectError> {
         let key = format!("{}{}", PREFIX_FILE_SYMBOLS, file_path);
         Ok(self
@@ -286,6 +296,7 @@ impl SledStore {
     }
 
     /// 删除文件→符号映射
+    #[deprecated(note = "文件→符号映射已不再存 sled，无需删除")]
     pub fn remove_file_symbols(&self, file_path: &str) -> Result<(), CodeConnectError> {
         let key = format!("{}{}", PREFIX_FILE_SYMBOLS, file_path);
         self.db

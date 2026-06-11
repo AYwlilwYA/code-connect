@@ -9,7 +9,7 @@ mod tests {
 
     use codeconnect_index::full_indexer::FullIndexer;
     use codeconnect_index::sled_store::SledStore;
-    use codeconnect_index::tantivy_index::TantivyIndex;
+    use codeconnect_index::tantivy_index::{CallEdgeIndex, TantivyIndex};
     use codeconnect_parser::factory::ParserRegistry;
     use codeconnect_parser::java::JavaParser;
     use codeconnect_parser::rust::RustParser;
@@ -27,12 +27,13 @@ mod tests {
             .to_path_buf()
     }
 
-    /// 创建临时目录用于索引存储
-    fn temp_index_dir(name: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    /// 创建临时目录用于索引存储（返回 tantivy、edges、sled 三个目录）
+    fn temp_index_dir(name: &str) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let tmp = tempfile::tempdir().expect("创建临时目录失败");
         let tantivy_dir = tmp.path().join(format!("{}_tantivy", name));
+        let tantivy_edges_dir = tmp.path().join(format!("{}_tantivy_edges", name));
         let sled_dir = tmp.path().join(format!("{}_sled", name));
-        (tmp, tantivy_dir, sled_dir)
+        (tmp, tantivy_dir, tantivy_edges_dir, sled_dir)
     }
 
     /// 创建注册了 Rust 解析器的注册表
@@ -70,12 +71,13 @@ mod tests {
             fixture_dir.display()
         );
 
-        let (_tmp, tantivy_dir, sled_dir) = temp_index_dir("rust");
+        let (_tmp, tantivy_dir, tantivy_edges_dir, sled_dir) = temp_index_dir("rust");
         let tantivy = TantivyIndex::open_or_create(&tantivy_dir).expect("创建索引失败");
+        let call_edge_index = CallEdgeIndex::open_or_create(&tantivy_edges_dir).expect("创建调用边索引失败");
         let sled = SledStore::open(&sled_dir).expect("创建存储失败");
 
         let registry = rust_registry();
-        let mut indexer = FullIndexer::new(&fixture_dir, tantivy, sled, registry);
+        let mut indexer = FullIndexer::new(&fixture_dir, tantivy, call_edge_index, sled, registry);
 
         let stats = indexer.run().expect("Rust 全量索引应成功");
 
@@ -108,12 +110,13 @@ mod tests {
         let root = project_root();
         let fixture_dir = root.join("tests").join("fixtures").join("rust_sample");
 
-        let (_tmp, tantivy_dir, sled_dir) = temp_index_dir("rust_stats");
+        let (_tmp, tantivy_dir, tantivy_edges_dir, sled_dir) = temp_index_dir("rust_stats");
         let tantivy = TantivyIndex::open_or_create(&tantivy_dir).expect("创建索引失败");
+        let call_edge_index = CallEdgeIndex::open_or_create(&tantivy_edges_dir).expect("创建调用边索引失败");
         let sled = SledStore::open(&sled_dir).expect("创建存储失败");
 
         let registry = rust_registry();
-        let mut indexer = FullIndexer::new(&fixture_dir, tantivy, sled, registry);
+        let mut indexer = FullIndexer::new(&fixture_dir, tantivy, call_edge_index, sled, registry);
 
         let stats = indexer.run().expect("索引应成功");
 
@@ -139,12 +142,13 @@ mod tests {
             fixture_dir.display()
         );
 
-        let (_tmp, tantivy_dir, sled_dir) = temp_index_dir("ts");
+        let (_tmp, tantivy_dir, tantivy_edges_dir, sled_dir) = temp_index_dir("ts");
         let tantivy = TantivyIndex::open_or_create(&tantivy_dir).expect("创建索引失败");
+        let call_edge_index = CallEdgeIndex::open_or_create(&tantivy_edges_dir).expect("创建调用边索引失败");
         let sled = SledStore::open(&sled_dir).expect("创建存储失败");
 
         let registry = typescript_registry();
-        let mut indexer = FullIndexer::new(&fixture_dir, tantivy, sled, registry);
+        let mut indexer = FullIndexer::new(&fixture_dir, tantivy, call_edge_index, sled, registry);
 
         let stats = indexer.run().expect("TypeScript 全量索引应成功");
 
@@ -177,12 +181,13 @@ mod tests {
         let root = project_root();
         let fixture_dir = root.join("tests").join("fixtures").join("ts_sample");
 
-        let (_tmp, tantivy_dir, sled_dir) = temp_index_dir("ts_class");
+        let (_tmp, tantivy_dir, tantivy_edges_dir, sled_dir) = temp_index_dir("ts_class");
         let tantivy = TantivyIndex::open_or_create(&tantivy_dir).expect("创建索引失败");
+        let call_edge_index = CallEdgeIndex::open_or_create(&tantivy_edges_dir).expect("创建调用边索引失败");
         let sled = SledStore::open(&sled_dir).expect("创建存储失败");
 
         let registry = typescript_registry();
-        let mut indexer = FullIndexer::new(&fixture_dir, tantivy, sled, registry);
+        let mut indexer = FullIndexer::new(&fixture_dir, tantivy, call_edge_index, sled, registry);
 
         let stats = indexer.run().expect("索引应成功");
         assert!(stats.symbols_found > 0, "应有符号");
@@ -216,12 +221,13 @@ mod tests {
             fixture_dir.display()
         );
 
-        let (_tmp, tantivy_dir, sled_dir) = temp_index_dir("java");
+        let (_tmp, tantivy_dir, tantivy_edges_dir, sled_dir) = temp_index_dir("java");
         let tantivy = TantivyIndex::open_or_create(&tantivy_dir).expect("创建索引失败");
+        let call_edge_index = CallEdgeIndex::open_or_create(&tantivy_edges_dir).expect("创建调用边索引失败");
         let sled = SledStore::open(&sled_dir).expect("创建存储失败");
 
         let registry = java_registry();
-        let mut indexer = FullIndexer::new(&fixture_dir, tantivy, sled, registry);
+        let mut indexer = FullIndexer::new(&fixture_dir, tantivy, call_edge_index, sled, registry);
 
         let stats = indexer.run().expect("Java 全量索引应成功");
 
@@ -254,12 +260,13 @@ mod tests {
         let root = project_root();
         let fixture_dir = root.join("tests").join("fixtures").join("java_sample");
 
-        let (_tmp, tantivy_dir, sled_dir) = temp_index_dir("java_class");
+        let (_tmp, tantivy_dir, tantivy_edges_dir, sled_dir) = temp_index_dir("java_class");
         let tantivy = TantivyIndex::open_or_create(&tantivy_dir).expect("创建索引失败");
+        let call_edge_index = CallEdgeIndex::open_or_create(&tantivy_edges_dir).expect("创建调用边索引失败");
         let sled = SledStore::open(&sled_dir).expect("创建存储失败");
 
         let registry = java_registry();
-        let mut indexer = FullIndexer::new(&fixture_dir, tantivy, sled, registry);
+        let mut indexer = FullIndexer::new(&fixture_dir, tantivy, call_edge_index, sled, registry);
 
         let stats = indexer.run().expect("索引应成功");
         assert!(stats.symbols_found > 0, "应有符号");
@@ -285,8 +292,9 @@ mod tests {
 
     #[test]
     fn test_index_empty_dir() {
-        let (_tmp, tantivy_dir, sled_dir) = temp_index_dir("empty");
+        let (_tmp, tantivy_dir, tantivy_edges_dir, sled_dir) = temp_index_dir("empty");
         let tantivy = TantivyIndex::open_or_create(&tantivy_dir).expect("创建索引失败");
+        let call_edge_index = CallEdgeIndex::open_or_create(&tantivy_edges_dir).expect("创建调用边索引失败");
         let sled = SledStore::open(&sled_dir).expect("创建存储失败");
 
         let registry = rust_registry();
@@ -294,7 +302,7 @@ mod tests {
         let empty_dir = _tmp.path().join("empty_src");
         std::fs::create_dir_all(&empty_dir).expect("创建空目录失败");
 
-        let mut indexer = FullIndexer::new(&empty_dir, tantivy, sled, registry);
+        let mut indexer = FullIndexer::new(&empty_dir, tantivy, call_edge_index, sled, registry);
         let stats = indexer.run().expect("空目录索引应成功（不报错）");
 
         assert_eq!(stats.files_scanned, 0);

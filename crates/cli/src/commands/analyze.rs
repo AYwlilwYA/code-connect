@@ -9,9 +9,8 @@ use codeconnect_core::types::Symbol;
 use codeconnect_graph::call_graph::CallGraph;
 use codeconnect_graph::metrics::MetricCalculator;
 use codeconnect_graph::type_hierarchy::TypeHierarchy;
-use codeconnect_index::sled_store::SledStore;
 use codeconnect_index::query_engine::symbol_search_result_to_symbol;
-use codeconnect_index::tantivy_index::TantivyIndex;
+use codeconnect_index::tantivy_index::{CallEdgeIndex, TantivyIndex};
 
 /// 执行离线分析
 ///
@@ -28,13 +27,14 @@ pub async fn run(
     let _ = project_root;
 
     let tantivy_dir = data_dir.join("tantivy");
-    let sled_dir = data_dir.join("sled");
+    let tantivy_edges_dir = data_dir.join("tantivy_edges");
     let tantivy = TantivyIndex::open_or_create(&tantivy_dir)
         .map_err(|e| format!("无法打开 tantivy 索引: {}", e))?;
-    let sled = SledStore::open(&sled_dir)
-        .map_err(|e| format!("无法打开 sled 存储: {}", e))?;
+    let call_edge_index = CallEdgeIndex::open_or_create(&tantivy_edges_dir)
+        .map_err(|e| format!("无法打开调用边索引: {}", e))?;
+    let _sled_dir = data_dir.join("sled");
 
-    // 从 tantivy 扫描所有符号（不再从 sled 扫描）
+    // 从 tantivy 扫描所有符号（不从 sled 扫描符号数据）
     let all_ids = tantivy.scan_all_ids()
         .map_err(|e| format!("扫描符号 ID 失败: {}", e))?;
 
@@ -55,8 +55,8 @@ pub async fn run(
     println!("符号总数: {}", all_symbols.len());
     println!();
 
-    // 构建调用图（从 tantivy + sled）
-    let call_graph = CallGraph::build_from_tantivy(&sled, &all_ids)
+    // 构建调用图（从 tantivy 符号索引 + tantivy 调用边索引）
+    let call_graph = CallGraph::build_from_tantivy_edges(&call_edge_index, &all_ids)
         .map_err(|e| format!("构建调用图失败: {}", e))?;
 
     let type_hierarchy = TypeHierarchy::new();

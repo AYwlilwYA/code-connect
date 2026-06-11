@@ -80,13 +80,18 @@ pub struct ImpactAnalyzer {
 }
 
 impl ImpactAnalyzer {
-    /// 从 sled 存储构建影响分析器
+    /// 从 sled 存储构建影响分析器（已废弃）
     ///
     /// 扫描 sled 中的调用边，构建完整调用图。
     ///
     /// # 参数
     /// - `sled` — 已打开的 sled 数据库实例
     /// - `max_depth` — BFS 最大搜索深度
+    ///
+    /// # 已废弃
+    /// 调用边已迁入 tantivy 调用边索引。请使用 [`from_graph`] 配合
+    /// `CallGraph::build_from_tantivy_edges` 来构建。
+    #[deprecated(note = "调用边已迁入 tantivy，请使用 from_graph 配合 CallGraph::build_from_tantivy_edges")]
     pub fn new(
         sled: &codeconnect_index::sled_store::SledStore,
         max_depth: usize,

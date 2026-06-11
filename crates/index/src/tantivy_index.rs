@@ -263,8 +263,15 @@ impl TantivyIndex {
 
         let results: Vec<SymbolSearchResult> = top_docs
             .iter()
-            .map(|(score, doc_addr)| {
-                let doc: TantivyDocument = searcher.doc(*doc_addr).unwrap();
+            .filter_map(|(score, doc_addr)| {
+                // searcher.doc 返回 Result，跳过获取失败的文档
+                let doc: TantivyDocument = match searcher.doc(*doc_addr) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!("读取文档失败 (search_by_name): {}", e);
+                        return None;
+                    }
+                };
                 // 辅助函数：从文档中提取 STORED 文本字段，缺失时返回空字符串
                 let get_text = |field: Field| -> String {
                     doc.get_first(field)
@@ -285,7 +292,7 @@ impl TantivyIndex {
                         .unwrap_or(false)
                 };
 
-                SymbolSearchResult {
+                Some(SymbolSearchResult {
                     stable_id: get_text(self.schema.stable_id),
                     name: get_text(self.schema.name),
                     kind: get_text(self.schema.kind),
@@ -303,7 +310,7 @@ impl TantivyIndex {
                     end_line: get_u64(self.schema.end_line),
                     end_column: get_u64(self.schema.end_column),
                     score: *score,
-                }
+                })
             })
             .collect();
 
@@ -422,9 +429,16 @@ impl TantivyIndex {
 
         let results: Vec<SymbolSearchResult> = top_docs
             .iter()
-            .map(|(score, doc_addr)| {
-                let doc: TantivyDocument = searcher.doc(*doc_addr).unwrap();
-                SymbolSearchResult {
+            .filter_map(|(score, doc_addr)| {
+                // searcher.doc 返回 Result，跳过获取失败的文档
+                let doc: TantivyDocument = match searcher.doc(*doc_addr) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!("读取文档失败 (search_by_file_path): {}", e);
+                        return None;
+                    }
+                };
+                Some(SymbolSearchResult {
                     stable_id: get_text(&doc, self.schema.stable_id),
                     name: get_text(&doc, self.schema.name),
                     kind: get_text(&doc, self.schema.kind),
@@ -442,7 +456,7 @@ impl TantivyIndex {
                     end_line: get_u64(&doc, self.schema.end_line),
                     end_column: get_u64(&doc, self.schema.end_column),
                     score: *score,
-                }
+                })
             })
             .collect();
 
@@ -499,6 +513,242 @@ impl TantivyIndex {
         self.reader
             .reload()
             .map_err(|e| CodeConnectError::Index(format!("重新加载失败: {}", e)))?;
+        let searcher = self.reader.searcher();
+        Ok(searcher.num_docs())
+    }
+}
+
+// ============================================================================
+// 调用边索引（CallEdgeIndex）
+// ============================================================================
+
+/// 调用边文档 Schema 定义
+///
+/// 用于在 tantivy 中独立存储调用边，替代 sled 的 append-only 写入，
+/// 避免 sled 磁盘膨胀问题。
+pub struct CallEdgeSchema {
+    /// tantivy schema 对象
+    pub schema: Schema,
+    /// 调用者 ID（存储 + 索引，便于按 caller 搜索）
+    pub caller_id: Field,
+    /// 被调用者名称（存储）
+    pub callee_name: Field,
+    /// 被调用者 ID（存储 + 索引）
+    pub callee_id: Field,
+    /// 调用所在文件（存储）
+    pub file: Field,
+    /// 调用所在行号（存储）
+    pub line: Field,
+    /// 调用所在列号（存储）
+    pub column: Field,
+    /// 调用类型（存储）
+    pub call_type: Field,
+    /// 可信度（存储）
+    pub confidence: Field,
+    /// 调用边完整 JSON（存储，便于反序列化还原 CallEdge）
+    pub edge_json: Field,
+}
+
+impl CallEdgeSchema {
+    /// 创建调用边 Schema
+    pub fn new() -> Self {
+        let mut schema_builder = Schema::builder();
+
+        let caller_id = schema_builder.add_text_field("caller_id", STRING | STORED);
+        let callee_name = schema_builder.add_text_field("callee_name", STRING | STORED);
+        let callee_id = schema_builder.add_text_field("callee_id", STRING | STORED);
+        let file = schema_builder.add_text_field("file", STRING | STORED);
+        let line = schema_builder.add_u64_field("line", STORED);
+        let column = schema_builder.add_u64_field("column", STORED);
+        let call_type = schema_builder.add_text_field("call_type", STRING | STORED);
+        let confidence = schema_builder.add_f64_field("confidence", STORED);
+        let edge_json = schema_builder.add_text_field("edge_json", STORED);
+
+        let schema = schema_builder.build();
+
+        Self {
+            schema,
+            caller_id,
+            callee_name,
+            callee_id,
+            file,
+            line,
+            column,
+            call_type,
+            confidence,
+            edge_json,
+        }
+    }
+}
+
+/// 调用边索引管理器
+///
+/// 封装调用边的索引创建、写入、提交和搜索操作。
+/// 与符号索引分开存放，目录为 `{data_dir}/tantivy_edges`。
+pub struct CallEdgeIndex {
+    /// 索引实例（保留字段，供未来扩展使用，如重建索引等场景需要访问底层 Index）
+    #[allow(dead_code)]
+    index: Index,
+    /// 索引写入器
+    writer: IndexWriter,
+    /// 索引读取器
+    reader: IndexReader,
+    /// Schema 引用
+    schema: CallEdgeSchema,
+}
+
+impl CallEdgeIndex {
+    /// 创建或打开调用边索引
+    pub fn open_or_create(index_dir: &Path) -> Result<Self, CodeConnectError> {
+        let schema = CallEdgeSchema::new();
+
+        let index = if index_dir.exists() {
+            Index::open_in_dir(index_dir)
+                .map_err(|e| CodeConnectError::Index(format!("无法打开调用边索引: {}", e)))?
+        } else {
+            std::fs::create_dir_all(index_dir)
+                .map_err(|e| CodeConnectError::Index(format!("无法创建调用边索引目录: {}", e)))?;
+            Index::create_in_dir(index_dir, schema.schema.clone())
+                .map_err(|e| CodeConnectError::Index(format!("无法创建调用边索引: {}", e)))?
+        };
+
+        let writer = index
+            .writer(50_000_000)
+            .map_err(|e| CodeConnectError::Index(format!("无法创建调用边写入器: {}", e)))?;
+
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()
+            .map_err(|e| CodeConnectError::Index(format!("无法创建调用边读取器: {}", e)))?;
+
+        Ok(Self {
+            index,
+            writer,
+            reader,
+            schema,
+        })
+    }
+
+    /// 添加一条调用边
+    ///
+    /// 将 CallEdge 序列化为 JSON 存储到 edge_json 字段，
+    /// 同时拆分关键字段便于搜索。
+    pub fn add_call_edge(
+        &self,
+        caller_id: &str,
+        callee_name: &str,
+        callee_id: &str,
+        file: &str,
+        line: u64,
+        column: u64,
+        call_type: &str,
+        confidence: f64,
+        edge_json: &str,
+    ) -> Result<(), CodeConnectError> {
+        let doc = doc!(
+            self.schema.caller_id => caller_id,
+            self.schema.callee_name => callee_name,
+            self.schema.callee_id => callee_id,
+            self.schema.file => file,
+            self.schema.line => line,
+            self.schema.column => column,
+            self.schema.call_type => call_type,
+            self.schema.confidence => confidence,
+            self.schema.edge_json => edge_json,
+        );
+
+        self.writer
+            .add_document(doc)
+            .map_err(|e| CodeConnectError::Index(format!("写入调用边文档失败: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// 提交所有待写入的调用边
+    pub fn commit(&mut self) -> Result<u64, CodeConnectError> {
+        self.writer
+            .commit()
+            .map_err(|e| CodeConnectError::Index(format!("调用边提交失败: {}", e)))
+    }
+
+    /// 按调用者 ID 搜索其所有出边
+    ///
+    /// 对 caller_id 字段精确匹配，返回该调用者的所有调用边。
+    pub fn search_edges_by_caller(
+        &self,
+        caller_id: &str,
+    ) -> Result<Vec<String>, CodeConnectError> {
+        self.reader
+            .reload()
+            .map_err(|e| CodeConnectError::Index(format!("调用边重载失败: {}", e)))?;
+
+        let searcher = self.reader.searcher();
+
+        use tantivy::query::TermQuery;
+        use tantivy::Term;
+        let term = Term::from_field_text(self.schema.caller_id, caller_id);
+        let query = TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+
+        let top_docs = searcher
+            .search(&query, &TopDocs::with_limit(10000))
+            .map_err(|e| CodeConnectError::Query(format!("调用边搜索失败: {}", e)))?;
+
+        let results: Vec<String> = top_docs
+            .iter()
+            .filter_map(|(_score, doc_addr)| {
+                let doc = searcher.doc::<TantivyDocument>(*doc_addr).ok()?;
+                doc.get_first(self.schema.edge_json)
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// 扫描所有调用边
+    ///
+    /// 遍历索引中所有调用边文档，返回 edge_json 字符串列表。
+    pub fn scan_all_edges(&self) -> Result<Vec<String>, CodeConnectError> {
+        self.reader
+            .reload()
+            .map_err(|e| CodeConnectError::Index(format!("调用边重载失败: {}", e)))?;
+
+        let searcher = self.reader.searcher();
+        let mut results = Vec::new();
+
+        for doc_addr in searcher
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .flat_map(|(segment_ord, reader)| {
+                reader
+                    .doc_ids_alive()
+                    .map(move |doc_id| tantivy::DocAddress {
+                        segment_ord: segment_ord as u32,
+                        doc_id,
+                    })
+            })
+        {
+            if let Ok(doc) = searcher.doc::<TantivyDocument>(doc_addr) {
+                if let Some(edge_json) = doc
+                    .get_first(self.schema.edge_json)
+                    .and_then(|v| v.as_str())
+                {
+                    results.push(edge_json.to_string());
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// 获取调用边索引中文档总数
+    pub fn doc_count(&self) -> Result<u64, CodeConnectError> {
+        self.reader
+            .reload()
+            .map_err(|e| CodeConnectError::Index(format!("重载失败: {}", e)))?;
         let searcher = self.reader.searcher();
         Ok(searcher.num_docs())
     }

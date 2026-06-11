@@ -3,8 +3,8 @@
 //! 封装 [`CallGraph`]，提供调用者/被调用者的双向 BFS 遍历分析，
 //! 以及基于调用图的全量引用查找。
 //!
-//! 调用图从 sled 存储中构建，`CallAnalyzer` 持有预构建的图实例，
-//! 避免每次查询都重新扫描 sled。
+//! 调用图从 tantivy 调用边索引构建，`CallAnalyzer` 持有预构建的图实例，
+//! 避免每次查询都重新扫描存储。
 
 use codeconnect_core::error::CodeConnectError;
 use codeconnect_graph::call_graph::{CallChainNode, CallGraph};
@@ -20,13 +20,18 @@ pub struct CallAnalyzer {
 }
 
 impl CallAnalyzer {
-    /// 从 sled 存储构建调用分析器
+    /// 从 sled 存储构建调用分析器（已废弃）
     ///
     /// 扫描 sled 中的 edges 命名空间，构建完整的调用图。
     /// 此操作会遍历所有调用边和符号，对于大型项目可能需要一定时间。
     ///
     /// # 参数
     /// - `sled` — 已打开的 sled 数据库实例
+    ///
+    /// # 已废弃
+    /// 调用边已迁入 tantivy 调用边索引。请使用 [`from_graph`] 配合
+    /// `CallGraph::build_from_tantivy_edges` 来构建。
+    #[deprecated(note = "调用边已迁入 tantivy，请使用 from_graph 配合 CallGraph::build_from_tantivy_edges")]
     pub fn new(
         sled: &codeconnect_index::sled_store::SledStore,
     ) -> Result<Self, CodeConnectError> {
