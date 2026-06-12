@@ -36,7 +36,7 @@ pub async fn run(
     // 尝试打开已有索引（目录不存在时不自动创建，serve 不会因此崩溃）
     let tantivy = TantivyIndex::open_only(&tantivy_dir).ok();
     let call_edge_index = CallEdgeIndex::open_only(&tantivy_edges_dir).ok();
-    let sled = SledStore::open(&sled_dir).ok();
+    let sled = SledStore::open_only(&sled_dir).ok();
 
     // 统计索引文档数
     let doc_count = tantivy.as_ref().and_then(|t| t.doc_count().ok()).unwrap_or(0);

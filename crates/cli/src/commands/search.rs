@@ -32,7 +32,7 @@ pub async fn run(
     // 检查索引目录是否存在（不自动创建——索引应由 `codeconnect index` 命令构建）
     super::check_index_dirs_exist(data_dir)?;
 
-    let tantivy = TantivyIndex::open_or_create(&tantivy_dir)
+    let tantivy = TantivyIndex::open_only(&tantivy_dir)
         .map_err(|e| format!("无法打开 tantivy 索引: {}", e))?;
 
     // 搜索符号（符号数据只存 tantivy，sled 仅用于调用边/文件指纹）
