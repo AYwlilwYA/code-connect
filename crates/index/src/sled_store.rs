@@ -39,12 +39,32 @@ pub struct SledStore {
 impl SledStore {
     /// 打开或创建 sled 数据库
     ///
+    /// 警告：`sled::open` 在目录不存在时内部调用 `fs::create_dir_all`，
+    /// 会递归创建父目录（包括 `.codeconnect/`）。因此只应在 index 命令中使用，
+    /// serve / analyze / search / status 等只读场景应使用 `open_only`。
+    ///
     /// # 参数
     /// - `path` — 数据库目录路径，目录不存在时会自动创建
     pub fn open(path: &Path) -> Result<Self, CodeConnectError> {
         let db = sled::open(path)
             .map_err(|e| CodeConnectError::Index(format!("无法打开 sled: {}", e)))?;
         Ok(Self { db })
+    }
+
+    /// 仅打开已有 sled 数据库（目录不存在时不自动创建）
+    ///
+    /// 在调用 `sled::open` 之前检查目录是否存在，
+    /// 避免 sled 内部 `fs::create_dir_all` 自动创建
+    /// `.codeconnect/` 父目录。适用于 serve 等只读场景。
+    pub fn open_only(path: &Path) -> Result<Self, CodeConnectError> {
+        if !path.exists() {
+            return Err(CodeConnectError::Index(format!(
+                "sled 数据目录不存在: {}",
+                path.display()
+            )));
+        }
+        // 此时目录已存在，sled::open 不会再触发 fs::create_dir_all
+        Self::open(path)
     }
 
     // ===== 文件元信息 =====

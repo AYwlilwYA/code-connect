@@ -37,7 +37,7 @@ pub async fn run(
         return Ok(());
     }
 
-    let tantivy = match TantivyIndex::open_or_create(&tantivy_dir) {
+    let tantivy = match TantivyIndex::open_only(&tantivy_dir) {
         Ok(t) => t,
         Err(e) => {
             println!("  无法打开 tantivy 索引: {}", e);
@@ -45,7 +45,7 @@ pub async fn run(
         }
     };
 
-    let sled = match SledStore::open(&sled_dir) {
+    let sled = match SledStore::open_only(&sled_dir) {
         Ok(s) => s,
         Err(e) => {
             println!("  无法打开 sled 存储: {}", e);

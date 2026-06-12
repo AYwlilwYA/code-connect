@@ -32,9 +32,9 @@ pub async fn run(
     // 检查索引目录是否存在（不自动创建——索引应由 `codeconnect index` 命令构建）
     super::check_index_dirs_exist(data_dir)?;
 
-    let tantivy = TantivyIndex::open_or_create(&tantivy_dir)
+    let tantivy = TantivyIndex::open_only(&tantivy_dir)
         .map_err(|e| format!("无法打开 tantivy 索引: {}", e))?;
-    let call_edge_index = CallEdgeIndex::open_or_create(&tantivy_edges_dir)
+    let call_edge_index = CallEdgeIndex::open_only(&tantivy_edges_dir)
         .map_err(|e| format!("无法打开调用边索引: {}", e))?;
     let _sled_dir = data_dir.join("sled");
 
