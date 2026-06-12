@@ -72,6 +72,11 @@ impl ParserRegistry {
     pub fn registered_languages(&self) -> Vec<&str> {
         self.parsers.keys().map(|s| s.as_str()).collect()
     }
+
+    /// 返回所有已注册的文件扩展名
+    pub fn all_extensions(&self) -> Vec<&str> {
+        self.ext_map.keys().map(|s| s.as_str()).collect()
+    }
 }
 
 impl Default for ParserRegistry {

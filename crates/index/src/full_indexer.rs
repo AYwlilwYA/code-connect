@@ -328,13 +328,11 @@ impl FullIndexer {
 
             let path = entry.path();
 
-            // 按扩展名过滤支持的编程语言
+            // 按扩展名过滤支持的编程语言（动态从解析器注册表获取）
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                let supported = matches!(
-                    ext,
-                    "rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "java" | "cs"
-                );
-                if supported {
+                let ext_lower = ext.to_lowercase();
+                let supported_exts = self.parser_registry.all_extensions();
+                if supported_exts.iter().any(|e| e.eq_ignore_ascii_case(&ext_lower)) {
                     files.push(path.to_path_buf());
                 }
             }
