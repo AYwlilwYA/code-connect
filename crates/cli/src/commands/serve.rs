@@ -35,24 +35,7 @@ pub async fn run(
     let sled_dir = data_dir.join("sled");
 
     // 检查索引目录是否存在（不自动创建——索引应由 `codeconnect index` 命令构建）
-    let required_dirs: [(&str, &Path); 3] = [
-        ("tantivy", &tantivy_dir),
-        ("sled", &sled_dir),
-        ("调用边索引", &tantivy_edges_dir),
-    ];
-    let mut missing = Vec::new();
-    for (name, dir) in &required_dirs {
-        if !dir.exists() {
-            missing.push(*name);
-        }
-    }
-    if !missing.is_empty() {
-        return Err(format!(
-            "索引数据不完整，缺失: {}\n请先运行 `codeconnect index -p \"{}\"` 构建索引。",
-            missing.join(", "),
-            project_root.display()
-        ).into());
-    }
+    super::check_index_dirs_exist(data_dir)?;
 
     // 打开索引（为 query_engine 创建）
     let tantivy = TantivyIndex::open_or_create(&tantivy_dir)
