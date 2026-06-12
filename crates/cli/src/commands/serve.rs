@@ -4,7 +4,6 @@
 //! 读取已构建的索引并提供代码分析工具供 AI 助手调用。
 
 use std::path::Path;
-use std::sync::Arc;
 
 use codeconnect_core::config::CodeConnectConfig;
 use codeconnect_index::sled_store::SledStore;
@@ -34,35 +33,24 @@ pub async fn run(
     let tantivy_edges_dir = data_dir.join("tantivy_edges");
     let sled_dir = data_dir.join("sled");
 
-    // 检查索引目录是否存在（不自动创建——索引应由 `codeconnect index` 命令构建）
-    super::check_index_dirs_exist(data_dir)?;
+    // 尝试打开已有索引（目录不存在时不自动创建，serve 不会因此崩溃）
+    let tantivy = TantivyIndex::open_only(&tantivy_dir).ok();
+    let call_edge_index = CallEdgeIndex::open_only(&tantivy_edges_dir).ok();
+    let sled = SledStore::open(&sled_dir).ok();
 
-    // 打开索引（为 query_engine 创建）
-    let tantivy = TantivyIndex::open_or_create(&tantivy_dir)
-        .map_err(|e| format!("无法打开 tantivy 索引: {}", e))?;
-    let call_edge_index = CallEdgeIndex::open_or_create(&tantivy_edges_dir)
-        .map_err(|e| format!("无法打开调用边索引: {}", e))?;
-    let sled = SledStore::open(&sled_dir)
-        .map_err(|e| format!("无法打开 sled 存储: {}", e))?;
-
-    let doc_count = tantivy.doc_count().unwrap_or(0);
-    let edge_count = call_edge_index.doc_count().unwrap_or(0);
+    // 统计索引文档数
+    let doc_count = tantivy.as_ref().and_then(|t| t.doc_count().ok()).unwrap_or(0);
+    let edge_count = call_edge_index.as_ref().and_then(|c| c.doc_count().ok()).unwrap_or(0);
     tracing::info!("已加载索引: {} 个符号文档, {} 条调用边", doc_count, edge_count);
 
     if doc_count == 0 {
         tracing::warn!("索引为空！请先运行 `codeconnect index` 构建索引。");
     }
 
-    // 构建查询引擎（拥有 tantivy 和 sled）
-    let query_engine = Arc::new(codeconnect_index::query_engine::QueryEngine::new(tantivy, sled));
-
-    // 注意：query_engine 已消费 tantivy 和 sled 的所有权，
-    // ToolRegistry 通过 query_engine 访问它们。
-    // 调用边索引独立传入（query_engine 不持有 CallEdgeIndex）。
-    // 同时传入 project_root 和 data_dir，供 handle_reindex 调用 CLI 索引命令。
+    // 构建 ToolRegistry — 即使索引为空也能启动，MCP 工具返回友好错误提示
     let registry = ToolRegistry::new()
-        .with_query_engine(query_engine)
-        .with_call_edge_index(Arc::new(call_edge_index))
+        .with_query_engine_opt(tantivy, sled)
+        .with_call_edge_index_opt(call_edge_index)
         .with_project_root(project_root.to_path_buf())
         .with_data_dir(data_dir.to_path_buf());
 

@@ -31,6 +31,9 @@ use std::time::Instant;
 
 use codeconnect_core::response::McpResponse;
 use codeconnect_core::types::Symbol;
+use codeconnect_index::query_engine::QueryEngine;
+use codeconnect_index::sled_store::SledStore;
+use codeconnect_index::tantivy_index::{CallEdgeIndex, TantivyIndex};
 
 use crate::schemas::*;
 
@@ -92,8 +95,30 @@ impl ToolRegistry {
     }
 
     /// 设置查询引擎实例
-    pub fn with_query_engine(mut self, qe: Arc<codeconnect_index::query_engine::QueryEngine>) -> Self {
+    pub fn with_query_engine(mut self, qe: Arc<QueryEngine>) -> Self {
         self.query_engine = Some(qe);
+        self
+    }
+
+    /// 可选地设置查询引擎（索引不存在时跳过）
+    ///
+    /// 同时接收 tantivy 和 sled 的所有权，如果两者都存在则创建 QueryEngine。
+    pub fn with_query_engine_opt(
+        mut self,
+        tantivy: Option<TantivyIndex>,
+        sled: Option<SledStore>,
+    ) -> Self {
+        if let (Some(tantivy), Some(sled)) = (tantivy, sled) {
+            self.query_engine = Some(Arc::new(QueryEngine::new(tantivy, sled)));
+        }
+        self
+    }
+
+    /// 可选地设置调用边索引（索引不存在时跳过）
+    pub fn with_call_edge_index_opt(mut self, cei: Option<CallEdgeIndex>) -> Self {
+        if let Some(cei) = cei {
+            self.call_edge_index = Some(Arc::new(cei));
+        }
         self
     }
 
