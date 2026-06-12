@@ -171,6 +171,36 @@ impl TantivyIndex {
         })
     }
 
+    /// 仅打开已有索引（目录不存在时不自动创建）
+    ///
+    /// 与 `open_or_create` 不同，此方法在索引目录不存在时直接返回错误，
+    /// 不会自动创建目录。适用于 serve 等只读场景。
+    pub fn open_only(index_dir: &Path) -> Result<Self, CodeConnectError> {
+        if !index_dir.exists() {
+            return Err(CodeConnectError::Index(format!(
+                "索引目录不存在: {}",
+                index_dir.display()
+            )));
+        }
+        let schema = SymbolSchema::new();
+        let index = Index::open_in_dir(index_dir)
+            .map_err(|e| CodeConnectError::Index(format!("无法打开索引: {}", e)))?;
+        let writer = index
+            .writer(50_000_000)
+            .map_err(|e| CodeConnectError::Index(format!("无法创建写入器: {}", e)))?;
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()
+            .map_err(|e| CodeConnectError::Index(format!("无法创建读取器: {}", e)))?;
+        Ok(Self {
+            index,
+            writer,
+            reader,
+            schema,
+        })
+    }
+
     /// 添加符号文档到索引
     ///
     /// # 参数
@@ -622,6 +652,36 @@ impl CallEdgeIndex {
             .try_into()
             .map_err(|e| CodeConnectError::Index(format!("无法创建调用边读取器: {}", e)))?;
 
+        Ok(Self {
+            index,
+            writer,
+            reader,
+            schema,
+        })
+    }
+
+    /// 仅打开已有调用边索引（目录不存在时不自动创建）
+    ///
+    /// 与 `open_or_create` 不同，此方法在索引目录不存在时直接返回错误，
+    /// 不会自动创建目录。适用于 serve 等只读场景。
+    pub fn open_only(index_dir: &Path) -> Result<Self, CodeConnectError> {
+        if !index_dir.exists() {
+            return Err(CodeConnectError::Index(format!(
+                "调用边索引目录不存在: {}",
+                index_dir.display()
+            )));
+        }
+        let schema = CallEdgeSchema::new();
+        let index = Index::open_in_dir(index_dir)
+            .map_err(|e| CodeConnectError::Index(format!("无法打开调用边索引: {}", e)))?;
+        let writer = index
+            .writer(50_000_000)
+            .map_err(|e| CodeConnectError::Index(format!("无法创建调用边写入器: {}", e)))?;
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()
+            .map_err(|e| CodeConnectError::Index(format!("无法创建调用边读取器: {}", e)))?;
         Ok(Self {
             index,
             writer,
