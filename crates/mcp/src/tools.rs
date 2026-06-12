@@ -25,7 +25,7 @@
 //! | `get_file_symbols` | 文件内符号列表 | [`GetFileSymbolsParams`] |
 //! | `get_dependency_graph` | 获取依赖图 | [`GetDependencyGraphParams`] |
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -788,6 +788,34 @@ pub async fn handle_reindex(
         Some(p) => p.clone(),
         None => return McpResponse::error("项目根目录未配置，无法执行重新索引"),
     };
+
+    // 检查索引目录是否存在（不自动创建——索引应由 `codeconnect index` 命令构建）
+    // reindex 工具需要索引已存在，初次构建请使用 CLI 的 `codeconnect index` 命令
+    if let Some(data_dir) = &registry.data_dir {
+        let tantivy_dir = data_dir.join("tantivy");
+        let tantivy_edges_dir = data_dir.join("tantivy_edges");
+        let sled_dir = data_dir.join("sled");
+
+        let required: [(&str, &Path); 3] = [
+            ("tantivy", &tantivy_dir),
+            ("调用边索引", &tantivy_edges_dir),
+            ("sled", &sled_dir),
+        ];
+        let mut missing = Vec::new();
+        for (name, dir) in &required {
+            if !dir.exists() {
+                missing.push(*name);
+            }
+        }
+        if !missing.is_empty() {
+            return McpResponse::error(
+                &format!(
+                    "索引数据不完整，缺失: {}\n请先运行 `codeconnect index` 构建索引。",
+                    missing.join(", ")
+                ),
+            );
+        }
+    }
 
     // 构建 CLI 命令参数（data_dir 由 CLI 根据配置文件自动推断，无需显式传入）
     let mut cmd = tokio::process::Command::new("codeconnect");
