@@ -102,14 +102,22 @@ impl ToolRegistry {
 
     /// 可选地设置查询引擎（索引不存在时跳过）
     ///
-    /// 同时接收 tantivy 和 sled 的所有权，如果两者都存在则创建 QueryEngine。
+    /// 同时接收 tantivy 和 sled 的所有权，如果两者都存在则：
+    /// 1. 将它们包装为 `Arc` 并 clone 到 `self.tantivy` / `self.sled`
+    /// 2. 用 `from_arc` 创建 `QueryEngine` 设置到 `self.query_engine`
+    ///
+    /// 这样后续 handler 中 `registry.sled` / `registry.tantivy` 不再为 None。
     pub fn with_query_engine_opt(
         mut self,
         tantivy: Option<TantivyIndex>,
         sled: Option<SledStore>,
     ) -> Self {
         if let (Some(tantivy), Some(sled)) = (tantivy, sled) {
-            self.query_engine = Some(Arc::new(QueryEngine::new(tantivy, sled)));
+            let tantivy_arc = Arc::new(tantivy);
+            let sled_arc = Arc::new(sled);
+            self.tantivy = Some(tantivy_arc.clone());
+            self.sled = Some(sled_arc.clone());
+            self.query_engine = Some(Arc::new(QueryEngine::from_arc(tantivy_arc, sled_arc)));
         }
         self
     }

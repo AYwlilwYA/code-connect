@@ -6,6 +6,8 @@
 //! 注意：符号定义数据只存储在 tantivy 的 STORED 字段中，
 //! sled 不再冗余存储符号定义（sled 的 append-only 架构会导致磁盘膨胀）。
 
+use std::sync::Arc;
+
 use crate::sled_store::SledStore;
 use crate::tantivy_index::{SymbolSearchResult, TantivyIndex};
 use codeconnect_core::error::CodeConnectError;
@@ -19,18 +21,32 @@ use codeconnect_core::types::{
 /// 无需关心底层存储实现的细节。
 pub struct QueryEngine {
     /// 全文搜索索引（基于 tantivy BM25）
-    pub tantivy: TantivyIndex,
+    pub tantivy: Arc<TantivyIndex>,
     /// 键值持久化存储（基于 sled）
-    pub sled: SledStore,
+    pub sled: Arc<SledStore>,
 }
 
 impl QueryEngine {
     /// 创建新的查询引擎（使用已存在的索引和存储实例）
     ///
+    /// 内部将 owned 值包装为 `Arc`，以便与 `ToolRegistry` 共享同一实例。
+    ///
     /// # 参数
     /// - `tantivy` — 已初始化的 tantivy 全文搜索索引
     /// - `sled` — 已打开的 sled K/V 数据库
     pub fn new(tantivy: TantivyIndex, sled: SledStore) -> Self {
+        Self::from_arc(Arc::new(tantivy), Arc::new(sled))
+    }
+
+    /// 使用已有的 `Arc` 实例创建查询引擎
+    ///
+    /// 当调用方已持有 `Arc<TantivyIndex>` 和 `Arc<SledStore>` 时使用此构造函数，
+    /// 避免重复包装。这些 `Arc` 可以 clone 后同时设置到 `ToolRegistry` 的其他字段。
+    ///
+    /// # 参数
+    /// - `tantivy` — 已包装为 `Arc` 的 tantivy 全文搜索索引
+    /// - `sled` — 已包装为 `Arc` 的 sled K/V 数据库
+    pub fn from_arc(tantivy: Arc<TantivyIndex>, sled: Arc<SledStore>) -> Self {
         Self { tantivy, sled }
     }
 
