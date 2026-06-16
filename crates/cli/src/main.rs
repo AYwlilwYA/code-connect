@@ -1,9 +1,11 @@
 //! CodeConnect CLI 入口
 //!
-//! 提供七个子命令：
+//! 提供九个子命令：
 //! - `serve` — 启动 MCP 服务器（stdio 模式）
 //! - `index` — 触发代码全量索引
 //! - `search` — 快速符号搜索
+//! - `references` — 查找符号的所有引用位置
+//! - `call-graph` — 显示符号的调用关系图
 //! - `analyze` — 离线分析（复杂度、死代码检测等）
 //! - `status` — 查看索引进度与统计
 //! - `check-rules` — 架构规则验证（CI 适用）
@@ -105,6 +107,33 @@ enum Commands {
         rules: Option<Vec<String>>,
     },
 
+    /// 查找符号的所有引用位置
+    ///
+    /// 在调用图中查找所有调用目标符号的位置，
+    /// 输出每个引用处的文件路径、行号和调用类型。
+    References {
+        /// 符号名称或符号 ID
+        symbol: String,
+        /// 是否包含声明位置
+        #[arg(long, default_value = "false")]
+        include_declaration: bool,
+    },
+
+    /// 显示符号的调用关系图
+    ///
+    /// 展示指定符号的调用者和被调用者，
+    /// 支持控制追踪方向和搜索深度。
+    CallGraph {
+        /// 符号名称或符号 ID
+        symbol: String,
+        /// 追踪方向：callers（调用者）、callees（被调用者）、both（双向，默认）
+        #[arg(long, default_value = "both")]
+        direction: String,
+        /// 最大搜索深度
+        #[arg(long, default_value = "2")]
+        depth: usize,
+    },
+
     /// MCP 一键配置
     ///
     /// 自动将 CodeConnect 注册到 Claude Code 的 MCP 配置中。
@@ -186,6 +215,34 @@ async fn run_command(
 
         Commands::CheckRules { rules } => {
             commands::analyze::run_check_rules(&cli.project_root, &data_dir, rules).await?;
+        }
+
+        Commands::References {
+            symbol,
+            include_declaration,
+        } => {
+            commands::references::run(
+                &cli.project_root,
+                &data_dir,
+                &symbol,
+                include_declaration,
+            )
+            .await?;
+        }
+
+        Commands::CallGraph {
+            symbol,
+            direction,
+            depth,
+        } => {
+            commands::call_graph::run(
+                &cli.project_root,
+                &data_dir,
+                &symbol,
+                &direction,
+                depth,
+            )
+            .await?;
         }
 
         Commands::McpSetup {
