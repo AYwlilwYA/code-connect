@@ -1,7 +1,9 @@
 use std::path::Path;
 
 pub mod analyze;
+pub mod call_graph;
 pub mod index;
+pub mod references;
 pub mod search;
 pub mod serve;
 pub mod setup;
