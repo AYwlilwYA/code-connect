@@ -20,6 +20,8 @@
 - JavaScript
 - Java
 - C#
+- C
+- C++
 
 > Kotlin 支持待其 tree-sitter grammar 稳定后启用。
 
@@ -87,9 +89,12 @@ sudo cp target/release/code-connect /usr/local/bin/
 | `serve` | 启动 MCP 服务器（stdio 模式），供 AI 助手直接调用 |
 | `index` | 遍历项目目录，解析源文件并构建全文索引 |
 | `search <query>` | 按名称搜索符号，返回位置、类型和签名信息 |
+| `references <symbol>` | 查找符号的所有引用位置（文件、行号、调用类型） |
+| `call-graph <symbol>` | 显示符号的调用关系图（调用者 + 被调用者） |
 | `analyze` | 离线分析：圈复杂度、死代码检测、指标统计等 |
 | `status` | 查看索引状态：文档数、存储占用、各语言分布 |
 | `check-rules` | 架构规则验证：层依赖、循环依赖等，退出码反馈结果 |
+| `mcp-setup` | 一键配置 MCP 接入（项目级或全局） |
 
 所有命令均支持 `-p <路径>` 指定项目根目录。
 
@@ -131,6 +136,8 @@ typescript = true
 javascript = true
 java = true
 csharp = true
+c = true
+cpp = true
 
 [index]
 data_dir = ".codeconnect"
@@ -190,6 +197,8 @@ codeconnect search "handle_request" --language rust --kind function
 | `javascript` | `bool` | `true` | 启用 JavaScript 解析与索引 |
 | `java` | `bool` | `true` | 启用 Java 解析与索引 |
 | `csharp` | `bool` | `true` | 启用 C# 解析与索引 |
+| `c` | `bool` | `true` | 启用 C 解析与索引 |
+| `cpp` | `bool` | `true` | 启用 C++ 解析与索引 |
 
 ### `[index]`
 
@@ -247,7 +256,7 @@ allowed = [
 | Crate | 说明 |
 |-------|------|
 | `codeconnect-core` | 核心类型、符号 ID、配置解析、错误处理、统一响应格式 |
-| `codeconnect-parser` | 多语言 tree-sitter 解析器：Rust / TypeScript / JavaScript / Java / C# |
+| `codeconnect-parser` | 多语言 tree-sitter 解析器：Rust / TS / JS / Java / C# / C / C++ |
 | `codeconnect-index` | 索引引擎：tantivy 全文搜索 + sled K/V 存储 + 并行索引构建 |
 | `codeconnect-graph` | 图分析模块：调用图、依赖图、类型层次、循环检测、LRU 缓存 |
 | `codeconnect-services` | 业务逻辑服务层：符号查找、调用分析、语义搜索、影响分析、架构查询、指标 |
