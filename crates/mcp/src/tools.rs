@@ -25,15 +25,18 @@
 //! | `get_file_symbols` | 文件内符号列表 | [`GetFileSymbolsParams`] |
 //! | `get_dependency_graph` | 获取依赖图 | [`GetDependencyGraphParams`] |
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use codeconnect_core::config::CodeConnectConfig;
 use codeconnect_core::response::McpResponse;
 use codeconnect_core::types::Symbol;
+use codeconnect_index::full_indexer::{FullIndexer, IndexStats};
 use codeconnect_index::query_engine::QueryEngine;
 use codeconnect_index::sled_store::SledStore;
 use codeconnect_index::tantivy_index::{CallEdgeIndex, TantivyIndex};
+use codeconnect_parser::factory::ParserRegistry;
 
 use crate::schemas::*;
 
@@ -58,6 +61,10 @@ pub struct ToolRegistry {
     pub project_root: Option<PathBuf>,
     /// 索引数据目录路径（用于重新索引时传递给 CLI）
     pub data_dir: Option<PathBuf>,
+    /// CodeConnect 配置（用于 reindex 时构建解析器）
+    pub config: Option<CodeConnectConfig>,
+    /// 解析器注册表（用于 reindex 时进程内构建索引）
+    pub parser_registry: Option<Arc<ParserRegistry>>,
 }
 
 impl ToolRegistry {
@@ -70,6 +77,8 @@ impl ToolRegistry {
             query_engine: None,
             project_root: None,
             data_dir: None,
+            config: None,
+            parser_registry: None,
         }
     }
 
@@ -139,6 +148,18 @@ impl ToolRegistry {
     /// 设置索引数据目录路径
     pub fn with_data_dir(mut self, path: PathBuf) -> Self {
         self.data_dir = Some(path);
+        self
+    }
+
+    /// 设置 CodeConnect 配置（用于 reindex 时获知语言开关）
+    pub fn with_config(mut self, config: CodeConnectConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// 设置解析器注册表（用于 reindex 时进程内构建索引）
+    pub fn with_parser_registry(mut self, registry: Arc<ParserRegistry>) -> Self {
+        self.parser_registry = Some(registry);
         self
     }
 }
@@ -808,83 +829,80 @@ pub fn handle_find_references(
 
 /// 重新索引 handler
 ///
-/// 通过调用 `codeconnect index` CLI 命令来执行索引构建。
-/// 这样可以复用 CLI 中已有的完整索引逻辑，避免将整个索引引擎引入 MCP server 的依赖。
+/// 在进程内直接调用 [`FullIndexer`] 构建索引，不再 spawn 子进程，
+/// 从而避免子进程与父进程的 sled 文件锁冲突。
 pub async fn handle_reindex(
     registry: &ToolRegistry,
     params: ReindexParams,
 ) -> McpResponse<serde_json::Value> {
     let start = Instant::now();
 
-    // 检查必要的路径参数是否已配置
+    // 检查必要的路径参数
     let project_root = match &registry.project_root {
         Some(p) => p.clone(),
         None => return McpResponse::error("项目根目录未配置，无法执行重新索引"),
     };
 
-    // 检查索引目录是否存在（不自动创建——索引应由 `codeconnect index` 命令构建）
-    // reindex 工具需要索引已存在，初次构建请使用 CLI 的 `codeconnect index` 命令
-    if let Some(data_dir) = &registry.data_dir {
-        let tantivy_dir = data_dir.join("tantivy");
-        let tantivy_edges_dir = data_dir.join("tantivy_edges");
-        let sled_dir = data_dir.join("sled");
-
-        let required: [(&str, &Path); 3] = [
-            ("tantivy", &tantivy_dir),
-            ("调用边索引", &tantivy_edges_dir),
-            ("sled", &sled_dir),
-        ];
-        let mut missing = Vec::new();
-        for (name, dir) in &required {
-            if !dir.exists() {
-                missing.push(*name);
-            }
-        }
-        if !missing.is_empty() {
-            return McpResponse::error(
-                &format!(
-                    "索引数据不完整，缺失: {}\n请先运行 `codeconnect index` 构建索引。",
-                    missing.join(", ")
-                ),
-            );
-        }
+    // 检查数据目录是否配置（索引存储已由 serve 打开）
+    if registry.data_dir.is_none() {
+        return McpResponse::error("数据目录未配置，无法执行重新索引");
     }
 
-    // 构建 CLI 命令参数（data_dir 由 CLI 根据配置文件自动推断，无需显式传入）
-    let mut cmd = tokio::process::Command::new("codeconnect");
-    cmd.arg("index");
-    cmd.arg("--project-root");
-    cmd.arg(project_root.to_string_lossy().as_ref());
-
-    // 全量重建模式
-    if params.full {
-        cmd.arg("--force");
-    }
-
-    // 执行命令
-    let output = match cmd.output().await {
-        Ok(o) => o,
-        Err(e) => {
-            return McpResponse::<serde_json::Value>::error(
-                &format!("执行 codeconnect index 失败: {}", e),
-            );
-        }
+    // 收集索引存储实例（必须是已打开的共享引用）
+    let tantivy = match &registry.tantivy {
+        Some(t) => Arc::clone(t),
+        None => return McpResponse::error("tantivy 索引未加载，请先启动 MCP 服务器并确保索引已就绪"),
+    };
+    let sled = match &registry.sled {
+        Some(s) => Arc::clone(s),
+        None => return McpResponse::error("sled 存储未加载，请先启动 MCP 服务器并确保索引已就绪"),
+    };
+    let call_edge_index = match &registry.call_edge_index {
+        Some(c) => Arc::clone(c),
+        None => return McpResponse::error("调用边索引未加载，请先启动 MCP 服务器并确保索引已就绪"),
+    };
+    let parser_registry = match &registry.parser_registry {
+        Some(r) => Arc::clone(r),
+        None => return McpResponse::error("解析器注册表未初始化，无法执行重新索引"),
     };
 
-    if output.status.success() {
-        let result = serde_json::json!({
-            "status": "reindex_complete",
-            "mode": if params.full { "full" } else { "incremental" },
-        });
-        let elapsed = start.elapsed().as_millis() as u64;
-        McpResponse::success(result, 1, 1, elapsed)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        McpResponse::error(
-            &format!("codeconnect index 命令执行失败 (exit code: {}): {}",
-                output.status.code().unwrap_or(-1),
-                stderr.trim()),
-        )
+    // 全量索引在 spawn_blocking 中运行以避免阻塞 MCP 事件循环
+    let result = tokio::task::spawn_blocking(move || -> Result<IndexStats, String> {
+        let indexer = FullIndexer::new(
+            &project_root,
+            tantivy,
+            call_edge_index,
+            sled,
+            parser_registry,
+        );
+        indexer.run().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("索引任务异常终止: {}", e));
+
+    match result {
+        Ok(Ok(stats)) => {
+            let result = serde_json::json!({
+                "status": "reindex_complete",
+                "mode": if params.full { "full" } else { "incremental" },
+                "stats": {
+                    "files_scanned": stats.files_scanned,
+                    "files_parsed": stats.files_parsed,
+                    "symbols_found": stats.symbols_found,
+                    "calls_found": stats.calls_found,
+                    "imports_found": stats.imports_found,
+                    "failed_files": stats.failed_files.len(),
+                },
+            });
+            let elapsed = start.elapsed().as_millis() as u64;
+            McpResponse::success(result, 1, 1, elapsed)
+        }
+        Ok(Err(e)) => {
+            McpResponse::error(&format!("索引构建失败: {}", e))
+        }
+        Err(e) => {
+            McpResponse::error(&format!("索引任务执行失败: {}", e))
+        }
     }
 }
 

@@ -110,8 +110,11 @@ pub async fn run(
 
     let parser_registry = Arc::new(registry);
 
-    // 创建并运行全量索引器
-    let mut indexer = FullIndexer::new(project_root, tantivy, call_edge_index, sled, parser_registry);
+    // 创建并运行全量索引器（将索引实例包装为 Arc 以支持共享引用）
+    let tantivy_arc = Arc::new(tantivy);
+    let call_edge_arc = Arc::new(call_edge_index);
+    let sled_arc = Arc::new(sled);
+    let indexer = FullIndexer::new(project_root, tantivy_arc, call_edge_arc, sled_arc, parser_registry);
 
     println!();
     println!("正在扫描并解析源文件...");

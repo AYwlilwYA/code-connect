@@ -3,6 +3,7 @@
 //! 定义符号文档 Schema，提供索引写入、搜索和版本管理。
 
 use std::path::Path;
+use std::sync::Mutex;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
@@ -122,8 +123,8 @@ impl SymbolSchema {
 pub struct TantivyIndex {
     /// 索引实例
     index: Index,
-    /// 索引写入器（50MB 内存缓冲区）
-    writer: IndexWriter,
+    /// 索引写入器（50MB 内存缓冲区），用 Mutex 包装以支持共享引用时的 commit
+    writer: Mutex<IndexWriter>,
     /// 索引读取器（Commit 后延迟重载）
     reader: IndexReader,
     /// Schema 引用
@@ -165,7 +166,7 @@ impl TantivyIndex {
 
         Ok(Self {
             index,
-            writer,
+            writer: Mutex::new(writer),
             reader,
             schema,
         })
@@ -195,7 +196,7 @@ impl TantivyIndex {
             .map_err(|e| CodeConnectError::Index(format!("无法创建读取器: {}", e)))?;
         Ok(Self {
             index,
-            writer,
+            writer: Mutex::new(writer),
             reader,
             schema,
         })
@@ -249,6 +250,8 @@ impl TantivyIndex {
         );
 
         self.writer
+            .lock()
+            .unwrap()
             .add_document(doc)
             .map_err(|e| CodeConnectError::Index(format!("写入文档失败: {}", e)))?;
 
@@ -259,8 +262,10 @@ impl TantivyIndex {
     ///
     /// 返回此次提交写入的文档数。
     /// 提交后读取器将自动重载，使新文档可见。
-    pub fn commit(&mut self) -> Result<u64, CodeConnectError> {
+    pub fn commit(&self) -> Result<u64, CodeConnectError> {
         self.writer
+            .lock()
+            .unwrap()
             .commit()
             .map_err(|e| CodeConnectError::Index(format!("提交失败: {}", e)))
     }
@@ -619,8 +624,8 @@ pub struct CallEdgeIndex {
     /// 索引实例（保留字段，供未来扩展使用，如重建索引等场景需要访问底层 Index）
     #[allow(dead_code)]
     index: Index,
-    /// 索引写入器
-    writer: IndexWriter,
+    /// 索引写入器，用 Mutex 包装以支持共享引用时的 commit
+    writer: Mutex<IndexWriter>,
     /// 索引读取器
     reader: IndexReader,
     /// Schema 引用
@@ -654,7 +659,7 @@ impl CallEdgeIndex {
 
         Ok(Self {
             index,
-            writer,
+            writer: Mutex::new(writer),
             reader,
             schema,
         })
@@ -684,7 +689,7 @@ impl CallEdgeIndex {
             .map_err(|e| CodeConnectError::Index(format!("无法创建调用边读取器: {}", e)))?;
         Ok(Self {
             index,
-            writer,
+            writer: Mutex::new(writer),
             reader,
             schema,
         })
@@ -719,6 +724,8 @@ impl CallEdgeIndex {
         );
 
         self.writer
+            .lock()
+            .unwrap()
             .add_document(doc)
             .map_err(|e| CodeConnectError::Index(format!("写入调用边文档失败: {}", e)))?;
 
@@ -726,8 +733,10 @@ impl CallEdgeIndex {
     }
 
     /// 提交所有待写入的调用边
-    pub fn commit(&mut self) -> Result<u64, CodeConnectError> {
+    pub fn commit(&self) -> Result<u64, CodeConnectError> {
         self.writer
+            .lock()
+            .unwrap()
             .commit()
             .map_err(|e| CodeConnectError::Index(format!("调用边提交失败: {}", e)))
     }

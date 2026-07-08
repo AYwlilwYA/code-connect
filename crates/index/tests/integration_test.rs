@@ -45,15 +45,15 @@ fn test_full_index_and_search_rust_sample() {
     let mut registry = ParserRegistry::new();
     registry.register(Arc::new(RustParser::new()));
 
-    let tantivy = TantivyIndex::open_or_create(&tantivy_dir)
-        .expect("创建 tantivy 索引失败");
-    let call_edge_index = CallEdgeIndex::open_or_create(&tantivy_edges_dir)
-        .expect("创建调用边索引失败");
-    let sled = SledStore::open(&sled_dir)
-        .expect("打开 sled 存储失败");
+    let tantivy = Arc::new(TantivyIndex::open_or_create(&tantivy_dir)
+        .expect("创建 tantivy 索引失败"));
+    let call_edge_index = Arc::new(CallEdgeIndex::open_or_create(&tantivy_edges_dir)
+        .expect("创建调用边索引失败"));
+    let sled = Arc::new(SledStore::open(&sled_dir)
+        .expect("打开 sled 存储失败"));
 
     let project_root = fixtures_dir();
-    let mut indexer = FullIndexer::new(
+    let indexer = FullIndexer::new(
         &project_root,
         tantivy,
         call_edge_index,
@@ -159,14 +159,14 @@ fn test_index_stats_has_all_fields() {
     let mut registry = ParserRegistry::new();
     registry.register(Arc::new(RustParser::new()));
 
-    let tantivy = TantivyIndex::open_or_create(&tmp_dir.path().join("tantivy"))
-        .expect("创建 tantivy 索引失败");
-    let call_edge_index = CallEdgeIndex::open_or_create(&tmp_dir.path().join("tantivy_edges"))
-        .expect("创建调用边索引失败");
-    let sled = SledStore::open(&tmp_dir.path().join("sled"))
-        .expect("打开 sled 存储失败");
+    let tantivy = Arc::new(TantivyIndex::open_or_create(&tmp_dir.path().join("tantivy"))
+        .expect("创建 tantivy 索引失败"));
+    let call_edge_index = Arc::new(CallEdgeIndex::open_or_create(&tmp_dir.path().join("tantivy_edges"))
+        .expect("创建调用边索引失败"));
+    let sled = Arc::new(SledStore::open(&tmp_dir.path().join("sled"))
+        .expect("打开 sled 存储失败"));
 
-    let mut indexer = FullIndexer::new(
+    let indexer = FullIndexer::new(
         &project_root,
         tantivy,
         call_edge_index,
@@ -210,15 +210,15 @@ fn test_full_index_and_search_typescript_sample() {
     let mut registry = ParserRegistry::new();
     registry.register(Arc::new(TypeScriptParser::new()));
 
-    let tantivy = TantivyIndex::open_or_create(&tantivy_dir)
-        .expect("创建 tantivy 索引失败");
-    let call_edge_index = CallEdgeIndex::open_or_create(&tantivy_edges_dir)
-        .expect("创建调用边索引失败");
-    let sled = SledStore::open(&sled_dir)
-        .expect("打开 sled 存储失败");
+    let tantivy = Arc::new(TantivyIndex::open_or_create(&tantivy_dir)
+        .expect("创建 tantivy 索引失败"));
+    let call_edge_index = Arc::new(CallEdgeIndex::open_or_create(&tantivy_edges_dir)
+        .expect("创建调用边索引失败"));
+    let sled = Arc::new(SledStore::open(&sled_dir)
+        .expect("打开 sled 存储失败"));
 
     let project_root = ts_fixtures_dir();
-    let mut indexer = FullIndexer::new(
+    let indexer = FullIndexer::new(
         &project_root,
         tantivy,
         call_edge_index,
@@ -285,14 +285,14 @@ fn test_typescript_finds_class_and_interface() {
     let mut registry = ParserRegistry::new();
     registry.register(Arc::new(TypeScriptParser::new()));
 
-    let tantivy = TantivyIndex::open_or_create(&tmp_dir.path().join("tantivy_ts2"))
-        .expect("创建索引失败");
-    let call_edge_index = CallEdgeIndex::open_or_create(&tmp_dir.path().join("tantivy_edges_ts2"))
-        .expect("创建调用边索引失败");
-    let sled = SledStore::open(&tmp_dir.path().join("sled_ts2"))
-        .expect("打开存储失败");
+    let tantivy = Arc::new(TantivyIndex::open_or_create(&tmp_dir.path().join("tantivy_ts2"))
+        .expect("创建索引失败"));
+    let call_edge_index = Arc::new(CallEdgeIndex::open_or_create(&tmp_dir.path().join("tantivy_edges_ts2"))
+        .expect("创建调用边索引失败"));
+    let sled = Arc::new(SledStore::open(&tmp_dir.path().join("sled_ts2"))
+        .expect("打开存储失败"));
 
-    let mut indexer = FullIndexer::new(
+    let indexer = FullIndexer::new(
         &ts_fixtures_dir(),
         tantivy,
         call_edge_index,
@@ -347,15 +347,15 @@ fn test_full_index_and_search_java_sample() {
     let mut registry = ParserRegistry::new();
     registry.register(Arc::new(JavaParser::new()));
 
-    let tantivy = TantivyIndex::open_or_create(&tantivy_dir)
-        .expect("创建 tantivy 索引失败");
-    let call_edge_index = CallEdgeIndex::open_or_create(&tantivy_edges_dir)
-        .expect("创建调用边索引失败");
-    let sled = SledStore::open(&sled_dir)
-        .expect("打开 sled 存储失败");
+    let tantivy = Arc::new(TantivyIndex::open_or_create(&tantivy_dir)
+        .expect("创建 tantivy 索引失败"));
+    let call_edge_index = Arc::new(CallEdgeIndex::open_or_create(&tantivy_edges_dir)
+        .expect("创建调用边索引失败"));
+    let sled = Arc::new(SledStore::open(&sled_dir)
+        .expect("打开 sled 存储失败"));
 
     let project_root = java_fixtures_dir();
-    let mut indexer = FullIndexer::new(
+    let indexer = FullIndexer::new(
         &project_root,
         tantivy,
         call_edge_index,
@@ -422,14 +422,14 @@ fn test_java_finds_class_and_interface() {
     let mut registry = ParserRegistry::new();
     registry.register(Arc::new(JavaParser::new()));
 
-    let tantivy = TantivyIndex::open_or_create(&tmp_dir.path().join("tantivy_java2"))
-        .expect("创建索引失败");
-    let call_edge_index = CallEdgeIndex::open_or_create(&tmp_dir.path().join("tantivy_edges_java2"))
-        .expect("创建调用边索引失败");
-    let sled = SledStore::open(&tmp_dir.path().join("sled_java2"))
-        .expect("打开存储失败");
+    let tantivy = Arc::new(TantivyIndex::open_or_create(&tmp_dir.path().join("tantivy_java2"))
+        .expect("创建索引失败"));
+    let call_edge_index = Arc::new(CallEdgeIndex::open_or_create(&tmp_dir.path().join("tantivy_edges_java2"))
+        .expect("创建调用边索引失败"));
+    let sled = Arc::new(SledStore::open(&tmp_dir.path().join("sled_java2"))
+        .expect("打开存储失败"));
 
-    let mut indexer = FullIndexer::new(
+    let indexer = FullIndexer::new(
         &java_fixtures_dir(),
         tantivy,
         call_edge_index,

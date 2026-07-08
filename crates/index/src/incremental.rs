@@ -19,7 +19,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use codeconnect_core::error::CodeConnectError;
 use codeconnect_core::types::{FileMeta, SymbolKind};
@@ -43,8 +43,8 @@ pub struct IncrementalIndexer {
     /// tantivy 全文搜索索引
     tantivy: Arc<TantivyIndex>,
     /// tantivy 调用边索引（替代 sled edges 命名空间）
-    /// 使用 Mutex 包装以支持内部可变性（commit 需要 &mut self）
-    call_edge_index: Mutex<CallEdgeIndex>,
+    /// 内部 Mutex 保护 IndexWriter，线程安全
+    call_edge_index: Arc<CallEdgeIndex>,
     /// 解析器注册表
     parser_registry: Arc<ParserRegistry>,
 }
@@ -63,14 +63,14 @@ impl IncrementalIndexer {
         project_root: &Path,
         sled: Arc<SledStore>,
         tantivy: Arc<TantivyIndex>,
-        call_edge_index: CallEdgeIndex,
+        call_edge_index: Arc<CallEdgeIndex>,
         parser_registry: Arc<ParserRegistry>,
     ) -> Self {
         Self {
             project_root: project_root.to_path_buf(),
             sled,
             tantivy,
-            call_edge_index: Mutex::new(call_edge_index),
+            call_edge_index,
             parser_registry,
         }
     }
@@ -218,12 +218,8 @@ impl IncrementalIndexer {
         }
 
         // 提交 tantivy 调用边索引
-        // 注意：由于我们持有 Arc<TantivyIndex> 而非 &mut，符号索引的 commit 有受限。
-        // 符号索引的提交在 run() 中通过外部调用者负责。
-        if let Ok(mut edge_index) = self.call_edge_index.lock() {
-            if let Err(e) = edge_index.commit() {
-                tracing::error!("提交调用边索引失败: {}", e);
-            }
+        if let Err(e) = self.call_edge_index.commit() {
+            tracing::error!("提交调用边索引失败: {}", e);
         }
 
         tracing::info!(
@@ -316,7 +312,7 @@ impl IncrementalIndexer {
                 };
                 let edge_json = serde_json::to_string(&edge)
                     .map_err(|e| CodeConnectError::Index(format!("序列化调用边失败: {}", e)))?;
-                self.call_edge_index.lock().unwrap().add_call_edge(
+                self.call_edge_index.add_call_edge(
                     &call.caller_id,
                     &call.callee_name,
                     &callee_id,
@@ -349,7 +345,7 @@ impl IncrementalIndexer {
                         };
                         let edge_json = serde_json::to_string(&edge)
                             .map_err(|e| CodeConnectError::Index(format!("序列化调用边失败: {}", e)))?;
-                        self.call_edge_index.lock().unwrap().add_call_edge(
+                        self.call_edge_index.add_call_edge(
                             &symbol.id,
                             &call.callee_name,
                             &callee_id,
@@ -440,9 +436,9 @@ mod tests {
             TantivyIndex::open_or_create(&tmp.path().join("tantivy"))
                 .expect("创建 tantivy 失败"),
         );
-        let call_edge_index = CallEdgeIndex::open_or_create(
+        let call_edge_index = Arc::new(CallEdgeIndex::open_or_create(
             &tmp.path().join("tantivy_edges"),
-        ).expect("创建调用边索引失败");
+        ).expect("创建调用边索引失败"));
         let parser_registry = Arc::new(ParserRegistry::new());
 
         let indexer = IncrementalIndexer::new(
@@ -466,9 +462,9 @@ mod tests {
             TantivyIndex::open_or_create(&tmp.path().join("tantivy"))
                 .expect("创建 tantivy 失败"),
         );
-        let call_edge_index = CallEdgeIndex::open_or_create(
+        let call_edge_index = Arc::new(CallEdgeIndex::open_or_create(
             &tmp.path().join("tantivy_edges"),
-        ).expect("创建调用边索引失败");
+        ).expect("创建调用边索引失败"));
         let parser_registry = Arc::new(ParserRegistry::new());
 
         let indexer = IncrementalIndexer::new(&tmp.path(), sled, tantivy, call_edge_index, parser_registry);
