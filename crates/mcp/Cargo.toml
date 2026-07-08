@@ -9,6 +9,7 @@ description = "MCP 服务器：rmcp 集成、工具注册、JSON Schema"
 codeconnect-core = { path = "../core" }
 codeconnect-services = { path = "../services" }
 codeconnect-index = { path = "../index" }
+codeconnect-parser = { path = "../parser" }
 codeconnect-graph = { path = "../graph" }
 
 rmcp.workspace = true

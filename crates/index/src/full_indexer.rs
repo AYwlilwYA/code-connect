@@ -120,9 +120,9 @@ struct ParseFailure {
 /// ```ignore
 /// let mut registry = Arc::new(ParserRegistry::new());
 /// // ... 注册解析器 ...
-/// let tantivy = TantivyIndex::open_or_create(index_dir)?;
-/// let call_edge_index = CallEdgeIndex::open_or_create(edges_dir)?;
-/// let sled = SledStore::open(sled_dir)?;
+/// let tantivy = Arc::new(TantivyIndex::open_or_create(index_dir)?);
+/// let call_edge_index = Arc::new(CallEdgeIndex::open_or_create(edges_dir)?);
+/// let sled = Arc::new(SledStore::open(sled_dir)?);
 /// let indexer = FullIndexer::new(project_root, tantivy, call_edge_index, sled, registry);
 /// let stats = indexer.run()?;
 /// println!("索引完成: {:?}", stats);
@@ -130,12 +130,12 @@ struct ParseFailure {
 pub struct FullIndexer {
     /// 项目根目录
     pub project_root: PathBuf,
-    /// tantivy 全文搜索索引
-    pub tantivy: TantivyIndex,
+    /// tantivy 全文搜索索引（共享引用，支持同时读写）
+    pub tantivy: Arc<TantivyIndex>,
     /// tantivy 调用边索引（替代 sled edges 命名空间，避免 sled 磁盘膨胀）
-    pub call_edge_index: CallEdgeIndex,
+    pub call_edge_index: Arc<CallEdgeIndex>,
     /// sled 键值存储（只存 meta + fingerprint + neighbors）
-    sled: SledStore,
+    sled: Arc<SledStore>,
     /// 解析器注册表
     parser_registry: Arc<ParserRegistry>,
 }
@@ -145,15 +145,15 @@ impl FullIndexer {
     ///
     /// # 参数
     /// - `project_root` — 项目根目录路径
-    /// - `tantivy` — 已初始化的 tantivy 索引实例
-    /// - `call_edge_index` — 已初始化的调用边 tantivy 索引实例
-    /// - `sled` — 已打开的 sled 存储实例
-    /// - `parser_registry` — 已注册所有语言解析器的注册表
+    /// - `tantivy` — 已初始化的 tantivy 索引实例（共享引用）
+    /// - `call_edge_index` — 已初始化的调用边 tantivy 索引实例（共享引用）
+    /// - `sled` — 已打开的 sled 存储实例（共享引用）
+    /// - `parser_registry` — 已注册所有语言解析器的注册表（共享引用）
     pub fn new(
         project_root: &Path,
-        tantivy: TantivyIndex,
-        call_edge_index: CallEdgeIndex,
-        sled: SledStore,
+        tantivy: Arc<TantivyIndex>,
+        call_edge_index: Arc<CallEdgeIndex>,
+        sled: Arc<SledStore>,
         parser_registry: Arc<ParserRegistry>,
     ) -> Self {
         Self {
@@ -172,7 +172,7 @@ impl FullIndexer {
     ///
     /// # 返回
     /// 返回 [`IndexStats`] 包含详细的统计信息。
-    pub fn run(&mut self) -> Result<IndexStats, CodeConnectError> {
+    pub fn run(&self) -> Result<IndexStats, CodeConnectError> {
         // ====================================================================
         // 第一步：收集需要解析的文件列表
         // ====================================================================

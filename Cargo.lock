@@ -409,6 +409,7 @@ dependencies = [
  "codeconnect-core",
  "codeconnect-graph",
  "codeconnect-index",
+ "codeconnect-parser",
  "codeconnect-services",
  "rmcp",
  "schemars",
