@@ -59,3 +59,22 @@
     name: (type_identifier) @symbol.name
   )
 ) @symbol.exported
+
+;; export default function（React 组件最常见的声明方式）
+;; 注：export default 在 tree-sitter-typescript 中 function_declaration 仍位于 declaration 字段下，
+;; 已有的 export_statement + declaration 模式已经覆盖。这里添加带完整参数签名的版本，
+;; 确保 export default function 的 symbol 能正确标记为 exported 并携带完整参数信息。
+(export_statement
+  declaration: (function_declaration
+    name: (identifier) @symbol.name
+    parameters: (formal_parameters) @symbol.parameters
+    return_type: (type_annotation)? @symbol.return_type
+  )
+) @symbol.exported
+
+;; export default class（同样 declaration 字段覆盖）
+(export_statement
+  declaration: (class_declaration
+    name: (type_identifier) @symbol.name
+  )
+) @symbol.exported
