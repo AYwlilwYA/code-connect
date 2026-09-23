@@ -222,6 +222,17 @@ impl IncrementalIndexer {
             tracing::error!("提交调用边索引失败: {}", e);
         }
 
+        // 记录索引更新时间，供 MCP 侧计算陈旧度（增量更新同样使索引变新）
+        if reindexed_count > 0 {
+            let built_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if let Err(e) = self.sled.put_index_built_at(built_at) {
+                tracing::warn!("写入索引更新时间失败: {}", e);
+            }
+        }
+
         tracing::info!(
             "增量索引完成: {} 重索引 / {} 跳过",
             reindexed_count,

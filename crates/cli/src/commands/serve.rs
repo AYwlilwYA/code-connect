@@ -57,6 +57,18 @@ pub async fn run(
         tracing::warn!("索引为空！请先运行 `codeconnect index` 构建索引。");
     }
 
+    // 读取索引最后构建时间，随每次工具响应回传给 AI，避免其采信过期结果
+    let index_built_at = sled
+        .as_ref()
+        .and_then(|s| s.get_index_built_at().ok())
+        .flatten();
+    match index_built_at {
+        Some(ts) => tracing::info!("索引最后更新于 unix {}", ts),
+        None => tracing::warn!(
+            "索引未记录构建时间（旧版本索引），工具响应将如实提示「时间未知」，运行一次 index 即可消除"
+        ),
+    }
+
     // 构建解析器注册表（根据 config 中的语言开关注册解析器）
     let mut registry = ParserRegistry::new();
 
@@ -108,7 +120,8 @@ pub async fn run(
         .with_project_root(project_root.to_path_buf())
         .with_data_dir(data_dir.to_path_buf())
         .with_config(config.clone())
-        .with_parser_registry(Arc::clone(&parser_registry));
+        .with_parser_registry(Arc::clone(&parser_registry))
+        .with_index_built_at(index_built_at);
 
     // 启动文件监控 — 在后台监控源文件变更，触发增量索引
     // 仅在索引已加载且数据具备时才启动监控

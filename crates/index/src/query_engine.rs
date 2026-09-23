@@ -52,22 +52,37 @@ impl QueryEngine {
 
     /// 按符号名搜索（全文 + 精确匹配）
     ///
-    /// 当前通过 tantivy 的 `name` 字段进行全文搜索。
-    /// 后续可扩展为组合 `language` 和 `kind` 过滤的分面查询。
+    /// 通过 tantivy 的 `name` 字段进行全文搜索，语言与符号种类过滤
+    /// 下推到检索阶段完成（而非取回后再筛，避免结果被 limit 提前截断）。
     ///
     /// # 参数
     /// - `name` — 符号名（支持部分匹配和 fts 语法）
-    /// - `_language` — 可选的编程语言过滤（暂未实现）
-    /// - `_kind` — 可选的符号种类过滤（暂未实现）
+    /// - `language` — 可选的编程语言过滤（大小写不敏感）
+    /// - `kind` — 可选的符号种类过滤（大小写不敏感）
     /// - `limit` — 最大返回结果数
     pub fn search_by_name(
         &self,
         name: &str,
-        _language: Option<&str>,
-        _kind: Option<&str>,
+        language: Option<&str>,
+        kind: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SymbolSearchResult>, CodeConnectError> {
-        self.tantivy.search_by_name(name, limit)
+        self.tantivy.search_by_name(name, language, kind, limit)
+    }
+
+    /// 查找与查询相近的符号名候选
+    ///
+    /// 供「搜索无结果」时使用，使调用方能区分「没匹配上」与「确实不存在」。
+    ///
+    /// # 参数
+    /// - `query` — 原始查询字符串
+    /// - `limit` — 最大候选数
+    pub fn suggest_similar_names(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SymbolSearchResult>, CodeConnectError> {
+        self.tantivy.suggest_similar_names(query, limit)
     }
 
     /// 按稳定 ID 获取符号的完整信息（从 tantivy STORED 字段反序列化）

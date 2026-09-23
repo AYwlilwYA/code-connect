@@ -284,6 +284,14 @@ impl FullIndexer {
         // 第五步：写入 Schema 版本并刷盘
         // ====================================================================
         self.sled.put_schema_version(CURRENT_SCHEMA_VERSION)?;
+
+        // 记录索引构建时间，供 MCP 侧计算陈旧度
+        let built_at = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.sled.put_index_built_at(built_at)?;
+
         self.sled.flush()?;
 
         tracing::info!(

@@ -29,10 +29,20 @@ pub struct SearchSymbolParams {
     /// 最大返回结果数，默认 20
     #[serde(default = "default_limit_20")]
     pub limit: usize,
+    /// 返回详细程度：`brief`（默认，只回定位必需字段）/ `full`（回完整符号信息含文档注释）
+    ///
+    /// 搜索用于定位，详情应由 get_symbol 按需获取，
+    /// 因此默认 brief 以避免单次调用吃掉大量上下文。
+    #[serde(default = "default_detail_brief")]
+    pub detail: String,
 }
 
 fn default_limit_20() -> usize {
     20
+}
+
+fn default_detail_brief() -> String {
+    "brief".to_string()
 }
 
 // ============================================================================
@@ -331,6 +341,7 @@ mod tests {
             kind: None,
             language: None,
             limit: default_limit_20(),
+            detail: "brief".to_string(),
         };
         assert_eq!(params.query, "main");
         assert_eq!(params.limit, 20);

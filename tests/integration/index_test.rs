@@ -94,13 +94,13 @@ mod tests {
         // 验证搜索能返回结果
         let results = indexer
             .tantivy
-            .search_by_name("User", 10)
+            .search_by_name("User", None, None, 10)
             .expect("搜索 User 失败");
         assert!(!results.is_empty(), "搜索 User 应返回结果");
 
         let results = indexer
             .tantivy
-            .search_by_name("authenticate", 10)
+            .search_by_name("authenticate", None, None, 10)
             .expect("搜索 authenticate 失败");
         assert!(!results.is_empty(), "搜索 authenticate 应返回结果");
     }
@@ -165,13 +165,13 @@ mod tests {
         // 验证搜索
         let results = indexer
             .tantivy
-            .search_by_name("User", 10)
+            .search_by_name("User", None, None, 10)
             .expect("搜索 User 失败");
         assert!(!results.is_empty(), "搜索 User 应返回结果");
 
         let results = indexer
             .tantivy
-            .search_by_name("authenticate", 10)
+            .search_by_name("authenticate", None, None, 10)
             .expect("搜索 authenticate 失败");
         assert!(!results.is_empty(), "搜索 authenticate 应返回结果");
     }
@@ -195,14 +195,14 @@ mod tests {
         // 搜索类
         let class_results = indexer
             .tantivy
-            .search_by_name("User", 10)
+            .search_by_name("User", None, None, 10)
             .expect("搜索 User 失败");
         assert!(!class_results.is_empty(), "应找到 User 类");
 
         // 搜索接口
         let iface_results = indexer
             .tantivy
-            .search_by_name("AuthService", 10)
+            .search_by_name("AuthService", None, None, 10)
             .expect("搜索 AuthService 失败");
         assert!(!iface_results.is_empty(), "应找到 AuthService 接口");
     }
@@ -244,13 +244,13 @@ mod tests {
         // 验证搜索
         let results = indexer
             .tantivy
-            .search_by_name("User", 10)
+            .search_by_name("User", None, None, 10)
             .expect("搜索 User 失败");
         assert!(!results.is_empty(), "搜索 User 应返回结果");
 
         let results = indexer
             .tantivy
-            .search_by_name("authenticate", 10)
+            .search_by_name("authenticate", None, None, 10)
             .expect("搜索 authenticate 失败");
         assert!(!results.is_empty(), "搜索 authenticate 应返回结果");
     }
@@ -274,14 +274,14 @@ mod tests {
         // 搜索类
         let class_results = indexer
             .tantivy
-            .search_by_name("User", 10)
+            .search_by_name("User", None, None, 10)
             .expect("搜索 User 失败");
         assert!(!class_results.is_empty(), "应找到 User 类");
 
         // 搜索接口
         let iface_results = indexer
             .tantivy
-            .search_by_name("AuthService", 10)
+            .search_by_name("AuthService", None, None, 10)
             .expect("搜索 AuthService 失败");
         assert!(!iface_results.is_empty(), "应找到 AuthService 接口");
     }

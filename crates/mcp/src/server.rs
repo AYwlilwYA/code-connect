@@ -91,6 +91,16 @@ impl CodeConnectServer {
         running.waiting().await?;
         Ok(())
     }
+
+    /// 所有工具的统一响应出口
+    ///
+    /// 在此处集中附加索引陈旧度信息，使 17 个工具无需各自处理。
+    fn respond<T: serde::Serialize>(
+        &self,
+        response: codeconnect_core::response::McpResponse<T>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        response_to_call_tool_result(attach_index_staleness(self.registry.as_ref(), response))
+    }
 }
 
 // ============================================================================
@@ -109,7 +119,7 @@ impl CodeConnectServer {
         Parameters(params): Parameters<SearchSymbolParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let response = tools::handle_search_symbol(&self.registry, params);
-        response_to_call_tool_result(response)
+        self.respond(response)
     }
 
     /// 获取符号详情 — 按符号 ID 获取完整信息
@@ -122,7 +132,7 @@ impl CodeConnectServer {
         Parameters(params): Parameters<GetSymbolParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let response = tools::handle_get_symbol(&self.registry, params);
-        response_to_call_tool_result(response)
+        self.respond(response)
     }
 
     /// 追溯调用者 — 反向遍历调用链找出所有上游调用者
@@ -135,7 +145,7 @@ impl CodeConnectServer {
         Parameters(params): Parameters<TraceCallersParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let response = tools::handle_trace_callers(&self.registry, params);
-        response_to_call_tool_result(response)
+        self.respond(response)
     }
 
     /// 追溯被调用者 — 正向遍历调用链找出所有下游被调用者
@@ -146,7 +156,7 @@ impl CodeConnectServer {
         Parameters(params): Parameters<TraceCalleesParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let response = tools::handle_trace_callees(&self.registry, params);
-        response_to_call_tool_result(response)
+        self.respond(response)
     }
 
     /// 变更影响分析 — 基于调用图评估修改符号的影响范围
@@ -159,7 +169,7 @@ impl CodeConnectServer {
         Parameters(params): Parameters<AnalyzeImpactParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let response = tools::handle_analyze_impact(&self.registry, params);
-        response_to_call_tool_result(response)
+        self.respond(response)
     }
 
     /// 获取调用子图 — 获取指定符号周围的局部调用图
@@ -172,7 +182,7 @@ impl CodeConnectServer {
         Parameters(params): Parameters<GetCallGraphParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let response = tools::handle_get_call_graph(&self.registry, params);
-        response_to_call_tool_result(response)
+        self.respond(response)
     }
 
     /// 获取代码质量指标 — 圈复杂度、扇入扇出、继承深度
@@ -185,7 +195,7 @@ impl CodeConnectServer {
         Parameters(params): Parameters<GetMetricsParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let response = tools::handle_get_metrics(&self.registry, params);
-        response_to_call_tool_result(response)
+        self.respond(response)
     }
 
     /// 死代码检测 — 检测从入口点不可达的代码
@@ -198,7 +208,7 @@ impl CodeConnectServer {
         Parameters(params): Parameters<DetectDeadCodeParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let response = tools::handle_detect_dead_code(&self.registry, params);
-        response_to_call_tool_result(response)
+        self.respond(response)
     }
 
     /// 架构规则验证 — 验证自定义架构规则
@@ -214,7 +224,7 @@ impl CodeConnectServer {
         Parameters(params): Parameters<CheckArchRulesParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let response = tools::handle_check_arch_rules(&self.registry, params);
-        response_to_call_tool_result(response)
+        self.respond(response)
     }
 
     /// 语义搜索 — 基于自然语言描述搜索符号
@@ -230,7 +240,7 @@ impl CodeConnectServer {
         Parameters(params): Parameters<SemanticSearchParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let response = tools::handle_semantic_search(&self.registry, params);
-        response_to_call_tool_result(response)
+        self.respond(response)
     }
 
     /// 查找引用 — 找出所有引用指定符号的位置
@@ -243,7 +253,7 @@ impl CodeConnectServer {
         Parameters(params): Parameters<FindReferencesParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let response = tools::handle_find_references(&self.registry, params);
-        response_to_call_tool_result(response)
+        self.respond(response)
     }
 
     /// 重新索引 — 触发增量或全量索引重建
@@ -256,7 +266,7 @@ impl CodeConnectServer {
         Parameters(params): Parameters<ReindexParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let response = tools::handle_reindex(&self.registry, params).await;
-        response_to_call_tool_result(response)
+        self.respond(response)
     }
 
     /// 获取索引状态 — 查看索引的整体状态和统计信息
@@ -269,7 +279,7 @@ impl CodeConnectServer {
         Parameters(params): Parameters<GetIndexStatusParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let response = tools::handle_get_index_status(&self.registry, params);
-        response_to_call_tool_result(response)
+        self.respond(response)
     }
 
     /// 列出已索引文件 — 按语言过滤分页列出已索引的文件
@@ -282,7 +292,7 @@ impl CodeConnectServer {
         Parameters(params): Parameters<ListFilesParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let response = tools::handle_list_files(&self.registry, params);
-        response_to_call_tool_result(response)
+        self.respond(response)
     }
 
     /// 类型继承链 — 获取类型的祖先链和子类链
@@ -295,7 +305,7 @@ impl CodeConnectServer {
         Parameters(params): Parameters<GetTypeHierarchyParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let response = tools::handle_get_type_hierarchy(&self.registry, params);
-        response_to_call_tool_result(response)
+        self.respond(response)
     }
 
     /// 文件符号列表 — 获取指定文件中的所有符号
@@ -308,7 +318,7 @@ impl CodeConnectServer {
         Parameters(params): Parameters<GetFileSymbolsParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let response = tools::handle_get_file_symbols(&self.registry, params);
-        response_to_call_tool_result(response)
+        self.respond(response)
     }
 
     /// 获取依赖图 — 获取文件/模块/符号级别的依赖关系图
@@ -321,7 +331,7 @@ impl CodeConnectServer {
         Parameters(params): Parameters<GetDependencyGraphParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let response = tools::handle_get_dependency_graph(&self.registry, params);
-        response_to_call_tool_result(response)
+        self.respond(response)
     }
 }
 
@@ -345,13 +355,74 @@ impl ServerHandler for CodeConnectServer {
 ///
 /// 成功和部分成功的响应序列化为 JSON 文本内容，
 /// 错误响应序列化为错误信息文本。
+/// 索引陈旧度告警阈值（秒）
+///
+/// 超过该时长未更新索引时，在响应中追加显式警告，
+/// 提示 AI 先 reindex 再采信结果。
+const STALE_INDEX_WARN_SECS: i64 = 300;
+
+/// 当前 Unix 时间戳（秒）
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 将秒数转为人类可读的粗略时长
+fn humanize_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{} 秒", secs)
+    } else if secs < 3600 {
+        format!("{} 分钟", secs / 60)
+    } else if secs < 86400 {
+        format!("{} 小时", secs / 3600)
+    } else {
+        format!("{} 天", secs / 86400)
+    }
+}
+
+/// 为响应附加索引陈旧度信息
+///
+/// 索引时间未知时如实标记为未知，并提示可能的不一致 —— 不谎报「刚刚构建」。
+fn attach_index_staleness<T: serde::Serialize>(
+    registry: &ToolRegistry,
+    response: codeconnect_core::response::McpResponse<T>,
+) -> codeconnect_core::response::McpResponse<T> {
+    // 错误响应不得改写状态：with_warning 会把状态降级为 Partial，
+    // 而调用方正是靠 Error 状态区分失败与成功
+    if response.status == codeconnect_core::response::ResponseStatus::Error {
+        return response;
+    }
+
+    match registry.index_built_at_unix {
+        Some(built_at) => {
+            let age = now_unix_secs().saturating_sub(built_at).max(0) as u64;
+            let response = response.with_staleness(age * 1000);
+            if age as i64 >= STALE_INDEX_WARN_SECS {
+                response.with_warning(format!(
+                    "索引已 {} 未更新。若你刚修改过代码，请先调用 reindex，否则本次结果可能基于旧代码。",
+                    humanize_duration(age)
+                ))
+            } else {
+                response
+            }
+        }
+        None => response.with_warning(
+            "索引最后更新时间未知（索引由旧版本构建或未记录时间）。若结果与预期不符，请调用 reindex。"
+                .into(),
+        ),
+    }
+}
+
 fn response_to_call_tool_result<T: serde::Serialize>(
     response: codeconnect_core::response::McpResponse<T>,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     match response.status {
         codeconnect_core::response::ResponseStatus::Success
         | codeconnect_core::response::ResponseStatus::Partial => {
-            let json_text = serde_json::to_string_pretty(&response)
+            // 紧凑 JSON：MCP 的消费方是 AI，多行缩进会显著放大 token 开销
+            let json_text = serde_json::to_string(&response)
                 .map_err(|e| rmcp::ErrorData::internal_error(format!("序列化响应失败: {}", e), None))?;
 
             let content = RawContent::Text(RawTextContent {

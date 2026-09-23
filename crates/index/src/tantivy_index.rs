@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, Query, QueryParser, TermQuery};
 use tantivy::schema::*;
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
 use codeconnect_core::error::CodeConnectError;
@@ -273,13 +273,19 @@ impl TantivyIndex {
     /// 按名称搜索符号
     ///
     /// 对 `name` 字段进行全文搜索，返回按相关度排序的结果。
+    /// 语言与符号类型过滤**下推到查询**，而非取回结果后再筛 ——
+    /// 否则会先被 limit 截断再过滤，导致「明明有却搜不全」。
     ///
     /// # 参数
     /// - `query_str` — 搜索查询字符串（支持 fts 语法）
+    /// - `language` — 可选语言过滤（如 `rust`），大小写不敏感
+    /// - `kind` — 可选符号类型过滤（如 `function`），大小写不敏感
     /// - `limit` — 最多返回的结果数
     pub fn search_by_name(
         &self,
         query_str: &str,
+        language: Option<&str>,
+        kind: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SymbolSearchResult>, CodeConnectError> {
         self.reader
@@ -288,68 +294,141 @@ impl TantivyIndex {
 
         let searcher = self.reader.searcher();
         let query_parser = QueryParser::for_index(&self.index, vec![self.schema.name]);
-        let query = query_parser
+        let text_query = query_parser
             .parse_query(query_str)
             .map_err(|e| CodeConnectError::Query(format!("查询解析失败: {}", e)))?;
+
+        let query = build_filtered_query(
+            Box::new(text_query),
+            &[(self.schema.language, language), (self.schema.kind, kind)],
+        );
 
         let top_docs = searcher
             .search(&query, &TopDocs::with_limit(limit))
             .map_err(|e| CodeConnectError::Query(format!("搜索失败: {}", e)))?;
 
-        let results: Vec<SymbolSearchResult> = top_docs
+        Ok(top_docs
             .iter()
-            .filter_map(|(score, doc_addr)| {
-                // searcher.doc 返回 Result，跳过获取失败的文档
-                let doc: TantivyDocument = match searcher.doc(*doc_addr) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        tracing::warn!("读取文档失败 (search_by_name): {}", e);
-                        return None;
-                    }
-                };
-                // 辅助函数：从文档中提取 STORED 文本字段，缺失时返回空字符串
-                let get_text = |field: Field| -> String {
-                    doc.get_first(field)
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string()
-                };
-                // 辅助函数：从文档中提取 u64 字段
-                let get_u64 = |field: Field| -> u64 {
-                    doc.get_first(field)
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0)
-                };
-                // 辅助函数：从文档中提取 bool 字段
-                let get_bool = |field: Field| -> bool {
-                    doc.get_first(field)
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-                };
+            .filter_map(|(score, addr)| self.doc_to_result(&searcher, *addr, *score))
+            .collect())
+    }
 
-                Some(SymbolSearchResult {
-                    stable_id: get_text(self.schema.stable_id),
-                    name: get_text(self.schema.name),
-                    kind: get_text(self.schema.kind),
-                    language: get_text(self.schema.language),
-                    file_path: get_text(self.schema.file_path),
-                    signature: get_text(self.schema.signature),
-                    doc_comment: get_text(self.schema.doc_comment),
-                    parent_type: get_text(self.schema.parent_type),
-                    modifiers: get_text(self.schema.modifiers),
-                    complexity: get_u64(self.schema.complexity),
-                    ast_hash: get_text(self.schema.ast_hash),
-                    is_exported: get_bool(self.schema.is_exported),
-                    line: get_u64(self.schema.line),
-                    column: get_u64(self.schema.column),
-                    end_line: get_u64(self.schema.end_line),
-                    end_column: get_u64(self.schema.end_column),
-                    score: *score,
-                })
+    /// 查找与查询相近的符号名候选
+    ///
+    /// 用于「搜索无结果」时给出近似建议 —— 让调用方能把「没匹配上」
+    /// 与「确实不存在」区分开，而不是把空结果直接当成「没有这个符号」。
+    ///
+    /// 实现：用与 `name` 字段相同的分词器切分查询，再对每个词元做
+    /// 编辑距离 ≤2 的模糊匹配（转置记 1 次编辑，容忍 `serach` 这类拼写错误）。
+    ///
+    /// # 参数
+    /// - `query_str` — 原始查询字符串
+    /// - `limit` — 最多返回的候选数
+    pub fn suggest_similar_names(
+        &self,
+        query_str: &str,
+        limit: usize,
+    ) -> Result<Vec<SymbolSearchResult>, CodeConnectError> {
+        let query_str = query_str.trim();
+        if query_str.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        self.reader
+            .reload()
+            .map_err(|e| CodeConnectError::Index(format!("重新加载失败: {}", e)))?;
+
+        let searcher = self.reader.searcher();
+
+        // 用与索引 name 字段一致的分词器切词，保证模糊项能对上索引里的词元
+        let mut analyzer = self
+            .index
+            .tokenizer_for_field(self.schema.name)
+            .map_err(|e| CodeConnectError::Index(format!("获取分词器失败: {}", e)))?;
+        let mut tokens: Vec<String> = Vec::new();
+        {
+            let mut stream = analyzer.token_stream(query_str);
+            while let Some(token) = stream.next() {
+                tokens.push(token.text.clone());
+            }
+        }
+        if tokens.is_empty() {
+            tokens.push(query_str.to_lowercase());
+        }
+        tokens.truncate(8);
+
+        let clauses: Vec<(Occur, Box<dyn Query>)> = tokens
+            .iter()
+            .map(|token| {
+                let term = Term::from_field_text(self.schema.name, token);
+                let query: Box<dyn Query> = Box::new(FuzzyTermQuery::new(term, 2, true));
+                (Occur::Should, query)
             })
             .collect();
 
-        Ok(results)
+        let top_docs = searcher
+            .search(&BooleanQuery::new(clauses), &TopDocs::with_limit(limit))
+            .map_err(|e| CodeConnectError::Query(format!("候选查询失败: {}", e)))?;
+
+        Ok(top_docs
+            .iter()
+            .filter_map(|(score, addr)| self.doc_to_result(&searcher, *addr, *score))
+            .collect())
+    }
+
+    /// 将 tantivy 文档转换为搜索结果
+    ///
+    /// 读取失败时返回 `None` 并记录警告，不中断整批查询。
+    fn doc_to_result(
+        &self,
+        searcher: &tantivy::Searcher,
+        doc_addr: tantivy::DocAddress,
+        score: f32,
+    ) -> Option<SymbolSearchResult> {
+        let doc: TantivyDocument = match searcher.doc(doc_addr) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("读取文档失败: {}", e);
+                return None;
+            }
+        };
+        // 辅助函数：从文档中提取 STORED 文本字段，缺失时返回空字符串
+        let get_text = |field: Field| -> String {
+            doc.get_first(field)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        // 辅助函数：从文档中提取 u64 字段
+        let get_u64 = |field: Field| -> u64 {
+            doc.get_first(field).and_then(|v| v.as_u64()).unwrap_or(0)
+        };
+        // 辅助函数：从文档中提取 bool 字段
+        let get_bool = |field: Field| -> bool {
+            doc.get_first(field)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        };
+
+        Some(SymbolSearchResult {
+            stable_id: get_text(self.schema.stable_id),
+            name: get_text(self.schema.name),
+            kind: get_text(self.schema.kind),
+            language: get_text(self.schema.language),
+            file_path: get_text(self.schema.file_path),
+            signature: get_text(self.schema.signature),
+            doc_comment: get_text(self.schema.doc_comment),
+            parent_type: get_text(self.schema.parent_type),
+            modifiers: get_text(self.schema.modifiers),
+            complexity: get_u64(self.schema.complexity),
+            ast_hash: get_text(self.schema.ast_hash),
+            is_exported: get_bool(self.schema.is_exported),
+            line: get_u64(self.schema.line),
+            column: get_u64(self.schema.column),
+            end_line: get_u64(self.schema.end_line),
+            end_column: get_u64(self.schema.end_column),
+            score,
+        })
     }
 
     /// 按稳定 ID 精确搜索符号
@@ -821,6 +900,46 @@ impl CallEdgeIndex {
         let searcher = self.reader.searcher();
         Ok(searcher.num_docs())
     }
+}
+
+/// 组合全文查询与等值过滤条件
+///
+/// `filters` 中每个 `Some(value)` 生成一个 MUST 子句，使过滤在**检索阶段**生效，
+/// 而不是取回结果后再筛掉 —— 后者会先被 limit 截断，导致结果数不足。
+/// 过滤值同时尝试原样与小写两种形式，避免调用方传入 `Rust` 而索引里是 `rust` 时静默失配。
+fn build_filtered_query(
+    text_query: Box<dyn tantivy::query::Query>,
+    filters: &[(Field, Option<&str>)],
+) -> Box<dyn tantivy::query::Query> {
+    let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![(Occur::Must, text_query)];
+
+    for (field, value) in filters {
+        let Some(value) = value.filter(|v| !v.is_empty()) else {
+            continue;
+        };
+
+        let mut terms = vec![Term::from_field_text(*field, value)];
+        let lowered = value.to_lowercase();
+        if lowered != value {
+            terms.push(Term::from_field_text(*field, &lowered));
+        }
+
+        let alternatives: Vec<(Occur, Box<dyn tantivy::query::Query>)> = terms
+            .into_iter()
+            .map(|term| {
+                let query: Box<dyn tantivy::query::Query> =
+                    Box::new(TermQuery::new(term, IndexRecordOption::Basic));
+                (Occur::Should, query)
+            })
+            .collect();
+
+        clauses.push((Occur::Must, Box::new(BooleanQuery::new(alternatives))));
+    }
+
+    if clauses.len() == 1 {
+        return clauses.pop().expect("clauses 非空").1;
+    }
+    Box::new(BooleanQuery::new(clauses))
 }
 
 /// 搜索结果

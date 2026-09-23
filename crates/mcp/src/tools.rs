@@ -65,6 +65,11 @@ pub struct ToolRegistry {
     pub config: Option<CodeConnectConfig>,
     /// 解析器注册表（用于 reindex 时进程内构建索引）
     pub parser_registry: Option<Arc<ParserRegistry>>,
+    /// 索引最后构建时间（Unix 秒）
+    ///
+    /// `None` 表示索引由旧版本构建、未记录时间 —— 此时不得谎报「刚刚构建」，
+    /// 响应中会提示索引时间未知。
+    pub index_built_at_unix: Option<i64>,
 }
 
 impl ToolRegistry {
@@ -79,7 +84,14 @@ impl ToolRegistry {
             data_dir: None,
             config: None,
             parser_registry: None,
+            index_built_at_unix: None,
         }
+    }
+
+    /// 设置索引最后构建时间（Unix 秒）
+    pub fn with_index_built_at(mut self, unix_secs: Option<i64>) -> Self {
+        self.index_built_at_unix = unix_secs;
+        self
     }
 
     /// 设置 sled 存储实例
@@ -180,7 +192,7 @@ impl Default for ToolRegistry {
 pub fn handle_search_symbol(
     registry: &ToolRegistry,
     params: SearchSymbolParams,
-) -> McpResponse<Vec<Symbol>> {
+) -> McpResponse<serde_json::Value> {
     let start = Instant::now();
 
     let query_engine = match &registry.query_engine {
@@ -188,40 +200,218 @@ pub fn handle_search_symbol(
         None => return McpResponse::error("查询引擎未初始化"),
     };
 
-    // 默认限制
     let limit = params.limit.min(100);
 
-    let results = match query_engine.search_by_name(&params.query, None, None, limit) {
+    // 语言/类型过滤下推到检索阶段 —— 此前是「先取 limit 条再在内存里过滤」，
+    // 会导致「库里有却只回几条」的假象
+    let results = match query_engine.search_by_name(
+        &params.query,
+        params.language.as_deref(),
+        params.kind.as_deref(),
+        limit,
+    ) {
         Ok(r) => r,
         Err(e) => return McpResponse::error(&format!("搜索失败: {}", e)),
     };
 
-    // 搜索结果已包含完整的符号信息（从 tantivy STORED 字段），直接转换即可
-    let mut symbols: Vec<Symbol> = Vec::new();
-    for result in &results {
-        // 过滤类型
-        if let Some(ref kind_filter) = params.kind {
-            if result.kind != *kind_filter {
-                continue;
-            }
-        }
-
-        // 语言过滤（从 stable_id 推断，格式: language::path::kind::name::fingerprint）
-        if let Some(ref lang_filter) = params.language {
-            let lang = result.stable_id.split("::").next().unwrap_or("");
-            if lang != lang_filter.as_str() {
-                continue;
-            }
-        }
-
-        let symbol = codeconnect_index::query_engine::symbol_search_result_to_symbol(result);
-        symbols.push(symbol);
+    if results.is_empty() {
+        return no_match_response(registry, &params, start);
     }
+
+    // 搜索结果已包含完整的符号信息（从 tantivy STORED 字段）
+    let symbols: Vec<serde_json::Value> = if params.detail == "full" {
+        results
+            .iter()
+            .map(|r| {
+                serde_json::to_value(codeconnect_index::query_engine::symbol_search_result_to_symbol(r))
+                    .unwrap_or(serde_json::Value::Null)
+            })
+            .collect()
+    } else {
+        results.iter().map(brief_symbol_json).collect()
+    };
 
     let total = symbols.len();
     let elapsed = start.elapsed().as_millis() as u64;
 
-    McpResponse::success(symbols, total, total, elapsed)
+    McpResponse::success(serde_json::Value::Array(symbols), total, total, elapsed)
+}
+
+/// brief 模式下签名保留的最大字符数
+const BRIEF_SIGNATURE_MAX_CHARS: usize = 150;
+
+/// 构造 brief 模式的符号投影
+///
+/// 只保留「定位并进一步调用」所必需的字段。搜索用于定位，
+/// 详情应由 get_symbol 按需获取，避免单次调用吃掉大量上下文。
+fn brief_symbol_json(r: &codeconnect_index::tantivy_index::SymbolSearchResult) -> serde_json::Value {
+    serde_json::json!({
+        "symbol_id": r.stable_id,
+        "name": r.name,
+        "kind": r.kind,
+        "language": r.language,
+        "file_path": r.file_path,
+        "line": r.line,
+        "signature": truncate_chars(&r.signature, BRIEF_SIGNATURE_MAX_CHARS),
+    })
+}
+
+/// 按字符数截断字符串（按字符而非字节，避免切断多字节字符）
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut truncated: String = s.chars().take(max).collect();
+    truncated.push('…');
+    truncated
+}
+
+/// 构造「无匹配」响应
+///
+/// 关键点：不返回看起来正常的空 Success —— 那会让调用方把「没匹配上」
+/// 误读为「该符号不存在」并转而重复实现。此处显式给出相近候选与排查方向。
+fn no_match_response(
+    registry: &ToolRegistry,
+    params: &SearchSymbolParams,
+    start: Instant,
+) -> McpResponse<serde_json::Value> {
+    let mut message = format!("未找到匹配 '{}' 的符号。", params.query);
+
+    if params.language.is_some() || params.kind.is_some() {
+        message.push_str(&format!(
+            "（当前已施加过滤：语言={} 类型={}，若不确定可去掉过滤重试）",
+            params.language.as_deref().unwrap_or("不限"),
+            params.kind.as_deref().unwrap_or("不限"),
+        ));
+    }
+
+    message.push_str(&describe_similar_symbols(registry, &params.query));
+
+    let elapsed = start.elapsed().as_millis() as u64;
+    McpResponse::success(serde_json::Value::Array(Vec::new()), 0, 0, elapsed)
+        .with_warning(message)
+}
+
+/// 描述与给定名称相近的符号候选
+///
+/// 无候选时返回排查建议，使调用方能把「拼写不对」「语言未启用」
+/// 「索引未建立」这几种情况区分开。
+fn describe_similar_symbols(registry: &ToolRegistry, query: &str) -> String {
+    let suggestions = registry
+        .query_engine
+        .as_ref()
+        .and_then(|q| q.suggest_similar_names(query, 8).ok())
+        .unwrap_or_default();
+
+    if suggestions.is_empty() {
+        return " 没有相近的符号名。请检查：① 符号名拼写；② 该语言是否在 .codeconnect.toml 的 [languages] 中启用；③ 是否已运行 codeconnect index 建立索引。".to_string();
+    }
+
+    let candidates: Vec<String> = suggestions
+        .iter()
+        .map(|s| format!("{} [{}] {}:{}", s.name, s.kind, s.file_path, s.line))
+        .collect();
+    format!(" 相近候选：{}", candidates.join(" | "))
+}
+
+// ============================================================================
+// 符号引用解析 — 允许用符号名代替 symbol_id
+// ============================================================================
+
+/// 符号引用解析结果
+enum SymbolRef {
+    /// 唯一确定
+    Resolved(Box<Symbol>),
+    /// 匹配到多个候选，需调用方抉择
+    Ambiguous(Vec<Symbol>),
+    /// 既不是有效 ID，也不匹配任何名称
+    NotFound,
+}
+
+/// 将「符号 ID 或符号名」解析为唯一符号
+///
+/// 工具入参历史上只接受精确 symbol_id，但调用方手里往往只有名字，
+/// 被迫先 search_symbol 拿 ID 再调目标工具，每次多一轮往返。
+/// 此处允许直接传名字：精确 ID 命中直接用；否则按名称检索，
+/// 唯一匹配则采用、多个匹配返回候选、无匹配给出相近建议。
+fn resolve_symbol_ref(registry: &ToolRegistry, input: &str) -> Result<SymbolRef, String> {
+    let query_engine = registry
+        .query_engine
+        .as_ref()
+        .ok_or_else(|| "查询引擎未初始化".to_string())?;
+
+    // 快路径：输入本身就是精确 symbol_id
+    if let Ok(Some(symbol)) = query_engine.get_symbol_by_id(input) {
+        return Ok(SymbolRef::Resolved(Box::new(symbol)));
+    }
+
+    // 慢路径：按名称检索
+    let matches = match query_engine.search_by_name(input, None, None, 20) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("按名称解析符号 '{}' 失败: {}", input, e);
+            return Ok(SymbolRef::NotFound);
+        }
+    };
+
+    // 名称完全一致的优先，避免被前缀命中淹没
+    let exact: Vec<Symbol> = matches
+        .iter()
+        .filter(|r| r.name == input)
+        .map(codeconnect_index::query_engine::symbol_search_result_to_symbol)
+        .collect();
+
+    let candidates: Vec<Symbol> = if exact.is_empty() {
+        matches
+            .iter()
+            .map(codeconnect_index::query_engine::symbol_search_result_to_symbol)
+            .collect()
+    } else {
+        exact
+    };
+
+    match candidates.len() {
+        0 => Ok(SymbolRef::NotFound),
+        1 => Ok(SymbolRef::Resolved(Box::new(
+            candidates.into_iter().next().expect("长度已确认为 1"),
+        ))),
+        _ => Ok(SymbolRef::Ambiguous(candidates)),
+    }
+}
+
+/// 解析符号引用，失败时直接返回构造好的响应
+///
+/// 泛型 `T` 使各 handler 无需转换返回类型即可直接 `return` 该响应。
+/// 失败一律显式报错并附候选 —— 不再像此前那样把查不到的输入当作名称继续空跑。
+fn resolve_or_respond<T: serde::Serialize>(
+    registry: &ToolRegistry,
+    input: &str,
+    tool: &str,
+) -> Result<Symbol, McpResponse<T>> {
+    match resolve_symbol_ref(registry, input) {
+        Ok(SymbolRef::Resolved(symbol)) => Ok(*symbol),
+        Ok(SymbolRef::Ambiguous(candidates)) => {
+            let listed: Vec<String> = candidates
+                .iter()
+                .take(10)
+                .map(|s| format!("{} ({}:{})", s.id, s.location.file_path, s.location.line))
+                .collect();
+            Err(McpResponse::error(&format!(
+                "{}: 符号引用 '{}' 不唯一，匹配到 {} 个符号，请改用其中一个完整 symbol_id：{}",
+                tool,
+                input,
+                candidates.len(),
+                listed.join(" | ")
+            )))
+        }
+        Ok(SymbolRef::NotFound) => Err(McpResponse::error(&format!(
+            "{}: 未找到符号 '{}' —— 它既不是有效的 symbol_id，也不匹配任何已索引的符号名。{}",
+            tool,
+            input,
+            describe_similar_symbols(registry, input)
+        ))),
+        Err(e) => Err(McpResponse::error(&format!("{}: {}", tool, e))),
+    }
 }
 
 /// 获取符号详情 handler
@@ -231,19 +421,14 @@ pub fn handle_get_symbol(
 ) -> McpResponse<Symbol> {
     let start = Instant::now();
 
-    let query_engine = match &registry.query_engine {
-        Some(q) => q,
-        None => return McpResponse::error("查询引擎未初始化"),
+    // 允许直接传符号名，内部解析为唯一符号
+    let symbol = match resolve_or_respond(registry, &params.symbol_id, "get_symbol") {
+        Ok(s) => s,
+        Err(resp) => return resp,
     };
 
-    match query_engine.get_symbol_by_id(&params.symbol_id) {
-        Ok(Some(symbol)) => {
-            let elapsed = start.elapsed().as_millis() as u64;
-            McpResponse::success(symbol, 1, 1, elapsed)
-        }
-        Ok(None) => McpResponse::error(&format!("未找到符号: {}", params.symbol_id)),
-        Err(e) => McpResponse::error(&format!("查询失败: {}", e)),
-    }
+    let elapsed = start.elapsed().as_millis() as u64;
+    McpResponse::success(symbol, 1, 1, elapsed)
 }
 
 /// 追溯调用者 handler
@@ -274,22 +459,19 @@ pub fn handle_trace_callers(
         Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
     };
 
-    // 从 tantivy 获取符号以获取符号名称
-    let symbol_name = match &registry.query_engine {
-        Some(q) => match q.get_symbol_by_id(&params.symbol_id) {
-            Ok(Some(sym)) => sym.name,
-            _ => params.symbol_id.clone(),
-        },
-        None => params.symbol_id.clone(),
+    // 支持直接传符号名 —— 解析为唯一符号后取其名称
+    let target = match resolve_or_respond(registry, &params.symbol_id, "trace_callers") {
+        Ok(s) => s,
+        Err(resp) => return resp,
     };
 
-    let callers = call_graph.trace_callers(&symbol_name, params.max_depth);
+    let callers = call_graph.trace_callers(&target.name, params.max_depth);
 
     // 构建 JSON 响应
     let result = serde_json::json!({
         "target": {
-            "symbol_id": params.symbol_id,
-            "name": symbol_name,
+            "symbol_id": target.id,
+            "name": target.name,
         },
         "callers": callers.iter().map(|n| {
             serde_json::json!({
@@ -334,20 +516,18 @@ pub fn handle_trace_callees(
         Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
     };
 
-    let symbol_name = match &registry.query_engine {
-        Some(q) => match q.get_symbol_by_id(&params.symbol_id) {
-            Ok(Some(sym)) => sym.name,
-            _ => params.symbol_id.clone(),
-        },
-        None => params.symbol_id.clone(),
+    // 支持直接传符号名 —— 解析为唯一符号后取其名称
+    let source = match resolve_or_respond(registry, &params.symbol_id, "trace_callees") {
+        Ok(s) => s,
+        Err(resp) => return resp,
     };
 
-    let callees = call_graph.trace_callees(&symbol_name, params.max_depth);
+    let callees = call_graph.trace_callees(&source.name, params.max_depth);
 
     let result = serde_json::json!({
         "source": {
-            "symbol_id": params.symbol_id,
-            "name": symbol_name,
+            "symbol_id": source.id,
+            "name": source.name,
         },
         "callees": callees.iter().map(|n| {
             serde_json::json!({
@@ -393,17 +573,14 @@ pub fn handle_analyze_impact(
         Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
     };
 
-    // 解析符号 ID → 名称（从 tantivy 获取）
+    // 解析每个符号引用（ID 或名称）为唯一符号
     let mut symbol_names: Vec<String> = Vec::new();
     for sid in &params.symbol_ids {
-        let name = match &registry.query_engine {
-            Some(q) => match q.get_symbol_by_id(sid) {
-                Ok(Some(sym)) => sym.name,
-                _ => sid.clone(),
-            },
-            None => sid.clone(),
+        let symbol = match resolve_or_respond(registry, sid, "analyze_impact") {
+            Ok(s) => s,
+            Err(resp) => return resp,
         };
-        symbol_names.push(name);
+        symbol_names.push(symbol.name);
     }
 
     let analyzer = codeconnect_services::impact_analyzer::ImpactAnalyzer::from_graph(call_graph, params.max_depth);
@@ -472,21 +649,19 @@ pub fn handle_get_call_graph(
         Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
     };
 
-    let symbol_name = match &registry.query_engine {
-        Some(q) => match q.get_symbol_by_id(&params.symbol_id) {
-            Ok(Some(sym)) => sym.name,
-            _ => params.symbol_id.clone(),
-        },
-        None => params.symbol_id.clone(),
+    // 支持直接传符号名
+    let center = match resolve_or_respond(registry, &params.symbol_id, "get_call_graph") {
+        Ok(s) => s,
+        Err(resp) => return resp,
     };
 
-    let callers = call_graph.trace_callers(&symbol_name, params.caller_depth);
-    let callees = call_graph.trace_callees(&symbol_name, params.callee_depth);
+    let callers = call_graph.trace_callers(&center.name, params.caller_depth);
+    let callees = call_graph.trace_callees(&center.name, params.callee_depth);
 
     let result = serde_json::json!({
         "center": {
-            "symbol_id": params.symbol_id,
-            "name": symbol_name,
+            "symbol_id": center.id,
+            "name": center.name,
         },
         "callers": callers.iter().map(|n| {
             serde_json::json!({
@@ -579,12 +754,11 @@ pub fn handle_get_metrics(
         return McpResponse::success(result, total, total, elapsed);
     }
 
-    // 如果指定了单个符号 ID
+    // 如果指定了单个符号（ID 或名称）
     if let Some(ref symbol_id) = params.symbol_id {
-        let symbol = match query_engine.get_symbol_by_id(symbol_id) {
-            Ok(Some(sym)) => sym,
-            Ok(None) => return McpResponse::error(&format!("未找到符号: {}", symbol_id)),
-            Err(e) => return McpResponse::error(&format!("查询失败: {}", e)),
+        let symbol = match resolve_or_respond(registry, symbol_id, "get_metrics") {
+            Ok(s) => s,
+            Err(resp) => return resp,
         };
 
         let type_hierarchy = codeconnect_graph::type_hierarchy::TypeHierarchy::new();
@@ -776,13 +950,10 @@ pub fn handle_find_references(
         None => return McpResponse::error("调用边索引未初始化"),
     };
 
-    // 获取符号名称（从 tantivy 获取）
-    let symbol_name = match &registry.query_engine {
-        Some(q) => match q.get_symbol_by_id(&params.symbol_id) {
-            Ok(Some(sym)) => sym.name,
-            _ => params.symbol_id.clone(),
-        },
-        None => params.symbol_id.clone(),
+    // 支持直接传符号名，解析为唯一符号
+    let target = match resolve_or_respond(registry, &params.symbol_id, "find_references") {
+        Ok(s) => s,
+        Err(resp) => return resp,
     };
 
     // 从调用图获取所有调用者（从 tantivy 构建）
@@ -798,7 +969,7 @@ pub fn handle_find_references(
         Err(e) => return McpResponse::error(&format!("构建调用图失败: {}", e)),
     };
 
-    let callers = call_graph.trace_callers(&symbol_name, 10);
+    let callers = call_graph.trace_callers(&target.name, 10);
 
     let references: Vec<serde_json::Value> = callers
         .iter()
@@ -815,8 +986,8 @@ pub fn handle_find_references(
 
     let result = serde_json::json!({
         "target": {
-            "symbol_id": params.symbol_id,
-            "name": symbol_name,
+            "symbol_id": target.id,
+            "name": target.name,
         },
         "references": references,
         "total_references": callers.len(),
@@ -848,18 +1019,29 @@ pub async fn handle_reindex(
         return McpResponse::error("数据目录未配置，无法执行重新索引");
     }
 
-    // 收集索引存储实例（必须是已打开的共享引用）
+    // 收集索引存储实例：优先用已加载的共享引用；未加载时从 data_dir 自举打开（open_or_create 会自动创建缺失目录）
+    let data_dir = registry.data_dir.as_ref().unwrap();
+
     let tantivy = match &registry.tantivy {
         Some(t) => Arc::clone(t),
-        None => return McpResponse::error("tantivy 索引未加载，请先启动 MCP 服务器并确保索引已就绪"),
+        None => match TantivyIndex::open_or_create(&data_dir.join("tantivy")) {
+            Ok(t) => Arc::new(t),
+            Err(e) => return McpResponse::error(&format!("tantivy 索引自举打开失败: {}", e)),
+        },
     };
     let sled = match &registry.sled {
         Some(s) => Arc::clone(s),
-        None => return McpResponse::error("sled 存储未加载，请先启动 MCP 服务器并确保索引已就绪"),
+        None => match SledStore::open(&data_dir.join("sled")) {
+            Ok(s) => Arc::new(s),
+            Err(e) => return McpResponse::error(&format!("sled 存储自举打开失败: {}", e)),
+        },
     };
     let call_edge_index = match &registry.call_edge_index {
         Some(c) => Arc::clone(c),
-        None => return McpResponse::error("调用边索引未加载，请先启动 MCP 服务器并确保索引已就绪"),
+        None => match CallEdgeIndex::open_or_create(&data_dir.join("tantivy_edges")) {
+            Ok(c) => Arc::new(c),
+            Err(e) => return McpResponse::error(&format!("调用边索引自举打开失败: {}", e)),
+        },
     };
     let parser_registry = match &registry.parser_registry {
         Some(r) => Arc::clone(r),
@@ -1041,11 +1223,12 @@ pub fn handle_get_type_hierarchy(
         Err(e) => return McpResponse::error(&format!("构建类型层次图失败: {}", e)),
     };
 
-    // 从 tantivy 获取符号名称（用于在层次图中查找）
-    let symbol_name = match query_engine.get_symbol_by_id(&params.symbol_id) {
-        Ok(Some(sym)) => sym.name,
-        _ => params.symbol_id.clone(),
+    // 支持直接传符号名（用于在层次图中查找）
+    let target = match resolve_or_respond(registry, &params.symbol_id, "get_type_hierarchy") {
+        Ok(s) => s,
+        Err(resp) => return resp,
     };
+    let symbol_name = target.name.clone();
 
     let mut ancestors = Vec::new();
     let mut descendants = Vec::new();
@@ -1080,7 +1263,7 @@ pub fn handle_get_type_hierarchy(
 
     let result = serde_json::json!({
         "target": {
-            "symbol_id": params.symbol_id,
+            "symbol_id": target.id,
             "name": symbol_name,
         },
         "ancestors": ancestors,
@@ -1230,6 +1413,7 @@ mod tests {
             kind: None,
             language: None,
             limit: 10,
+            detail: "brief".to_string(),
         };
         let response = handle_search_symbol(&registry, params);
         assert_eq!(response.status, codeconnect_core::response::ResponseStatus::Error);

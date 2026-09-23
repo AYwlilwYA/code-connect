@@ -419,6 +419,39 @@ impl SledStore {
             }))
     }
 
+    // ===== 索引构建时间 =====
+
+    /// 记录索引最后构建时间（Unix 秒）
+    ///
+    /// 每次全量索引或增量更新完成后调用。MCP 侧据此计算索引陈旧度，
+    /// 让 AI 判断返回结果是否可能已过期。
+    pub fn put_index_built_at(&self, unix_secs: i64) -> Result<(), CodeConnectError> {
+        let key = format!("{}built_at", PREFIX_INDEX_META);
+        let data = unix_secs.to_le_bytes();
+        self.db
+            .insert(key.as_bytes(), &data[..])
+            .map_err(|e| CodeConnectError::Index(format!("写入索引时间失败: {}", e)))?;
+        Ok(())
+    }
+
+    /// 读取索引最后构建时间（Unix 秒）
+    ///
+    /// 返回 `None` 表示该索引由旧版本构建、未记录时间。
+    /// 调用方**不得**将 `None` 当作「刚刚构建」处理。
+    pub fn get_index_built_at(&self) -> Result<Option<i64>, CodeConnectError> {
+        let key = format!("{}built_at", PREFIX_INDEX_META);
+        Ok(self
+            .db
+            .get(key.as_bytes())
+            .map_err(|e| CodeConnectError::Index(format!("读取索引时间失败: {}", e)))?
+            .map(|v| {
+                let mut arr = [0u8; 8];
+                let len = 8.min(v.len());
+                arr[..len].copy_from_slice(&v[..len]);
+                i64::from_le_bytes(arr)
+            }))
+    }
+
     // ===== 批量操作 =====
 
     /// 批处理：原子地执行多个键值对操作
