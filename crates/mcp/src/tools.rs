@@ -3,7 +3,9 @@
 //! 注册所有 CodeConnect MCP 工具及对应的 handler 函数。
 //! 所有工具均返回统一的 [`McpResponse`] 信封。
 //!
-//! ## 已注册工具列表（16 个）
+//! ## 已注册工具列表
+//!
+//! 数量以 `server.rs` 中实际的 `#[rmcp::tool]` 标注为准，此处不写死数字以免漂移。
 //!
 //! | 工具名称 | 功能 | 参数结构 |
 //! |----------|------|----------|
@@ -24,6 +26,7 @@
 //! | `get_type_hierarchy` | 类型继承链 | [`GetTypeHierarchyParams`] |
 //! | `get_file_symbols` | 文件内符号列表 | [`GetFileSymbolsParams`] |
 //! | `get_dependency_graph` | 获取依赖图 | [`GetDependencyGraphParams`] |
+//! | `get_project_map` | 项目语义地图（上下文重建） | [`GetProjectMapParams`] |
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -415,10 +418,12 @@ fn resolve_or_respond<T: serde::Serialize>(
 }
 
 /// 获取符号详情 handler
+///
+/// 返回值是符号对象本身，`include_source` 为真时额外附加 `source` 字段。
 pub fn handle_get_symbol(
     registry: &ToolRegistry,
     params: GetSymbolParams,
-) -> McpResponse<Symbol> {
+) -> McpResponse<serde_json::Value> {
     let start = Instant::now();
 
     // 允许直接传符号名，内部解析为唯一符号
@@ -427,8 +432,118 @@ pub fn handle_get_symbol(
         Err(resp) => return resp,
     };
 
+    // 保留原有字段布局，仅追加 source，既有调用方读 data.name 等仍可用
+    let mut data = serde_json::to_value(&symbol).unwrap_or(serde_json::Value::Null);
+    if params.include_source {
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("source".to_string(), extract_source(registry, &symbol));
+        }
+    }
+
     let elapsed = start.elapsed().as_millis() as u64;
-    McpResponse::success(symbol, 1, 1, elapsed)
+    McpResponse::success(data, 1, 1, elapsed)
+}
+
+/// 单个符号返回的源码行数上限
+const SOURCE_MAX_LINES: usize = 200;
+
+/// 单个符号返回的源码字符数上限
+///
+/// 只限行数挡不住 min.js / 生成代码里的超长单行 ——
+/// 200 行 × 每行上万字符足以一次吃掉整个上下文。
+const SOURCE_MAX_CHARS: usize = 8000;
+
+/// `get_file_symbols` 单次响应附带的源码字符总量上限
+///
+/// 单符号有上限不代表整次响应有上限 —— 一个文件几百个符号叠加起来仍会把上下文吃光。
+const FILE_SOURCE_TOTAL_MAX_CHARS: usize = 40000;
+
+/// 提取符号对应的源码片段
+///
+/// 索引中已记录 `file_path` / `line` / `end_line`，直接对源文件切片即可 ——
+/// 这一步让「看这个函数怎么写的」从「read 整个文件」降为一次工具调用。
+///
+/// 任何取不到源码的情况都如实返回 `available: false` 及原因，
+/// **不返回空串伪装成功** —— 否则调用方会把「文件读不到」当成「函数是空的」。
+fn extract_source(registry: &ToolRegistry, symbol: &Symbol) -> serde_json::Value {
+    let Some(root) = registry.project_root.as_ref() else {
+        return serde_json::json!({
+            "available": false,
+            "reason": "未配置项目根目录，无法定位源文件",
+        });
+    };
+
+    let relative = symbol.location.file_path.clone();
+    let path = root.join(&relative);
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            return serde_json::json!({
+                "available": false,
+                "file_path": relative,
+                "reason": format!("读取源文件失败（文件可能已删除或移出项目）: {}", e),
+            });
+        }
+    };
+
+    slice_source(&content, &relative, symbol)
+}
+
+/// 从已读取的文件内容中切出符号对应的源码片段
+///
+/// 与 [`extract_source`] 分离，是为了让 `get_file_symbols` 只读一次盘 ——
+/// 否则同一文件有多少符号就要读多少次。
+fn slice_source(content: &str, relative: &str, symbol: &Symbol) -> serde_json::Value {
+    let lines: Vec<&str> = content.lines().collect();
+    let start = symbol.location.line.max(1) as usize;
+    if start > lines.len() {
+        return serde_json::json!({
+            "available": false,
+            "file_path": relative,
+            "reason": format!(
+                "行号越界：索引记录该符号位于第 {} 行，但文件只有 {} 行 —— 索引可能已过期，请先调用 reindex",
+                start,
+                lines.len()
+            ),
+        });
+    }
+
+    // end_line 是脏数据时（早于 line，或与 line 同为 0）退化为单行。
+    // 注意必须先与钳制后的 start 取 max：只比 line 会漏掉 line=0/end_line=0 的情形，
+    // 那样 end_clamped - start 会 usize 下溢，release 下回绕成「空源码 + 成功」
+    let end = (symbol.location.end_line as usize).max(start);
+    let end_clamped = end.min(lines.len()).max(start);
+    let over_line_limit = (end_clamped - start + 1) > SOURCE_MAX_LINES;
+    let slice_end = (start + SOURCE_MAX_LINES - 1).min(end_clamped).max(start);
+
+    let mut code = lines[start - 1..slice_end].join("\n");
+    let mut truncated = end > lines.len() || over_line_limit;
+    let mut truncation_reason: Option<&str> = over_line_limit.then_some("超出行数上限");
+
+    if code.chars().count() > SOURCE_MAX_CHARS {
+        code = truncate_chars(&code, SOURCE_MAX_CHARS);
+        truncated = true;
+        truncation_reason = Some("超出字符数上限");
+    }
+
+    let mut result = serde_json::json!({
+        "available": true,
+        "file_path": relative,
+        "start_line": start,
+        "end_line": slice_end,
+        "code": code,
+        "truncated": truncated,
+    });
+    if let Some(reason) = truncation_reason {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert(
+                "truncated_reason".to_string(),
+                serde_json::Value::String(reason.to_string()),
+            );
+        }
+    }
+    result
 }
 
 /// 追溯调用者 handler
@@ -1285,7 +1400,7 @@ pub fn handle_get_type_hierarchy(
 pub fn handle_get_file_symbols(
     registry: &ToolRegistry,
     params: GetFileSymbolsParams,
-) -> McpResponse<Vec<Symbol>> {
+) -> McpResponse<serde_json::Value> {
     let start = Instant::now();
 
     let query_engine = match &registry.query_engine {
@@ -1302,9 +1417,448 @@ pub fn handle_get_file_symbols(
         return McpResponse::error(&format!("文件内无符号: {}", params.file_path));
     }
 
-    let total = symbols.len();
+    // include_source 缺省关闭：一个文件的符号可能很多，
+    // 全部带源码会一次吃掉大量上下文
+    let mut source_budget_exhausted = false;
+    let data: Vec<serde_json::Value> = if params.include_source {
+        // 整份文件只读一次 —— 按符号逐个读会把同一文件读 N 遍
+        let relative = symbols[0].location.file_path.clone();
+        let content = registry
+            .project_root
+            .as_ref()
+            .and_then(|root| std::fs::read_to_string(root.join(&relative)).ok());
+
+        let mut used_chars = 0usize;
+        symbols
+            .iter()
+            .map(|s| {
+                let mut v = serde_json::to_value(s).unwrap_or(serde_json::Value::Null);
+                let source = match &content {
+                    Some(c) if used_chars < FILE_SOURCE_TOTAL_MAX_CHARS => {
+                        let sliced = slice_source(c, &relative, s);
+                        used_chars += sliced
+                            .get("code")
+                            .and_then(|c| c.as_str())
+                            .map(|c| c.chars().count())
+                            .unwrap_or(0);
+                        sliced
+                    }
+                    Some(_) => {
+                        source_budget_exhausted = true;
+                        serde_json::json!({
+                            "available": false,
+                            "reason": format!(
+                                "本次响应的源码总量已达上限（{} 字符），后续符号未附源码；请用 get_symbol 按需单独获取",
+                                FILE_SOURCE_TOTAL_MAX_CHARS
+                            ),
+                        })
+                    }
+                    None => serde_json::json!({
+                        "available": false,
+                        "file_path": relative,
+                        "reason": "读取源文件失败（文件可能已删除或移出项目）",
+                    }),
+                };
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("source".to_string(), source);
+                }
+                v
+            })
+            .collect()
+    } else {
+        symbols
+            .iter()
+            .map(|s| serde_json::to_value(s).unwrap_or(serde_json::Value::Null))
+            .collect()
+    };
+
+    let total = data.len();
     let elapsed = start.elapsed().as_millis() as u64;
-    McpResponse::success(symbols, total, total, elapsed)
+    let response = McpResponse::success(serde_json::Value::Array(data), total, total, elapsed);
+
+    // 预算耗尽必须说出来，不能让调用方以为「这些符号本来就没有源码」
+    if source_budget_exhausted {
+        response.with_warning(format!(
+            "本次响应的源码总量已达 {} 字符上限，后续符号未附源码。需要逐个查看请改用 get_symbol。",
+            FILE_SOURCE_TOTAL_MAX_CHARS
+        ))
+    } else {
+        response
+    }
+}
+
+// ============================================================================
+// 项目地图 — 上下文重建
+// ============================================================================
+
+/// 项目地图的详细程度，按信息量从高到低排列
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MapLevel {
+    /// 模块 → 文件 → 符号名 + 截断签名
+    Detailed,
+    /// 模块 → 文件 → 符号名
+    Names,
+    /// 模块 → 文件与符号计数
+    Counts,
+    /// 仅总量与语言分布
+    Summary,
+}
+
+impl MapLevel {
+    fn name(self) -> &'static str {
+        match self {
+            MapLevel::Detailed => "detailed",
+            MapLevel::Names => "names",
+            MapLevel::Counts => "counts",
+            MapLevel::Summary => "summary",
+        }
+    }
+}
+
+/// `counts` 层级下每个文件列出的关键符号数
+const COUNT_LEVEL_SYMBOLS_PER_FILE: usize = 6;
+
+/// 粗略估算文本的 token 开销
+///
+/// 代码约 4 字符/token，中文约 1.5 字符/token，取 3 作偏保守的折中值 ——
+/// 宁可低估预算导致提前降级，也不要把上下文撑爆。
+fn estimate_tokens(text: &str) -> usize {
+    (text.chars().count() / 3).max(1)
+}
+
+/// 获取项目地图 handler
+///
+/// 在上下文丢失后一次性重建对项目的整体认知，
+/// 替代逐个文件重读。结果同时落盘供 CLAUDE.md 引用。
+pub fn handle_get_project_map(
+    registry: &ToolRegistry,
+    params: GetProjectMapParams,
+) -> McpResponse<serde_json::Value> {
+    let start = Instant::now();
+
+    let query_engine = match &registry.query_engine {
+        Some(q) => q,
+        None => return McpResponse::error("查询引擎未初始化"),
+    };
+
+    let (all, skipped_docs) = match query_engine.scan_all_symbols() {
+        Ok(s) => s,
+        Err(e) => return McpResponse::error(&format!("扫描符号失败: {}", e)),
+    };
+
+    if all.is_empty() {
+        return McpResponse::error("索引中没有符号。请先运行 `codeconnect index` 建立索引。");
+    }
+
+    let focus = params
+        .focus
+        .as_deref()
+        .map(|f| f.trim_matches('/').to_string())
+        .filter(|f| !f.is_empty());
+
+    let scoped: Vec<&codeconnect_index::tantivy_index::SymbolSearchResult> = match focus.as_deref() {
+        Some(f) => {
+            // 按路径段匹配，而非裸前缀 —— 否则 focus="crates/index" 会命中 crates/index_old/
+            let prefix = format!("{}/", f);
+            all.iter()
+                .filter(|s| s.file_path == f || s.file_path.starts_with(&prefix))
+                .collect()
+        }
+        None => all.iter().collect(),
+    };
+
+    if scoped.is_empty() {
+        return McpResponse::error(&format!(
+            "focus 路径 '{}' 下没有任何已索引符号。请确认该路径相对于项目根目录（如 crates/index），或去掉 focus 查看全量。",
+            params.focus.as_deref().unwrap_or("")
+        ));
+    }
+
+    // 按预算逐级降级：宁可少给信息并明确说明，也不静默截断
+    let budget = params.budget_tokens.max(200);
+    let mut selected: Option<(MapLevel, String)> = None;
+    for level in [
+        MapLevel::Detailed,
+        MapLevel::Names,
+        MapLevel::Counts,
+        MapLevel::Summary,
+    ] {
+        let candidate = render_project_map(&scoped, &all, level, focus.as_deref(), registry);
+        if estimate_tokens(&candidate) <= budget {
+            selected = Some((level, candidate));
+            break;
+        }
+    }
+
+    let (level, map, over_budget) = match selected {
+        Some((l, m)) => (l, m, false),
+        // 连最简形式都超预算：仍然返回它，但必须让调用方知道
+        None => (
+            MapLevel::Summary,
+            render_project_map(&scoped, &all, MapLevel::Summary, focus.as_deref(), registry),
+            true,
+        ),
+    };
+
+    let estimated = estimate_tokens(&map);
+    let degraded = level != MapLevel::Detailed;
+    let scoped_files = scoped
+        .iter()
+        .map(|s| s.file_path.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+
+    // 落盘：让地图能被 CLAUDE.md 引用，从而每次会话自动加载
+    let mut written_to: Option<String> = None;
+    let mut write_error: Option<String> = None;
+    if params.write_file {
+        match registry.data_dir.as_ref() {
+            Some(data_dir) => {
+                let path = data_dir.join("PROJECT_MAP.md");
+                match std::fs::write(&path, &map) {
+                    Ok(()) => written_to = Some(path.display().to_string()),
+                    Err(e) => write_error = Some(format!("写入 {} 失败: {}", path.display(), e)),
+                }
+            }
+            None => write_error = Some("未配置数据目录，地图未落盘".to_string()),
+        }
+    }
+
+    let data = serde_json::json!({
+        "map": map,
+        "written_to": written_to,
+        "scope": focus.clone().unwrap_or_else(|| "全项目".to_string()),
+        "level": level.name(),
+        "degraded": degraded,
+        "budget_tokens": budget,
+        "estimated_tokens": estimated,
+        "total_symbols": all.len(),
+        "scoped_symbols": scoped.len(),
+        "scoped_files": scoped_files,
+    });
+
+    let total = scoped.len();
+    let elapsed = start.elapsed().as_millis() as u64;
+    let mut response = McpResponse::success(data, total, total, elapsed);
+
+    if over_budget {
+        response = response.with_warning(format!(
+            "项目地图已降到最简形式，仍超出 {} token 预算（约 {} token）。请改用 focus 缩小范围，或调大 budget_tokens。",
+            budget, estimated
+        ));
+    } else if degraded {
+        response = response.with_warning(format!(
+            "为适配 {} token 预算，地图已降级为 '{}' 层级（省略了部分细节）。需要更细的信息请调大 budget_tokens 或用 focus 聚焦。",
+            budget,
+            level.name()
+        ));
+    }
+
+    if skipped_docs > 0 {
+        response = response.with_warning(format!(
+            "扫描时有 {} 个索引文档读取失败或已损坏，已被跳过 —— 地图内容与计数可能偏低，建议运行一次 `codeconnect index -f` 重建索引。",
+            skipped_docs
+        ));
+    }
+
+    if let Some(err) = write_error {
+        response = response.with_warning(err);
+    }
+
+    response
+}
+
+/// 渲染项目地图文本
+fn render_project_map(
+    scoped: &[&codeconnect_index::tantivy_index::SymbolSearchResult],
+    all: &[codeconnect_index::tantivy_index::SymbolSearchResult],
+    level: MapLevel,
+    focus: Option<&str>,
+    registry: &ToolRegistry,
+) -> String {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+
+    // ---- 汇总 ----
+    let mut lang_stats: BTreeMap<&str, (usize, BTreeSet<&str>)> = BTreeMap::new();
+    let mut file_stats: BTreeMap<&str, Vec<&codeconnect_index::tantivy_index::SymbolSearchResult>> =
+        BTreeMap::new();
+    for s in scoped {
+        let entry = lang_stats.entry(s.language.as_str()).or_default();
+        entry.0 += 1;
+        entry.1.insert(s.file_path.as_str());
+        file_stats.entry(s.file_path.as_str()).or_default().push(s);
+    }
+
+    let _ = writeln!(out, "# CodeConnect 项目地图");
+    let _ = writeln!(out);
+    let scope_note = match focus {
+        Some(f) => format!("范围: {}（全项目共 {} 符号）", f, all.len()),
+        None => "范围: 全项目".to_string(),
+    };
+    let _ = writeln!(
+        out,
+        "> {} | 本范围 {} 符号 / {} 文件",
+        scope_note,
+        scoped.len(),
+        file_stats.len()
+    );
+    match registry.index_built_at_unix {
+        Some(built_at) => {
+            let age = crate::server::now_unix_secs().saturating_sub(built_at).max(0) as u64;
+            let _ = writeln!(
+                out,
+                "> 索引最后更新于 {} 前 —— 若与实际代码不符，请先调用 reindex",
+                crate::server::humanize_duration(age)
+            );
+        }
+        None => {
+            let _ = writeln!(out, "> 索引更新时间未知（旧索引），内容可能已过期");
+        }
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## 语言分布");
+    for (lang, (count, files)) in &lang_stats {
+        let _ = writeln!(out, "- {}: {} 符号 / {} 文件", lang, count, files.len());
+    }
+
+    // ---- 最简层级：仍须回答「项目由哪些模块构成」----
+    if level == MapLevel::Summary {
+        let mut dir_totals: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for (file, syms) in &file_stats {
+            let dir = match file.rfind('/') {
+                Some(i) => file[..i].to_string(),
+                None => ".".to_string(),
+            };
+            let entry = dir_totals.entry(dir).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += syms.len();
+        }
+        let mut list: Vec<_> = dir_totals.into_iter().collect();
+        list.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then_with(|| a.0.cmp(&b.0)));
+
+        let _ = writeln!(out);
+        let _ = writeln!(out, "## 主要模块");
+        for (dir, (files, symbols)) in list {
+            let _ = writeln!(out, "- {}/  ({} 文件 / {} 符号)", dir, files, symbols);
+        }
+    }
+
+    // ---- 模块明细 ----
+    if level != MapLevel::Summary {
+        let mut dirs: BTreeMap<String, Vec<(&str, &Vec<&codeconnect_index::tantivy_index::SymbolSearchResult>)>> =
+            BTreeMap::new();
+        for (file, syms) in &file_stats {
+            let dir = match file.rfind('/') {
+                Some(i) => file[..i].to_string(),
+                None => ".".to_string(),
+            };
+            dirs.entry(dir).or_default().push((file, syms));
+        }
+
+        // 符号密集的目录优先展示
+        let mut dir_list: Vec<_> = dirs.into_iter().collect();
+        dir_list.sort_by(|a, b| {
+            let ca: usize = a.1.iter().map(|(_, s)| s.len()).sum();
+            let cb: usize = b.1.iter().map(|(_, s)| s.len()).sum();
+            cb.cmp(&ca).then_with(|| a.0.cmp(&b.0))
+        });
+
+        let _ = writeln!(out);
+        let _ = writeln!(out, "## 模块明细");
+
+        for (dir, mut files_in_dir) in dir_list {
+            let dir_total: usize = files_in_dir.iter().map(|(_, s)| s.len()).sum();
+            let _ = writeln!(out);
+            let _ = writeln!(
+                out,
+                "### {}/  —  {} 文件 / {} 符号",
+                dir,
+                files_in_dir.len(),
+                dir_total
+            );
+
+            files_in_dir.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
+            for (file, syms) in files_in_dir {
+                let _ = writeln!(out, "- {}  ({} 符号)", file, syms.len());
+
+                let mut sorted = syms.clone();
+                sorted.sort_by(|a, b| {
+                    b.is_exported
+                        .cmp(&a.is_exported)
+                        .then_with(|| a.name.cmp(&b.name))
+                });
+
+                // 计数层级也列出每个文件最关键的几个符号：只给计数的话，
+                // 「重建项目认知」拿不到任何具体名字，价值所剩无几
+                if level == MapLevel::Counts {
+                    for s in sorted.iter().take(COUNT_LEVEL_SYMBOLS_PER_FILE) {
+                        let _ = writeln!(out, "    - {}", s.name);
+                    }
+                    if sorted.len() > COUNT_LEVEL_SYMBOLS_PER_FILE {
+                        let _ = writeln!(
+                            out,
+                            "    - …… 另有 {} 个符号未列出",
+                            sorted.len() - COUNT_LEVEL_SYMBOLS_PER_FILE
+                        );
+                    }
+                    continue;
+                }
+
+                let cap = match level {
+                    MapLevel::Detailed => 40,
+                    _ => 25,
+                };
+                for s in sorted.iter().take(cap) {
+                    if level == MapLevel::Detailed {
+                        let sig = truncate_chars(&s.signature, 90);
+                        if sig.is_empty() {
+                            let _ = writeln!(out, "    - {} [{}] :{}", s.name, s.kind, s.line);
+                        } else {
+                            let _ = writeln!(
+                                out,
+                                "    - {} [{}] {} :{}",
+                                s.name, s.kind, sig, s.line
+                            );
+                        }
+                    } else {
+                        let _ = writeln!(out, "    - {}", s.name);
+                    }
+                }
+                if sorted.len() > cap {
+                    let _ = writeln!(out, "    - …… 另有 {} 个符号未列出", sorted.len() - cap);
+                }
+            }
+        }
+    }
+
+    // ---- 入口点线索 ----
+    let entries: Vec<&&codeconnect_index::tantivy_index::SymbolSearchResult> = scoped
+        .iter()
+        .filter(|s| {
+            s.name == "main"
+                || (s.is_exported
+                    && (s.file_path.ends_with("lib.rs")
+                        || s.file_path.ends_with("index.ts")
+                        || s.file_path.ends_with("index.js")))
+        })
+        .collect();
+    if !entries.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "## 入口点线索");
+        for s in entries.iter().take(30) {
+            let _ = writeln!(
+                out,
+                "- {} [{}] {}:{}",
+                s.name, s.kind, s.file_path, s.line
+            );
+        }
+    }
+
+    out
 }
 
 /// 获取依赖图 handler
@@ -1424,8 +1978,220 @@ mod tests {
         let registry = ToolRegistry::new();
         let params = GetSymbolParams {
             symbol_id: "test_id".to_string(),
+            include_source: true,
         };
         let response = handle_get_symbol(&registry, params);
         assert_eq!(response.status, codeconnect_core::response::ResponseStatus::Error);
+    }
+
+    // ===== 源码切片 =====
+
+    /// 构造一个仅含 project_root 的注册表，用于测试源码切片
+    fn registry_with_root(root: &std::path::Path) -> ToolRegistry {
+        ToolRegistry::new().with_project_root(root.to_path_buf())
+    }
+
+    fn symbol_at(file_path: &str, line: u64, end_line: u64) -> Symbol {
+        Symbol {
+            id: "rust::src/demo.rs::function::demo::aaaa".to_string(),
+            name: "demo".to_string(),
+            kind: codeconnect_core::types::SymbolKind::Function,
+            location: codeconnect_core::types::SourceLocation {
+                file_path: file_path.to_string(),
+                line,
+                column: 1,
+                end_line,
+                end_column: 1,
+            },
+            signature: None,
+            doc_comment: None,
+            parent_id: None,
+            modifiers: Vec::new(),
+            is_exported: false,
+            complexity: None,
+        }
+    }
+
+    #[test]
+    fn test_extract_source_returns_exact_line_range() {
+        let dir = std::env::temp_dir().join("cc_source_slice_test");
+        let _ = std::fs::create_dir_all(dir.join("src"));
+        std::fs::write(
+            dir.join("src/demo.rs"),
+            "line1\nline2\nfn demo() {\n    body\n}\nline6\n",
+        )
+        .unwrap();
+
+        let registry = registry_with_root(&dir);
+        let result = extract_source(&registry, &symbol_at("src/demo.rs", 3, 5));
+
+        assert_eq!(result["available"], true, "应成功取到源码: {}", result);
+        assert_eq!(result["code"], "fn demo() {\n    body\n}");
+        assert_eq!(result["start_line"], 3);
+        assert_eq!(result["end_line"], 5);
+        assert_eq!(result["truncated"], false);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_extract_source_reports_missing_file_not_empty_string() {
+        let dir = std::env::temp_dir().join("cc_source_missing_test");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let registry = registry_with_root(&dir);
+        let result = extract_source(&registry, &symbol_at("src/gone.rs", 1, 2));
+
+        // 关键：不能返回 available=true + 空 code（那会被读成「函数是空的」）
+        assert_eq!(result["available"], false, "文件缺失必须如实报告: {}", result);
+        assert!(result["reason"].as_str().unwrap().contains("读取源文件失败"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_extract_source_reports_out_of_range_lines() {
+        let dir = std::env::temp_dir().join("cc_source_range_test");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("short.rs"), "only_one_line\n").unwrap();
+
+        let registry = registry_with_root(&dir);
+        let result = extract_source(&registry, &symbol_at("short.rs", 99, 120));
+
+        assert_eq!(result["available"], false, "行号越界必须如实报告: {}", result);
+        assert!(result["reason"].as_str().unwrap().contains("行号越界"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_extract_source_truncates_long_body() {
+        let dir = std::env::temp_dir().join("cc_source_truncate_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let body: String = (1..=SOURCE_MAX_LINES + 50).map(|i| format!("line{}\n", i)).collect();
+        std::fs::write(dir.join("long.rs"), body).unwrap();
+
+        let registry = registry_with_root(&dir);
+        let result = extract_source(&registry, &symbol_at("long.rs", 1, (SOURCE_MAX_LINES + 50) as u64));
+
+        assert_eq!(result["available"], true);
+        assert_eq!(result["truncated"], true, "超长符号体必须标记截断");
+        assert_eq!(result["end_line"], SOURCE_MAX_LINES);
+        assert_eq!(result["code"].as_str().unwrap().lines().count(), SOURCE_MAX_LINES);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_extract_source_handles_end_line_past_eof_without_panic() {
+        let dir = std::env::temp_dir().join("cc_source_eof_test");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("partial.rs"), "a\nb\nc\n").unwrap();
+
+        let registry = registry_with_root(&dir);
+        // 起止都在文件内，但 end_line 超出末行 —— 应裁剪到末行并标记截断
+        let result = extract_source(&registry, &symbol_at("partial.rs", 2, 999));
+
+        assert_eq!(result["available"], true, "{}", result);
+        assert_eq!(result["start_line"], 2);
+        assert_eq!(result["end_line"], 3);
+        assert_eq!(result["code"], "b\nc");
+        assert_eq!(result["truncated"], true);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_extract_source_handles_end_line_before_start() {
+        let dir = std::env::temp_dir().join("cc_source_reversed_test");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("rev.rs"), "a\nb\nc\n").unwrap();
+
+        let registry = registry_with_root(&dir);
+        // end_line < line（脏索引数据）—— 必须退化为单行，不能 panic
+        let result = extract_source(&registry, &symbol_at("rev.rs", 3, 1));
+
+        assert_eq!(result["available"], true, "{}", result);
+        assert_eq!(result["start_line"], 3);
+        assert_eq!(result["end_line"], 3);
+        assert_eq!(result["code"], "c");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_extract_source_handles_empty_file() {
+        let dir = std::env::temp_dir().join("cc_source_empty_test");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("empty.rs"), "").unwrap();
+
+        let registry = registry_with_root(&dir);
+        let result = extract_source(&registry, &symbol_at("empty.rs", 1, 5));
+
+        // 空文件属于「行号越界」，必须如实报告而不是回空代码
+        assert_eq!(result["available"], false, "{}", result);
+        assert!(result["reason"].as_str().unwrap().contains("行号越界"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_estimate_tokens_is_monotonic_and_nonzero() {
+        assert!(estimate_tokens("") >= 1);
+        assert!(estimate_tokens("abc") <= estimate_tokens("abcdef"));
+    }
+
+    #[test]
+    fn test_extract_source_handles_zero_line_numbers() {
+        let dir = std::env::temp_dir().join("cc_source_zeroline_test");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("zero.rs"), "first\nsecond\n").unwrap();
+
+        let registry = registry_with_root(&dir);
+        // line=0 且 end_line=0：解析器若将来给出未赋值的行号会走到这里。
+        // 此前 end_clamped(0) - start(1) 会 usize 下溢 —— debug panic，
+        // release 下回绕成「available:true + 空 code」，即空串伪装成功
+        let result = extract_source(&registry, &symbol_at("zero.rs", 0, 0));
+
+        assert_eq!(result["available"], true, "{}", result);
+        assert!(
+            !result["code"].as_str().unwrap().is_empty(),
+            "不得返回空源码伪装成功: {}",
+            result
+        );
+        assert_eq!(result["code"], "first");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_extract_source_caps_total_characters() {
+        let dir = std::env::temp_dir().join("cc_source_charcap_test");
+        let _ = std::fs::create_dir_all(&dir);
+        // 单行超长（min.js / 生成代码的典型形态）：行数没超，字符数远超上限
+        let long_line = "x".repeat(SOURCE_MAX_CHARS * 3);
+        std::fs::write(dir.join("min.js"), format!("{}\n", long_line)).unwrap();
+
+        let registry = registry_with_root(&dir);
+        let result = extract_source(&registry, &symbol_at("min.js", 1, 1));
+
+        assert_eq!(result["available"], true);
+        assert_eq!(result["truncated"], true, "超长单行必须标记截断: {}", result);
+        assert_eq!(result["truncated_reason"], "超出字符数上限");
+        assert!(
+            result["code"].as_str().unwrap().chars().count() <= SOURCE_MAX_CHARS + 1,
+            "实际长度 {} 超过上限",
+            result["code"].as_str().unwrap().chars().count()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_extract_source_without_project_root() {
+        let registry = ToolRegistry::new();
+        let result = extract_source(&registry, &symbol_at("src/demo.rs", 1, 2));
+        assert_eq!(result["available"], false);
+        assert!(result["reason"].as_str().unwrap().contains("未配置项目根目录"));
     }
 }

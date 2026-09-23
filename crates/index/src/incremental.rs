@@ -149,11 +149,14 @@ impl IncrementalIndexer {
 
         for file_path in &unique_paths {
             // ---- 计算相对于项目根目录的路径 ----
+            // 必须与 full_indexer 一致地归一化为正斜杠：否则同一文件在 Windows 上
+            // 会被全量索引写成 `a/b.rs`、被增量索引写成 `a\b.rs`，
+            // 索引里出现两份互不相干的记录（查询、去重、计数全部错乱）
             let relative_path = file_path
                 .strip_prefix(&self.project_root)
                 .unwrap_or(file_path)
                 .to_string_lossy()
-                .to_string();
+                .replace('\\', "/");
 
             // ---- 第二步：读取内容并计算指纹 ----
             let source = match std::fs::read_to_string(file_path) {
@@ -215,6 +218,18 @@ impl IncrementalIndexer {
                 symbols.len()
             );
             reindexed_count += 1;
+        }
+
+        // 提交 tantivy 符号索引
+        //
+        // 此前这里只提交了调用边索引，符号一直悬在 writer 缓冲里不落盘 ——
+        // 结果是「文件监控已启动」但改了代码后新符号根本搜不到，
+        // 直到某次全量索引的 commit 把它们顺带刷盘时才突然出现（且带着旧路径）。
+        if reindexed_count > 0 {
+            match self.tantivy.commit() {
+                Ok(count) => tracing::debug!("提交符号索引完成: {} 个文档", count),
+                Err(e) => tracing::error!("提交符号索引失败: {}", e),
+            }
         }
 
         // 提交 tantivy 调用边索引

@@ -111,7 +111,7 @@ impl CodeConnectServer {
 impl CodeConnectServer {
     /// 符号搜索 — 按名称、类型和语言搜索代码符号
     #[rmcp::tool(
-        description = "按名称、类型和语言搜索代码符号，返回匹配的符号及其位置、签名、文档等完整信息"
+        description = "按名称搜索代码符号，返回位置、签名等定位信息（默认 detail=brief 精简输出）。搜索无匹配时会返回相近候选与排查方向；找详情请用 get_symbol。这是替代 grep 的首选：它按符号边界匹配，不会把注释、字符串里的同名文本一起捞出来"
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn search_symbol(
@@ -124,7 +124,7 @@ impl CodeConnectServer {
 
     /// 获取符号详情 — 按符号 ID 获取完整信息
     #[rmcp::tool(
-        description = "按符号 ID 获取符号的完整信息，包括位置、签名、文档注释、修饰符等"
+        description = "获取符号的完整信息，含位置、签名、文档注释、修饰符，以及该符号的源码片段（source.code）。参数可传 symbol_id 或直接传符号名。想「看一眼这个函数怎么写的」时用本工具，不必 read 整个文件。源码取不到时会说明原因而非返回空"
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn get_symbol(
@@ -137,7 +137,7 @@ impl CodeConnectServer {
 
     /// 追溯调用者 — 反向遍历调用链找出所有上游调用者
     #[rmcp::tool(
-        description = "反向遍历调用图，找出目标符号的所有上游调用者及其完整调用链"
+        description = "反向遍历调用图，找出目标符号的所有上游调用者及其完整调用链。参数可传 symbol_id 或符号名"
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn trace_callers(
@@ -149,7 +149,7 @@ impl CodeConnectServer {
     }
 
     /// 追溯被调用者 — 正向遍历调用链找出所有下游被调用者
-    #[rmcp::tool(description = "正向遍历调用图，找出目标符号调用的所有下游符号")]
+    #[rmcp::tool(description = "正向遍历调用图，找出目标符号调用的所有下游符号。参数可传 symbol_id 或符号名")]
     #[allow(clippy::needless_pass_by_value)]
     async fn trace_callees(
         &self,
@@ -161,7 +161,7 @@ impl CodeConnectServer {
 
     /// 变更影响分析 — 基于调用图评估修改符号的影响范围
     #[rmcp::tool(
-        description = "基于 BFS 调用链传播算法，评估修改指定符号后的潜在影响范围，按严重度分类输出影响报告"
+        description = "基于 BFS 调用链传播算法，评估修改指定符号后的潜在影响范围，按严重度分类输出影响报告。参数可传 symbol_id 或符号名（多个用 symbol_ids）"
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn analyze_impact(
@@ -174,7 +174,7 @@ impl CodeConnectServer {
 
     /// 获取调用子图 — 获取指定符号周围的局部调用图
     #[rmcp::tool(
-        description = "以指定符号为中心，提取上游调用者和下游被调用者组成的局部调用关系子图"
+        description = "以指定符号为中心，提取上游调用者和下游被调用者组成的局部调用关系子图。参数可传 symbol_id 或符号名"
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn get_call_graph(
@@ -187,7 +187,7 @@ impl CodeConnectServer {
 
     /// 获取代码质量指标 — 圈复杂度、扇入扇出、继承深度
     #[rmcp::tool(
-        description = "获取指定符号或文件的代码质量指标：圈复杂度、扇入、扇出、继承深度等"
+        description = "获取指定符号或文件的代码质量指标：圈复杂度、扇入、扇出、继承深度等。symbol_id 可传符号名，也可传 file_path"
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn get_metrics(
@@ -245,7 +245,7 @@ impl CodeConnectServer {
 
     /// 查找引用 — 找出所有引用指定符号的位置
     #[rmcp::tool(
-        description = "查找代码中所有引用指定符号的位置，包括调用引用和数据依赖引用"
+        description = "查找引用指定符号的位置。注意：当前仅覆盖调用关系，字段读取/类型标注类引用尚未索引，这类需求请改用 search_symbol。参数可传 symbol_id 或符号名"
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn find_references(
@@ -297,7 +297,7 @@ impl CodeConnectServer {
 
     /// 类型继承链 — 获取类型的祖先链和子类链
     #[rmcp::tool(
-        description = "获取指定类型的完整继承链：父类（祖先）和子类（后代）双向查询"
+        description = "获取指定类型的完整继承链：父类（祖先）和子类（后代）双向查询。参数可传 symbol_id 或符号名"
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn get_type_hierarchy(
@@ -310,7 +310,7 @@ impl CodeConnectServer {
 
     /// 文件符号列表 — 获取指定文件中的所有符号
     #[rmcp::tool(
-        description = "获取指定源文件中提取的所有符号及其位置、类型和签名信息"
+        description = "获取指定源文件中提取的所有符号及其位置、类型和签名信息。include_source=true 时每个符号附带源码片段（默认关闭，避免一次调用吃掉大量上下文）"
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn get_file_symbols(
@@ -331,6 +331,19 @@ impl CodeConnectServer {
         Parameters(params): Parameters<GetDependencyGraphParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let response = tools::handle_get_dependency_graph(&self.registry, params);
+        self.respond(response)
+    }
+
+    /// 项目地图 — 上下文丢失后一次性重建项目认知
+    #[rmcp::tool(
+        description = "生成项目语义地图：目录结构、各模块的符号与签名、语言分布、入口点，按 budget_tokens（默认 3000）自动控制体积。用于对话压缩后快速重建对项目的整体认知，替代逐个文件重读。结果同时写入 .codeconnect/PROJECT_MAP.md。可用 focus 聚焦某个子目录"
+    )]
+    #[allow(clippy::needless_pass_by_value)]
+    async fn get_project_map(
+        &self,
+        Parameters(params): Parameters<GetProjectMapParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let response = tools::handle_get_project_map(&self.registry, params);
         self.respond(response)
     }
 }
@@ -362,7 +375,7 @@ impl ServerHandler for CodeConnectServer {
 const STALE_INDEX_WARN_SECS: i64 = 300;
 
 /// 当前 Unix 时间戳（秒）
-fn now_unix_secs() -> i64 {
+pub(crate) fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -370,7 +383,7 @@ fn now_unix_secs() -> i64 {
 }
 
 /// 将秒数转为人类可读的粗略时长
-fn humanize_duration(secs: u64) -> String {
+pub(crate) fn humanize_duration(secs: u64) -> String {
     if secs < 60 {
         format!("{} 秒", secs)
     } else if secs < 3600 {

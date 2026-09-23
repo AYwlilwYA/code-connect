@@ -4,9 +4,75 @@
 > grep 不准确 引用索引 put_ref_edge find_references 源码切片 get_symbol include_source
 > 符号源码 body_text definition 多次 read
 
-- 状态：已批准实施（⑧ → ⑦，顺序执行）
+- 状态：⑧⑦ 均已实施并端到端验证；⑨ 未做
 - 日期：2026-09-23
 - 范围：解决 AI 写代码时的三个核心痛点
+
+---
+
+## 实施结果（2026-09-23）
+
+### ⑧ 已实施
+
+- `GetSymbolParams.include_source`（默认 true）、`GetFileSymbolsParams.include_source`（默认 false，
+  一个文件符号多，默认带源码会一次吃掉大量上下文）。
+- `tools.rs::extract_source` 用 `line`/`end_line` 对源文件切片，上限 `SOURCE_MAX_LINES = 200`，
+  超长标记 `truncated`。
+- **实测**：`get_symbol("greet")` 返回 `source.code` = 源文件第 7–10 行原文。
+- 失败路径均返回 `available:false` + 原因（文件缺失 / 行号越界 / 未配置项目根目录），
+  并有 5 个单测覆盖。
+
+### ⑦ 已实施
+
+- `TantivyIndex::scan_all_symbols` 单遍遍历全量符号（避免 N 次随机读），
+  `QueryEngine` 透传。
+- `tools.rs::handle_get_project_map` + `render_project_map`，四级降级
+  `Detailed → Names → Counts → Summary`，按 `estimate_tokens`（字符数/3，偏保守）
+  选择首个不超预算的层级；**超预算时显式 warning，不静默截断**。
+- 落盘 `<data_dir>/PROJECT_MAP.md`。
+- **实测**（60 文件 / 3416 符号的隔离副本）：
+  - `budget_tokens=3000` → 降级 `counts`，~1080 token，warning 明示降级
+  - `budget_tokens=300` → 降级 `summary`，~112 token
+  - `focus=crates/mcp, budget=2000` → 保持 `detailed`，453 符号，~1768 token
+  - 落盘文件与工具返回一致
+
+### 代码审查中查出的两个既有严重缺陷（已修）
+
+这两条**不在原计划内**，是审查 Agent 与端到端实验挖出来的，都不在本次新增代码里，
+但本次新功能直接踩在它们上面。
+
+#### 缺陷 A — 增量索引写出的文件路径是反斜杠，导致索引内同一文件存在两份记录
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 真索引里同一文件有两条记录：`crates/mcp/src/tools.rs`（216 符号）与 `crates\mcp\src\tools.rs`（325 符号），共 11 对 |
+| 根因 | `full_indexer.rs:558` 有 `.replace('\\', "/")`（注释「统一使用正斜杠」），`incremental.rs` 的同名计算没有 |
+| 后果 | 同一文件被索引两次且内容分裂；按路径查询只命中其中一份（且往往是陈旧的那份）而**状态仍为 Success**；计数虚高；按目录分组、按前缀过滤全部失配 |
+| 修法 | `incremental.rs` 补上同样的归一化（根因）；`tantivy_index.rs::doc_to_result` 读取时再归一化一次（兜住已损坏的历史索引） |
+
+**为何此前的端到端测试没测出来**：隔离副本走的是全量索引（有归一化），
+只有 `serve` 的文件监控走增量索引。必须真正触发 watcher 才能复现。
+
+#### 缺陷 B — 增量索引从不提交符号索引，文件监控形同虚设
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 修改源文件后日志显示「增量索引: 处理 1 个变更文件」，但新符号**搜不到** |
+| 根因 | `incremental.rs` 收尾只调了 `call_edge_index.commit()`，**从未调用 `tantivy.commit()`**。符号只写进 writer 缓冲，不落盘 |
+| 后果 | 文件监控的「自动增量更新」实际无效；写入的文档会一直悬着，直到某次全量索引的 `commit()` 把它们顺带刷盘 —— 这也正是缺陷 A 中反斜杠条目得以出现在索引里的原因 |
+| 修法 | `reindexed_count > 0` 时补 `self.tantivy.commit()` |
+
+**验证方式**（隔离项目，撑住 stdin 让 serve 存活，改文件触发 watcher）：
+修复前 `gamma` 搜不到且路径为 `src\a.rs`；修复后 `gamma` 可搜到、路径为 `src/a.rs`。
+
+### 未决事项
+
+1. **CLAUDE.md 未改动**（用户决定）。因此「自动挺过 compact」只走通一半：
+   文件会生成，但没有东西自动把它拉进上下文。查实 `.codeconnect/` 被 `.gitignore:7`
+   忽略，若在已提交的 CLAUDE.md 中写 `@.codeconnect/PROJECT_MAP.md` 导入，
+   同事 clone 或删除索引后引用会悬空，故未采用。
+2. **本项目自身的 `PROJECT_MAP.md` 尚未生成** —— 运行中的 MCP 服务占用 tantivy
+   索引锁（实测 `LockBusy`），需重启 Claude Code 后执行 `index -f` 再调用一次工具。
 
 ---
 

@@ -169,6 +169,16 @@ impl QueryEngine {
     pub fn scan_all_ids(&self) -> Result<Vec<(String, String)>, CodeConnectError> {
         self.tantivy.scan_all_ids()
     }
+
+    /// 一次性扫描索引中的全部符号（含完整字段）
+    ///
+    /// 单遍遍历，供生成项目地图等需要全量符号的场合使用。
+    /// 返回值第二项为被跳过的损坏/不可读文档数，调用方应据此告警。
+    pub fn scan_all_symbols(
+        &self,
+    ) -> Result<(Vec<SymbolSearchResult>, usize), CodeConnectError> {
+        self.tantivy.scan_all_symbols()
+    }
 }
 
 /// 将 tantivy 搜索结果转换为完整的 Symbol 结构

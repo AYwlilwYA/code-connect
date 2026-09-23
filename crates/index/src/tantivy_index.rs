@@ -376,6 +376,46 @@ impl TantivyIndex {
             .collect())
     }
 
+    /// 一次性扫描索引中的全部符号
+    ///
+    /// 与 `scan_all_ids` 同为**单遍遍历**，但返回完整字段。
+    /// 供「生成项目地图」这类需要全量符号的场合使用 ——
+    /// 逐个 ID 反查文档会退化成 N 次随机读，大项目上不可接受。
+    /// 返回值第二项为**被跳过的文档数**（读取失败或 stable_id 为空的损坏条目）。
+    /// 该计数必须向上传递并告警 —— 静默丢弃会让总数偏低而状态仍显示成功。
+    pub fn scan_all_symbols(
+        &self,
+    ) -> Result<(Vec<SymbolSearchResult>, usize), CodeConnectError> {
+        self.reader
+            .reload()
+            .map_err(|e| CodeConnectError::Index(format!("重新加载失败: {}", e)))?;
+
+        let searcher = self.reader.searcher();
+        let mut results = Vec::new();
+        let mut skipped = 0usize;
+
+        for doc_addr in searcher
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .flat_map(|(segment_ord, reader)| {
+                reader
+                    .doc_ids_alive()
+                    .map(move |doc_id| tantivy::DocAddress {
+                        segment_ord: segment_ord as u32,
+                        doc_id,
+                    })
+            })
+        {
+            match self.doc_to_result(&searcher, doc_addr, 0.0) {
+                Some(result) if !result.stable_id.is_empty() => results.push(result),
+                _ => skipped += 1,
+            }
+        }
+
+        Ok((results, skipped))
+    }
+
     /// 将 tantivy 文档转换为搜索结果
     ///
     /// 读取失败时返回 `None` 并记录警告，不中断整批查询。
@@ -415,7 +455,9 @@ impl TantivyIndex {
             name: get_text(self.schema.name),
             kind: get_text(self.schema.kind),
             language: get_text(self.schema.language),
-            file_path: get_text(self.schema.file_path),
+            // 读取侧同样归一化：历史索引里存在反斜杠路径（增量索引曾漏做归一化），
+            // 不修的话按路径分组、按前缀过滤都会静默失配
+            file_path: get_text(self.schema.file_path).replace('\\', "/"),
             signature: get_text(self.schema.signature),
             doc_comment: get_text(self.schema.doc_comment),
             parent_type: get_text(self.schema.parent_type),
@@ -482,7 +524,9 @@ impl TantivyIndex {
             name: get_text(self.schema.name),
             kind: get_text(self.schema.kind),
             language: get_text(self.schema.language),
-            file_path: get_text(self.schema.file_path),
+            // 读取侧同样归一化：历史索引里存在反斜杠路径（增量索引曾漏做归一化），
+            // 不修的话按路径分组、按前缀过滤都会静默失配
+            file_path: get_text(self.schema.file_path).replace('\\', "/"),
             signature: get_text(self.schema.signature),
             doc_comment: get_text(self.schema.doc_comment),
             parent_type: get_text(self.schema.parent_type),

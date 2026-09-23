@@ -52,8 +52,14 @@ fn default_detail_brief() -> String {
 /// 获取符号详情请求参数
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct GetSymbolParams {
-    /// 稳定符号 ID
+    /// 稳定符号 ID，或符号名称（内部自动解析）
     pub symbol_id: String,
+    /// 是否随符号一并返回源码片段，默认 true
+    ///
+    /// 索引中已记录符号的行区间，可直接切片返回，
+    /// 避免为「看一眼这个函数怎么写的」而 read 整个文件。
+    #[serde(default = "default_true")]
+    pub include_source: bool,
 }
 
 // ============================================================================
@@ -303,6 +309,44 @@ fn default_direction() -> String {
 pub struct GetFileSymbolsParams {
     /// 文件路径（相对于项目根目录）
     pub file_path: String,
+    /// 是否随每个符号返回源码片段，默认 false
+    ///
+    /// 一个文件可能包含大量符号，默认关闭以免一次调用吃掉大量上下文；
+    /// 需要逐段查看时再显式开启。
+    #[serde(default)]
+    pub include_source: bool,
+}
+
+// ============================================================================
+// get_project_map — 项目语义快照
+// ============================================================================
+
+/// 项目地图请求参数
+///
+/// 用于在上下文丢失（如对话压缩）后，一次性重建对项目的整体认知，
+/// 替代逐个文件重读。
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GetProjectMapParams {
+    /// 目标 token 预算，默认 3000
+    ///
+    /// 超出预算时会自动逐级降级（省略签名 → 只留符号名 → 只留统计），
+    /// 并在响应中明确标注已降级，不会静默截断。
+    #[serde(default = "default_budget_tokens")]
+    pub budget_tokens: usize,
+    /// 只关注某个子目录（相对项目根目录的路径前缀，如 `crates/index`）
+    #[serde(default)]
+    pub focus: Option<String>,
+    /// 是否把地图写入 `<数据目录>/PROJECT_MAP.md`，默认 true
+    ///
+    /// 落盘是为了让它能被项目 CLAUDE.md 引用，
+    /// 从而像 MEMORY.md 一样在每次会话自动加载 —— 这是唯一能让
+    /// 语义自动挺过对话压缩的机制。
+    #[serde(default = "default_true")]
+    pub write_file: bool,
+}
+
+fn default_budget_tokens() -> usize {
+    3000
 }
 
 // ============================================================================

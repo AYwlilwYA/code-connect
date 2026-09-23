@@ -60,7 +60,7 @@ codeconnect status   # 查看索引是否就绪
 
 ### 1.3 Claude Code 中验证
 
-在 Claude Code 中运行 `/mcp` 查看已连接的服务器列表，应能看到 `codeconnect` 及其 17 个工具。
+在 Claude Code 中运行 `/mcp` 查看已连接的服务器列表，应能看到 `codeconnect` 及其 18 个工具。
 
 ---
 
@@ -134,7 +134,7 @@ codeconnect status   # 查看索引是否就绪
 
 ## 四、可用的 MCP 工具
 
-接入成功后，AI 助手可以调用以下 17 个工具：
+接入成功后，AI 助手可以调用以下 18 个工具：
 
 | 工具名称 | 功能描述 | 关键参数 |
 |----------|----------|----------|
@@ -155,6 +155,7 @@ codeconnect status   # 查看索引是否就绪
 | `get_type_hierarchy` | 类型继承链 | `symbol_id`, `direction` |
 | `get_file_symbols` | 文件内符号列表 | `file_path` |
 | `get_dependency_graph` | 获取依赖关系图 | `level`, `file_path` |
+| `get_project_map` | 项目语义地图（压缩后重建认知） | `budget_tokens`, `focus` |
 
 ---
 
