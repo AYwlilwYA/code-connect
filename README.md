@@ -72,8 +72,11 @@ cargo build --release
 ### 添加到 PATH（可选）
 
 **Windows (CMD，管理员权限):**
+
+将 `<你的仓库路径>` 换成本地实际路径（即 `target\release` 所在位置）：
+
 ```
-setx PATH "%PATH%;F:\_other\code-connect\target\release"
+setx PATH "%PATH%;<你的仓库路径>\target\release"
 ```
 
 **Linux / macOS:**
