@@ -79,10 +79,19 @@ pub struct TraceCallersParams {
     /// 是否包含间接调用者，默认 true
     #[serde(default = "default_true")]
     pub include_indirect: bool,
+    /// 最大返回结果数，默认 50（硬上限 200）
+    ///
+    /// 超出时会截断并在响应中给出真实总数与告警，不静默丢弃。
+    #[serde(default = "default_result_limit")]
+    pub limit: usize,
 }
 
 fn default_depth_3() -> usize {
     3
+}
+
+fn default_result_limit() -> usize {
+    50
 }
 
 fn default_true() -> bool {
@@ -103,6 +112,11 @@ pub struct TraceCalleesParams {
     /// 最大追溯深度，默认 3
     #[serde(default = "default_depth_3")]
     pub max_depth: usize,
+    /// 最大返回结果数，默认 50（硬上限 200）
+    ///
+    /// 超出时会截断并在响应中给出真实总数与告警，不静默丢弃。
+    #[serde(default = "default_result_limit")]
+    pub limit: usize,
 }
 
 // ============================================================================
@@ -119,6 +133,11 @@ pub struct AnalyzeImpactParams {
     /// BFS 遍历最大深度，默认 5
     #[serde(default = "default_impact_depth")]
     pub max_depth: usize,
+    /// 最大返回结果数，默认 50（硬上限 200）
+    ///
+    /// 超出时会截断并在响应中给出真实总数与告警，不静默丢弃。
+    #[serde(default = "default_result_limit")]
+    pub limit: usize,
 }
 
 fn default_impact_depth() -> usize {
@@ -142,6 +161,11 @@ pub struct GetCallGraphParams {
     /// 被调用者方向深度，默认 2
     #[serde(default = "default_graph_depth_2")]
     pub callee_depth: usize,
+    /// 最大返回结果数，默认 50（硬上限 200）
+    ///
+    /// 超出时会截断并在响应中给出真实总数与告警，不静默丢弃。
+    #[serde(default = "default_result_limit")]
+    pub limit: usize,
 }
 
 fn default_graph_depth_2() -> usize {
@@ -166,6 +190,11 @@ pub struct GetMetricsParams {
     /// 指标类型过滤（如 complexity、fan_in、fan_out）
     #[serde(default)]
     pub metric_types: Option<Vec<String>>,
+    /// 最大返回结果数，默认 50（硬上限 200）
+    ///
+    /// 超出时会截断并在响应中给出真实总数与告警，不静默丢弃。
+    #[serde(default = "default_result_limit")]
+    pub limit: usize,
 }
 
 // ============================================================================
@@ -178,6 +207,11 @@ pub struct DetectDeadCodeParams {
     /// 入口点符号名称列表（如 main、pub 函数）
     #[serde(default)]
     pub entry_points: Option<Vec<String>>,
+    /// 最大返回结果数，默认 50（硬上限 200）
+    ///
+    /// 超出时会截断并在响应中给出真实总数与告警，不静默丢弃。
+    #[serde(default = "default_result_limit")]
+    pub limit: usize,
 }
 
 // ============================================================================
@@ -190,6 +224,11 @@ pub struct CheckArchRulesParams {
     /// 指定要检查的规则名称列表（可选，默认检查全部）
     #[serde(default)]
     pub rule_names: Option<Vec<String>>,
+    /// 最大返回结果数，默认 50（硬上限 200）
+    ///
+    /// 超出时会截断并在响应中给出真实总数与告警，不静默丢弃。
+    #[serde(default = "default_result_limit")]
+    pub limit: usize,
 }
 
 // ============================================================================
@@ -294,6 +333,11 @@ pub struct GetTypeHierarchyParams {
     /// 查询方向：ancestors（父类链）| descendants（子类链）| both（双向）
     #[serde(default = "default_direction")]
     pub direction: String,
+    /// 最大返回结果数，默认 50（硬上限 200）
+    ///
+    /// 超出时会截断并在响应中给出真实总数与告警，不静默丢弃。
+    #[serde(default = "default_result_limit")]
+    pub limit: usize,
 }
 
 fn default_direction() -> String {
@@ -327,10 +371,12 @@ pub struct GetFileSymbolsParams {
 /// 替代逐个文件重读。
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct GetProjectMapParams {
-    /// 目标 token 预算，默认 3000
+    /// 本次**响应**的目标 token 预算，默认 6000
     ///
     /// 超出预算时会自动逐级降级（省略签名 → 只留符号名 → 只留统计），
     /// 并在响应中明确标注已降级，不会静默截断。
+    /// **只约束响应**：落盘的 PROJECT_MAP.md 始终是全量，
+    /// 需要细节时直接读取该文件即可。
     #[serde(default = "default_budget_tokens")]
     pub budget_tokens: usize,
     /// 只关注某个子目录（相对项目根目录的路径前缀，如 `crates/index`）
@@ -346,7 +392,7 @@ pub struct GetProjectMapParams {
 }
 
 fn default_budget_tokens() -> usize {
-    3000
+    6000
 }
 
 // ============================================================================
@@ -364,6 +410,11 @@ pub struct GetDependencyGraphParams {
     /// 指定文件路径（可选，不提供则返回完整图）
     #[serde(default)]
     pub file_path: Option<String>,
+    /// 最大返回结果数，默认 50（硬上限 200）
+    ///
+    /// 超出时会截断并在响应中给出真实总数与告警，不静默丢弃。
+    #[serde(default = "default_result_limit")]
+    pub limit: usize,
 }
 
 fn default_dep_level() -> String {
@@ -398,9 +449,11 @@ mod tests {
             symbol_id: "test_id".to_string(),
             max_depth: default_depth_3(),
             include_indirect: true,
+            limit: default_result_limit(),
         };
         assert_eq!(params.max_depth, 3);
         assert!(params.include_indirect);
+        assert_eq!(params.limit, 50);
     }
 
     #[test]
@@ -408,8 +461,10 @@ mod tests {
         let params = AnalyzeImpactParams {
             symbol_ids: vec!["s1".to_string()],
             max_depth: 5,
+            limit: default_result_limit(),
         };
         assert_eq!(params.max_depth, 5);
         assert_eq!(params.symbol_ids.len(), 1);
+        assert_eq!(params.limit, 50);
     }
 }

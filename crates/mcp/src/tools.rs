@@ -259,6 +259,29 @@ fn brief_symbol_json(r: &codeconnect_index::tantivy_index::SymbolSearchResult) -
     })
 }
 
+/// 单次响应中列表类结果的数量硬上限
+const MAX_RESULT_LIMIT: usize = 200;
+
+/// 截断结果列表，返回（保留的条数, 真实总数）
+///
+/// 保留**真实总数**是为了让调用方知道「还有多少没拿到」——
+/// 只回截断后的数量会让它以为这就是全部。
+fn clip<T>(items: &[T], limit: usize) -> (usize, usize) {
+    let total = items.len();
+    let shown = total.min(limit.min(MAX_RESULT_LIMIT));
+    (shown, total)
+}
+
+/// 生成截断告警文案；未截断时返回 None（不制造噪音）
+fn truncation_warning(shown: usize, total: usize, what: &str) -> Option<String> {
+    (total > shown).then(|| {
+        format!(
+            "{}共 {} 条，本次仅返回前 {} 条（已截断）。需要更多请调大 limit（上限 {}），或缩小查询范围。",
+            what, total, shown, MAX_RESULT_LIMIT
+        )
+    })
+}
+
 /// 按字符数截断字符串（按字符而非字节，避免切断多字节字符）
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -580,7 +603,10 @@ pub fn handle_trace_callers(
         Err(resp) => return resp,
     };
 
-    let callers = call_graph.trace_callers(&target.name, params.max_depth);
+    let all_callers = call_graph.trace_callers(&target.name, params.max_depth);
+    // 热点函数可能有数千个调用者，必须截断后再返回
+    let (shown, total_callers) = clip(&all_callers, params.limit);
+    let callers = &all_callers[..shown];
 
     // 构建 JSON 响应
     let result = serde_json::json!({
@@ -596,12 +622,17 @@ pub fn handle_trace_callers(
                 "call_type": n.call_type,
             })
         }).collect::<Vec<_>>(),
-        "total_callers": callers.len(),
+        "total_callers": total_callers,
+        "returned_callers": shown,
+        "truncated": total_callers > shown,
     });
 
-    let total = callers.len();
     let elapsed = start.elapsed().as_millis() as u64;
-    McpResponse::success(result, total, total, elapsed)
+    let mut response = McpResponse::success(result, total_callers, shown, elapsed);
+    if let Some(w) = truncation_warning(shown, total_callers, "调用者") {
+        response = response.with_warning(w);
+    }
+    response
 }
 
 /// 追溯被调用者 handler
@@ -637,7 +668,9 @@ pub fn handle_trace_callees(
         Err(resp) => return resp,
     };
 
-    let callees = call_graph.trace_callees(&source.name, params.max_depth);
+    let all_callees = call_graph.trace_callees(&source.name, params.max_depth);
+    let (shown, total_callees) = clip(&all_callees, params.limit);
+    let callees = &all_callees[..shown];
 
     let result = serde_json::json!({
         "source": {
@@ -652,12 +685,17 @@ pub fn handle_trace_callees(
                 "call_type": n.call_type,
             })
         }).collect::<Vec<_>>(),
-        "total_callees": callees.len(),
+        "total_callees": total_callees,
+        "returned_callees": shown,
+        "truncated": total_callees > shown,
     });
 
-    let total = callees.len();
     let elapsed = start.elapsed().as_millis() as u64;
-    McpResponse::success(result, total, total, elapsed)
+    let mut response = McpResponse::success(result, total_callees, shown, elapsed);
+    if let Some(w) = truncation_warning(shown, total_callees, "被调用者") {
+        response = response.with_warning(w);
+    }
+    response
 }
 
 /// 变更影响分析 handler
@@ -722,6 +760,13 @@ pub fn handle_analyze_impact(
         })
     }).collect();
 
+    // 影响面可能很大，两个列表都要截断
+    let total_affected = report.total_affected();
+    let (shown_direct, _) = clip(&direct_impacts, params.limit / 2 + 1);
+    let (shown_trans, total_trans) = clip(&transitive_impacts, params.limit / 2);
+    let shown_total = shown_direct + shown_trans;
+    let total_all = direct_impacts.len() + total_trans;
+
     let result = serde_json::json!({
         "changed_symbols": params.symbol_ids.iter().enumerate().map(|(i, sid)| {
             serde_json::json!({
@@ -729,14 +774,20 @@ pub fn handle_analyze_impact(
                 "name": symbol_names.get(i).unwrap_or(sid),
             })
         }).collect::<Vec<_>>(),
-        "direct_impacts": direct_impacts,
-        "transitive_impacts": transitive_impacts,
-        "total_affected": report.total_affected(),
+        "direct_impacts": direct_impacts[..shown_direct],
+        "transitive_impacts": transitive_impacts[..shown_trans],
+        "total_affected": total_affected,
+        "returned_impacts": shown_total,
+        "truncated": total_all > shown_total,
         "max_depth": params.max_depth,
     });
 
     let elapsed = start.elapsed().as_millis() as u64;
-    McpResponse::success(result, 1, 1, elapsed)
+    let mut response = McpResponse::success(result, total_affected, shown_total, elapsed);
+    if let Some(w) = truncation_warning(shown_total, total_all, "受影响符号") {
+        response = response.with_warning(w);
+    }
+    response
 }
 
 /// 获取调用子图 handler
@@ -770,15 +821,21 @@ pub fn handle_get_call_graph(
         Err(resp) => return resp,
     };
 
-    let callers = call_graph.trace_callers(&center.name, params.caller_depth);
-    let callees = call_graph.trace_callees(&center.name, params.callee_depth);
+    let all_callers = call_graph.trace_callers(&center.name, params.caller_depth);
+    let all_callees = call_graph.trace_callees(&center.name, params.callee_depth);
+
+    // 两个方向各分一半配额
+    let (shown_callers, total_callers) = clip(&all_callers, params.limit / 2);
+    let (shown_callees, total_callees) = clip(&all_callees, params.limit / 2 + 1);
+    let shown_total = shown_callers + shown_callees;
+    let total_all = total_callers + total_callees;
 
     let result = serde_json::json!({
         "center": {
             "symbol_id": center.id,
             "name": center.name,
         },
-        "callers": callers.iter().map(|n| {
+        "callers": all_callers[..shown_callers].iter().map(|n| {
             serde_json::json!({
                 "symbol_id": n.symbol_id,
                 "name": n.name,
@@ -786,7 +843,7 @@ pub fn handle_get_call_graph(
                 "call_type": n.call_type,
             })
         }).collect::<Vec<_>>(),
-        "callees": callees.iter().map(|n| {
+        "callees": all_callees[..shown_callees].iter().map(|n| {
             serde_json::json!({
                 "symbol_id": n.symbol_id,
                 "name": n.name,
@@ -794,12 +851,17 @@ pub fn handle_get_call_graph(
                 "call_type": n.call_type,
             })
         }).collect::<Vec<_>>(),
-        "total_nodes": callers.len() + callees.len() + 1,
+        "total_nodes": total_all + 1,
+        "returned_nodes": shown_total + 1,
+        "truncated": total_all > shown_total,
     });
 
-    let total = callers.len() + callees.len();
     let elapsed = start.elapsed().as_millis() as u64;
-    McpResponse::success(result, total, total, elapsed)
+    let mut response = McpResponse::success(result, total_all, shown_total, elapsed);
+    if let Some(w) = truncation_warning(shown_total, total_all, "调用子图节点") {
+        response = response.with_warning(w);
+    }
+    response
 }
 
 /// 获取代码质量指标 handler
@@ -849,10 +911,13 @@ pub fn handle_get_metrics(
             None,
         );
 
+        // 一个文件可能有几百个符号，指标列表必须截断
+        let (shown_metrics, total_metrics) = clip(&metrics, params.limit);
+
         let result = serde_json::json!({
             "file_path": file_path,
             "symbol_count": symbols.len(),
-            "metrics": metrics.iter().map(|m| {
+            "metrics": metrics[..shown_metrics].iter().map(|m| {
                 serde_json::json!({
                     "symbol_id": m.symbol_id,
                     "name": m.name,
@@ -862,11 +927,16 @@ pub fn handle_get_metrics(
                     "depth_of_inheritance": m.depth_of_inheritance,
                 })
             }).collect::<Vec<_>>(),
+            "returned_metrics": shown_metrics,
+            "truncated": total_metrics > shown_metrics,
         });
 
-        let total = metrics.len();
         let elapsed = start.elapsed().as_millis() as u64;
-        return McpResponse::success(result, total, total, elapsed);
+        let mut response = McpResponse::success(result, total_metrics, shown_metrics, elapsed);
+        if let Some(w) = truncation_warning(shown_metrics, total_metrics, "文件内符号指标") {
+            response = response.with_warning(w);
+        }
+        return response;
     }
 
     // 如果指定了单个符号（ID 或名称）
@@ -953,11 +1023,14 @@ pub fn handle_detect_dead_code(
         &entry_points,
     );
 
+    // 大型项目的死代码可能有几千条，必须截断
+    let (shown_dead, total_dead) = clip(&dead_entries, params.limit);
+
     let result = serde_json::json!({
         "entry_points": entry_points,
         "total_symbols": all_symbols.len(),
-        "dead_code_count": dead_entries.len(),
-        "dead_entries": dead_entries.iter().map(|d| {
+        "dead_code_count": total_dead,
+        "dead_entries": dead_entries[..shown_dead].iter().map(|d| {
             serde_json::json!({
                 "symbol_id": d.symbol_id,
                 "name": d.name,
@@ -965,11 +1038,16 @@ pub fn handle_detect_dead_code(
                 "reason": d.reason,
             })
         }).collect::<Vec<_>>(),
+        "returned_entries": shown_dead,
+        "truncated": total_dead > shown_dead,
     });
 
-    let total = dead_entries.len();
     let elapsed = start.elapsed().as_millis() as u64;
-    McpResponse::success(result, total, total, elapsed)
+    let mut response = McpResponse::success(result, total_dead, shown_dead, elapsed);
+    if let Some(w) = truncation_warning(shown_dead, total_dead, "死代码条目") {
+        response = response.with_warning(w);
+    }
+    response
 }
 
 /// 架构规则验证 handler
@@ -1376,22 +1454,33 @@ pub fn handle_get_type_hierarchy(
             .collect();
     }
 
+    // 继承链两个方向都要截断（深层继承树可能很长）
+    let (shown_anc, total_anc) = clip(&ancestors, params.limit / 2);
+    let (shown_desc, total_desc) = clip(&descendants, params.limit / 2 + 1);
+    let shown_total = shown_anc + shown_desc;
+    let total_all = total_anc + total_desc;
+
     let result = serde_json::json!({
         "target": {
             "symbol_id": target.id,
             "name": symbol_name,
         },
-        "ancestors": ancestors,
-        "descendants": descendants,
+        "ancestors": ancestors[..shown_anc],
+        "descendants": descendants[..shown_desc],
+        "returned_types": shown_total,
+        "truncated": total_all > shown_total,
         "graph_stats": {
             "total_types": type_hierarchy.node_count(),
             "total_edges": type_hierarchy.edge_count(),
         },
     });
 
-    let total = ancestors.len() + descendants.len();
     let elapsed = start.elapsed().as_millis() as u64;
-    McpResponse::success(result, total, total, elapsed)
+    let mut response = McpResponse::success(result, total_all, shown_total, elapsed);
+    if let Some(w) = truncation_warning(shown_total, total_all, "继承链节点") {
+        response = response.with_warning(w);
+    }
+    response
 }
 
 /// 获取文件内所有符号 handler
@@ -1583,7 +1672,7 @@ pub fn handle_get_project_map(
         MapLevel::Counts,
         MapLevel::Summary,
     ] {
-        let candidate = render_project_map(&scoped, &all, level, focus.as_deref(), registry);
+        let candidate = render_project_map(&scoped, &all, level, focus.as_deref(), registry, false);
         if estimate_tokens(&candidate) <= budget {
             selected = Some((level, candidate));
             break;
@@ -1595,7 +1684,7 @@ pub fn handle_get_project_map(
         // 连最简形式都超预算：仍然返回它，但必须让调用方知道
         None => (
             MapLevel::Summary,
-            render_project_map(&scoped, &all, MapLevel::Summary, focus.as_deref(), registry),
+            render_project_map(&scoped, &all, MapLevel::Summary, focus.as_deref(), registry, false),
             true,
         ),
     };
@@ -1608,15 +1697,29 @@ pub fn handle_get_project_map(
         .collect::<std::collections::HashSet<_>>()
         .len();
 
-    // 落盘：让地图能被 CLAUDE.md 引用，从而每次会话自动加载
+    // 落盘写**全量**地图：不受预算降级影响、不设每文件符号数上限。
+    // 响应受预算约束是为了省上下文，但文件是持久记录 ——
+    // 需要细节时让 AI 直接 Read/Grep 该文件，而不是把全量塞进响应。
     let mut written_to: Option<String> = None;
     let mut write_error: Option<String> = None;
+    let mut file_meta: Option<(usize, usize)> = None; // (字节数, 行数)
     if params.write_file {
         match registry.data_dir.as_ref() {
             Some(data_dir) => {
+                let full_map = render_project_map(
+                    &scoped,
+                    &all,
+                    MapLevel::Detailed,
+                    focus.as_deref(),
+                    registry,
+                    true,
+                );
                 let path = data_dir.join("PROJECT_MAP.md");
-                match std::fs::write(&path, &map) {
-                    Ok(()) => written_to = Some(path.display().to_string()),
+                match std::fs::write(&path, &full_map) {
+                    Ok(()) => {
+                        file_meta = Some((full_map.len(), full_map.lines().count()));
+                        written_to = Some(path.display().to_string());
+                    }
                     Err(e) => write_error = Some(format!("写入 {} 失败: {}", path.display(), e)),
                 }
             }
@@ -1626,12 +1729,15 @@ pub fn handle_get_project_map(
 
     let data = serde_json::json!({
         "map": map,
-        "written_to": written_to,
-        "scope": focus.clone().unwrap_or_else(|| "全项目".to_string()),
-        "level": level.name(),
-        "degraded": degraded,
+        "response_level": level.name(),
+        "response_degraded": degraded,
+        "response_estimated_tokens": estimated,
         "budget_tokens": budget,
-        "estimated_tokens": estimated,
+        "written_to": written_to,
+        "file_bytes": file_meta.map(|(bytes, _)| bytes),
+        "file_lines": file_meta.map(|(_, lines)| lines),
+        "file_is_complete": file_meta.is_some(),
+        "scope": focus.clone().unwrap_or_else(|| "全项目".to_string()),
         "total_symbols": all.len(),
         "scoped_symbols": scoped.len(),
         "scoped_files": scoped_files,
@@ -1641,16 +1747,28 @@ pub fn handle_get_project_map(
     let elapsed = start.elapsed().as_millis() as u64;
     let mut response = McpResponse::success(data, total, total, elapsed);
 
+    // 降级只影响「本次响应」，落盘文件始终是全量 —— 说明清楚，
+    // 否则调用方会以为细节永久丢失了
+    let file_note = match (&written_to, &write_error) {
+        (Some(path), _) => format!(
+            "本次响应仅为摘要；全量地图（含全部符号）已写入 {}，需要细节请直接读取该文件。",
+            path
+        ),
+        (None, Some(err)) => format!("注意：全量地图未能落盘（{}），本次响应即为全部内容。", err),
+        (None, None) => "注意：本次未落盘（write_file=false），本次响应即为全部内容。".to_string(),
+    };
+
     if over_budget {
         response = response.with_warning(format!(
-            "项目地图已降到最简形式，仍超出 {} token 预算（约 {} token）。请改用 focus 缩小范围，或调大 budget_tokens。",
-            budget, estimated
+            "项目地图已降到最简形式，仍超出 {} token 预算（约 {} token）。请改用 focus 缩小范围，或调大 budget_tokens。{}",
+            budget, estimated, file_note
         ));
     } else if degraded {
         response = response.with_warning(format!(
-            "为适配 {} token 预算，地图已降级为 '{}' 层级（省略了部分细节）。需要更细的信息请调大 budget_tokens 或用 focus 聚焦。",
+            "为适配 {} token 预算，本次响应已降级为 '{}' 层级（省略了部分细节）。{}",
             budget,
-            level.name()
+            level.name(),
+            file_note
         ));
     }
 
@@ -1669,15 +1787,23 @@ pub fn handle_get_project_map(
 }
 
 /// 渲染项目地图文本
+///
+/// `full` 为真时用于**落盘**：不受预算降级影响、不设每文件符号数上限，
+/// 保留全部符号 —— 该文件是持久记录，供后续 Read/Grep 当作项目索引使用。
+/// 为假时用于**响应**：按传入层级渲染，受每文件条数上限约束。
 fn render_project_map(
     scoped: &[&codeconnect_index::tantivy_index::SymbolSearchResult],
     all: &[codeconnect_index::tantivy_index::SymbolSearchResult],
     level: MapLevel,
     focus: Option<&str>,
     registry: &ToolRegistry,
+    full: bool,
 ) -> String {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fmt::Write as _;
+
+    // 落盘走最高详细度，且下面把每文件上限放开
+    let level = if full { MapLevel::Detailed } else { level };
 
     let mut out = String::new();
 
@@ -1808,9 +1934,14 @@ fn render_project_map(
                     continue;
                 }
 
-                let cap = match level {
-                    MapLevel::Detailed => 40,
-                    _ => 25,
+                // 落盘时不设每文件上限，列出该文件全部符号
+                let cap = if full {
+                    usize::MAX
+                } else {
+                    match level {
+                        MapLevel::Detailed => 40,
+                        _ => 25,
+                    }
                 };
                 for s in sorted.iter().take(cap) {
                     if level == MapLevel::Detailed {
@@ -1910,16 +2041,20 @@ pub fn handle_get_dependency_graph(
         (nodes, edges)
     };
 
+    // 完整依赖图的节点与边都可能上万，两个列表都要截断
+    let (shown_nodes, total_nodes) = clip(&filtered_nodes, params.limit / 2);
+    let (shown_edges, total_edges) = clip(&filtered_edges, params.limit / 2 + 1);
+
     let result = serde_json::json!({
         "level": params.level,
-        "nodes": filtered_nodes.iter().map(|n| {
+        "nodes": filtered_nodes[..shown_nodes].iter().map(|n| {
             serde_json::json!({
                 "id": n.id,
                 "name": n.name,
                 "kind": format!("{:?}", n.kind),
             })
         }).collect::<Vec<_>>(),
-        "edges": filtered_edges.iter().map(|(src, tgt, edge)| {
+        "edges": filtered_edges[..shown_edges].iter().map(|(src, tgt, edge)| {
             serde_json::json!({
                 "source": src.id,
                 "target": tgt.id,
@@ -1927,13 +2062,19 @@ pub fn handle_get_dependency_graph(
                 "count": edge.count,
             })
         }).collect::<Vec<_>>(),
-        "total_nodes": filtered_nodes.len(),
-        "total_edges": filtered_edges.len(),
+        "total_nodes": total_nodes,
+        "total_edges": total_edges,
+        "returned_nodes": shown_nodes,
+        "returned_edges": shown_edges,
+        "truncated": total_nodes > shown_nodes || total_edges > shown_edges,
     });
 
-    let total = filtered_nodes.len();
     let elapsed = start.elapsed().as_millis() as u64;
-    McpResponse::success(result, total, total, elapsed)
+    let mut response = McpResponse::success(result, total_nodes, shown_nodes, elapsed);
+    if let Some(w) = truncation_warning(shown_nodes + shown_edges, total_nodes + total_edges, "依赖图节点与边") {
+        response = response.with_warning(w);
+    }
+    response
 }
 
 // ============================================================================
