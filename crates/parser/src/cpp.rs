@@ -6,6 +6,7 @@
 //!
 //! C++ grammar 与 C grammar 共享大量节点类型，因此复用 queries/c/ 下的 query 文件。
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -14,7 +15,7 @@ use codeconnect_core::symbol_id::StableSymbolId;
 use codeconnect_core::types::{
     CallSite, CallType, Import, ImportResolution, SourceLocation, Symbol, SymbolKind,
 };
-use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
+use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
 use crate::query_loader::load_cpp_queries;
 use crate::r#trait::LanguageParser;
@@ -62,6 +63,182 @@ impl CppParser {
     fn node_text<'a>(&self, node: tree_sitter::Node, source: &'a str) -> &'a str {
         node.utf8_text(source.as_bytes()).unwrap_or("")
     }
+
+    /// 从 declarator 链解析出函数名节点，非函数返回 None
+    ///
+    /// 指针/引用返回类型会把 function_declarator 包在
+    /// pointer_declarator / reference_declarator / parenthesized_declarator 里，
+    /// 需要逐层下探；链上没有 function_declarator（数据成员、函数指针变量）则不是函数。
+    fn resolve_declarator_name(node: Node) -> Option<Node> {
+        let mut cur = node;
+        for _ in 0..8 {
+            match cur.kind() {
+                "pointer_declarator" | "reference_declarator" | "parenthesized_declarator" => {
+                    cur = Self::declarator_child(cur)?;
+                }
+                "function_declarator" => {
+                    let inner = Self::declarator_child(cur)?;
+                    return match inner.kind() {
+                        "identifier" | "field_identifier" | "destructor_name" | "operator_name" => {
+                            Some(inner)
+                        }
+                        // Shape::area / Box<T>::get
+                        "qualified_identifier" | "template_function" => {
+                            inner.child_by_field_name("name")
+                        }
+                        _ => None,
+                    };
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// 取 declarator 链上的下一层节点
+    ///
+    /// 注意 grammar 差异：pointer_declarator 的子节点带 declarator 字段，
+    /// reference_declarator（`int& f()`）的子节点**没有**该字段，只能按 kind 找。
+    fn declarator_child(node: Node) -> Option<Node> {
+        if let Some(c) = node.child_by_field_name("declarator") {
+            return Some(c);
+        }
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|c| Self::is_declarator_node(c.kind()))
+    }
+
+    /// 是否为 declarator 链上的节点类型
+    fn is_declarator_node(kind: &str) -> bool {
+        matches!(
+            kind,
+            "identifier"
+                | "field_identifier"
+                | "destructor_name"
+                | "operator_name"
+                | "function_declarator"
+                | "qualified_identifier"
+                | "template_function"
+                | "pointer_declarator"
+                | "reference_declarator"
+                | "parenthesized_declarator"
+        )
+    }
+
+    /// 判断节点是否位于类/结构体体内（用于区分 Method 与 Function）
+    fn is_class_member(node: Node) -> bool {
+        let mut cur = node.parent();
+        for _ in 0..6 {
+            let p = match cur {
+                Some(p) => p,
+                None => return false,
+            };
+            match p.kind() {
+                "field_declaration_list" => return true,
+                "translation_unit" | "namespace_definition" | "declaration_list"
+                | "function_definition" | "compound_statement" => return false,
+                _ => cur = p.parent(),
+            }
+        }
+        false
+    }
+
+    /// 判断节点是否位于 template_declaration 内
+    fn has_template_ancestor(node: Node) -> bool {
+        let mut cur = node.parent();
+        for _ in 0..6 {
+            let p = match cur {
+                Some(p) => p,
+                None => return false,
+            };
+            match p.kind() {
+                "template_declaration" => return true,
+                "translation_unit" | "namespace_definition" | "declaration_list"
+                | "compound_statement" => return false,
+                _ => cur = p.parent(),
+            }
+        }
+        false
+    }
+
+    /// 判定函数类符号是方法还是自由函数
+    fn classify_function(name_node: Node, stmt: Node) -> SymbolKind {
+        let is_method = matches!(name_node.kind(), "field_identifier" | "destructor_name")
+            // 类外限定名定义：Shape::area
+            || name_node
+                .parent()
+                .map(|p| p.kind() == "qualified_identifier")
+                .unwrap_or(false)
+            // 类内声明：构造函数 Shape(); 无返回类型，declarator 是裸 identifier
+            || Self::is_class_member(stmt);
+        if is_method {
+            SymbolKind::Method
+        } else {
+            SymbolKind::Function
+        }
+    }
+
+    /// 组装符号对象
+    fn build_symbol(
+        &self,
+        id: String,
+        name: String,
+        kind: SymbolKind,
+        location: SourceLocation,
+        is_template: bool,
+    ) -> Symbol {
+        // C++ 中函数、类、结构体、枚举、命名空间在命名空间层级都是可见的
+        let is_exported = matches!(
+            kind,
+            SymbolKind::Function
+                | SymbolKind::Method
+                | SymbolKind::Class
+                | SymbolKind::Struct
+                | SymbolKind::Module
+                | SymbolKind::Enum
+                | SymbolKind::TypeAlias
+                | SymbolKind::Macro
+        );
+
+        let mut modifiers = if is_exported {
+            vec!["extern".to_string()]
+        } else {
+            vec!["static".to_string()]
+        };
+        if is_template {
+            modifiers.push("template".to_string());
+        }
+
+        Symbol {
+            id,
+            name,
+            kind,
+            location,
+            signature: None,
+            doc_comment: None,
+            parent_id: None,
+            modifiers,
+            is_exported,
+            complexity: None,
+        }
+    }
+
+    /// 同一符号多次出现时的取舍权重：定义(3) > 类内声明(2) > 前置声明(1)
+    fn definition_rank(node: Node) -> u8 {
+        match node.kind() {
+            "function_definition" => 3,
+            "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier" => {
+                if node.child_by_field_name("body").is_some() {
+                    3
+                } else {
+                    1
+                }
+            }
+            "field_declaration" => 2,
+            "declaration" => 1,
+            _ => 2,
+        }
+    }
 }
 
 impl Default for CppParser {
@@ -95,7 +272,7 @@ impl LanguageParser for CppParser {
     fn extract_symbols(&self, tree: &Tree, source: &str, file_path: &Path) -> Vec<Symbol> {
         let queries = load_cpp_queries();
         let file_path_str = file_path.to_string_lossy().to_string();
-        let mut results = Vec::new();
+        let mut results: Vec<Symbol> = Vec::new();
 
         let query = match Query::new(&self.language, &queries.symbols) {
             Ok(q) => q,
@@ -105,9 +282,8 @@ impl LanguageParser for CppParser {
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
 
-        // 用于追踪已处理的类/结构体（避免重复）
-        use std::collections::HashSet;
-        let mut seen_ids: HashSet<String> = HashSet::new();
+        // 符号 ID → (results 下标, 取舍权重)：声明与定义同名同类时只保留更完整的一个
+        let mut seen: HashMap<String, (usize, u8)> = HashMap::new();
 
         while let Some(m) = matches.next() {
             let mut name = String::new();
@@ -119,6 +295,10 @@ impl LanguageParser for CppParser {
                 end_line: 0,
                 end_column: 0,
             };
+            // 函数类模式：名称与 Method/Function 需要解析 declarator 决定
+            let mut declarator: Option<Node> = None;
+            // 符号所在的语句节点，用于判断类成员位置与模板祖先
+            let mut stmt: Option<Node> = None;
 
             for capture in m.captures {
                 let node = capture.node;
@@ -128,32 +308,64 @@ impl LanguageParser for CppParser {
                     "name" => {
                         name = self.node_text(node, source).to_string();
                     }
-                    "func" => {
-                        kind = SymbolKind::Function;
+                    "declarator" => {
+                        declarator = Some(node);
+                    }
+                    "class" => {
+                        kind = SymbolKind::Class;
                         location = self.node_to_location(node, &file_path_str);
+                        stmt = Some(node);
                     }
                     "struct" => {
                         kind = SymbolKind::Struct;
                         location = self.node_to_location(node, &file_path_str);
+                        stmt = Some(node);
                     }
                     "union" => {
                         // SymbolKind 中没有 Union 变体，union 映射为 Struct
                         kind = SymbolKind::Struct;
                         location = self.node_to_location(node, &file_path_str);
+                        stmt = Some(node);
                     }
                     "enum" => {
                         kind = SymbolKind::Enum;
                         location = self.node_to_location(node, &file_path_str);
+                        stmt = Some(node);
+                    }
+                    "namespace" => {
+                        kind = SymbolKind::Module;
+                        location = self.node_to_location(node, &file_path_str);
+                        stmt = Some(node);
                     }
                     "macro" => {
                         kind = SymbolKind::Macro;
                         location = self.node_to_location(node, &file_path_str);
+                        stmt = Some(node);
                     }
                     "type_definition" => {
                         kind = SymbolKind::TypeAlias;
                         location = self.node_to_location(node, &file_path_str);
+                        stmt = Some(node);
+                    }
+                    "func" | "method" | "declaration" => {
+                        location = self.node_to_location(node, &file_path_str);
+                        stmt = Some(node);
                     }
                     _ => {}
+                }
+            }
+
+            if let Some(decl) = declarator {
+                match Self::resolve_declarator_name(decl) {
+                    Some(name_node) => {
+                        name = self.node_text(name_node, source).to_string();
+                        kind = match stmt {
+                            Some(s) => Self::classify_function(name_node, s),
+                            None => SymbolKind::Function,
+                        };
+                    }
+                    // 不是函数（数据成员、函数指针变量等）
+                    None => continue,
                 }
             }
 
@@ -163,48 +375,46 @@ impl LanguageParser for CppParser {
 
             let kind_str = match &kind {
                 SymbolKind::Function => "function",
+                SymbolKind::Method => "method",
+                SymbolKind::Class => "class",
                 SymbolKind::Struct => "struct",
                 SymbolKind::Enum => "enum",
+                SymbolKind::Module => "module",
                 SymbolKind::Macro => "macro",
                 SymbolKind::TypeAlias => "type_alias",
                 _ => "unknown",
             };
 
             let id = StableSymbolId::new("cpp", &file_path_str, kind_str, &name);
+            let id_str = id.to_string();
+            let rank = stmt.map(Self::definition_rank).unwrap_or(2);
 
-            // 去重：C++ 中 class/struct 可能被 query 重复捕获
-            if !seen_ids.insert(id.to_string()) {
+            // 去重：同名同类符号（声明+定义、类内声明+类外定义）只产出一份
+            if let Some(&(idx, old_rank)) = seen.get(&id_str) {
+                if rank <= old_rank {
+                    continue;
+                }
+                results[idx] = self.build_symbol(
+                    id_str.clone(),
+                    name,
+                    kind,
+                    location,
+                    stmt.map(Self::has_template_ancestor).unwrap_or(false),
+                );
+                seen.insert(id_str, (idx, rank));
                 continue;
             }
 
-            // C++ 中函数、类、结构体、枚举默认都是全局可见的
-            let is_exported = matches!(
-                kind,
-                SymbolKind::Function
-                    | SymbolKind::Struct
-                    | SymbolKind::Enum
-                    | SymbolKind::TypeAlias
-                    | SymbolKind::Macro
-            );
 
-            let modifiers = if is_exported {
-                vec!["extern".to_string()]
-            } else {
-                vec!["static".to_string()]
-            };
-
-            results.push(Symbol {
-                id: id.to_string(),
+            let symbol = self.build_symbol(
+                id_str.clone(),
                 name,
                 kind,
                 location,
-                signature: None,
-                doc_comment: None,
-                parent_id: None,
-                modifiers,
-                is_exported,
-                complexity: None,
-            });
+                stmt.map(Self::has_template_ancestor).unwrap_or(false),
+            );
+            seen.insert(id_str, (results.len(), rank));
+            results.push(symbol);
         }
 
         results
@@ -374,6 +584,219 @@ mod tests {
         let parser = CppParser::new();
         let tree = parser.parse(source).expect("解析测试源码失败");
         (tree, parser)
+    }
+
+    /// 提取符号
+    fn symbols_of(source: &str) -> Vec<Symbol> {
+        let (tree, parser) = parse_source(source);
+        parser.extract_symbols(&tree, source, Path::new("test.cpp"))
+    }
+
+    /// 某名称 + 类型的符号个数
+    fn count_of(symbols: &[Symbol], name: &str, kind: SymbolKind) -> usize {
+        symbols
+            .iter()
+            .filter(|s| s.name == name && s.kind == kind)
+            .count()
+    }
+
+    /// 查找符号
+    fn find<'a>(symbols: &'a [Symbol], name: &str) -> &'a Symbol {
+        symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("未找到符号 {}，实得: {:?}", name, names(symbols)))
+    }
+
+    fn names(symbols: &[Symbol]) -> Vec<(String, String)> {
+        symbols
+            .iter()
+            .map(|s| (s.name.clone(), format!("{:?}", s.kind)))
+            .collect()
+    }
+
+    #[test]
+    fn test_parse_class_namespace_ctor_dtor() {
+        let source = "namespace geom {\nclass Shape {\npublic:\n    Shape();\n    virtual ~Shape();\n    virtual double area() const = 0;\n};\n}\n";
+        let symbols = symbols_of(source);
+
+        assert_eq!(find(&symbols, "geom").kind, SymbolKind::Module);
+        assert_eq!(find(&symbols, "geom").location.line, 1);
+        assert_eq!(find(&symbols, "Shape").kind, SymbolKind::Class);
+        assert_eq!(find(&symbols, "Shape").location.line, 2);
+
+        // 构造函数归类为 Method
+        assert_eq!(count_of(&symbols, "Shape", SymbolKind::Method), 1);
+        assert_eq!(find(&symbols, "Shape").kind, SymbolKind::Class);
+        assert_eq!(count_of(&symbols, "~Shape", SymbolKind::Method), 1);
+        assert_eq!(count_of(&symbols, "area", SymbolKind::Method), 1);
+        assert_eq!(find(&symbols, "area").location.line, 6);
+    }
+
+    #[test]
+    fn test_parse_namespace_nested_name() {
+        let symbols = symbols_of("namespace outer::inner {\nvoid fn();\n}\n");
+        assert_eq!(count_of(&symbols, "outer::inner", SymbolKind::Module), 1);
+        assert_eq!(find(&symbols, "fn").kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_parse_qualified_out_of_class_definition() {
+        let source =
+            "class Shape {\npublic:\n    double area() const;\n};\ndouble Shape::area() const { return 1.0; }\n";
+        let symbols = symbols_of(source);
+
+        // 类内声明 + 类外定义 → 只产出一份，位置取定义处
+        assert_eq!(count_of(&symbols, "area", SymbolKind::Method), 1);
+        assert_eq!(find(&symbols, "area").location.line, 5);
+        assert_eq!(count_of(&symbols, "Shape", SymbolKind::Class), 1);
+    }
+
+    #[test]
+    fn test_parse_in_class_definition_not_duplicated() {
+        let source = "class Shape {\npublic:\n    double scaled(double f) const { return f; }\n};\n";
+        let symbols = symbols_of(source);
+        assert_eq!(count_of(&symbols, "scaled", SymbolKind::Method), 1);
+        assert_eq!(find(&symbols, "scaled").location.line, 3);
+        assert_eq!(symbols.len(), 2, "应只有类与类内方法: {:?}", names(&symbols));
+    }
+
+    #[test]
+    fn test_parse_virtual_override_not_duplicated() {
+        let source = "class Shape {\npublic:\n    virtual double area() const = 0;\n};\nclass Circle : public Shape {\npublic:\n    double area() const override;\n};\ndouble Circle::area() const { return 1.0; }\n";
+        let symbols = symbols_of(source);
+
+        // 基类纯虚 + 派生覆写 + 类外定义：同名同类只产出一份
+        assert_eq!(count_of(&symbols, "area", SymbolKind::Method), 1);
+        assert_eq!(find(&symbols, "area").location.line, 9);
+        assert_eq!(count_of(&symbols, "Shape", SymbolKind::Class), 1);
+        assert_eq!(count_of(&symbols, "Circle", SymbolKind::Class), 1);
+    }
+
+    #[test]
+    fn test_parse_template_symbols_not_duplicated() {
+        let source = "template <typename T>\nclass Box {\npublic:\n    T get() const;\n    T value() const { return raw_; }\nprivate:\n    T raw_;\n};\n\ntemplate <typename T>\nT Box<T>::get() const { return raw_; }\n";
+        let symbols = symbols_of(source);
+
+        assert_eq!(count_of(&symbols, "Box", SymbolKind::Class), 1);
+        assert_eq!(count_of(&symbols, "get", SymbolKind::Method), 1);
+        assert_eq!(count_of(&symbols, "value", SymbolKind::Method), 1);
+        assert!(
+            symbols.iter().all(|s| s.name != "raw_"),
+            "数据成员不应产出符号: {:?}",
+            names(&symbols)
+        );
+
+        // 模板类与模板方法带 template 修饰符
+        assert!(find(&symbols, "Box").modifiers.contains(&"template".to_string()));
+        assert!(find(&symbols, "get").modifiers.contains(&"template".to_string()));
+    }
+
+    #[test]
+    fn test_parse_no_duplicate_symbol_names() {
+        // 综合场景：任意 (名称, 类型) 组合都不得重复
+        let source = concat!(
+            "namespace geom {\n",
+            "class Shape {\n",
+            "public:\n",
+            "    Shape();\n",
+            "    virtual ~Shape();\n",
+            "    virtual double area() const = 0;\n",
+            "    double scaled(double f) const { return area() * f; }\n",
+            "    double scaled_out(double f) const;\n",
+            "};\n",
+            "Shape::Shape() {}\n",
+            "Shape::~Shape() {}\n",
+            "double Shape::scaled_out(double f) const { return f; }\n",
+            "class Circle : public Shape {\n",
+            "public:\n",
+            "    Circle(double r);\n",
+            "    ~Circle() override;\n",
+            "    double area() const override;\n",
+            "};\n",
+            "Circle::Circle(double r) {}\n",
+            "Circle::~Circle() {}\n",
+            "double Circle::area() const { return 1.0; }\n",
+            "template <typename T>\n",
+            "class Box {\n",
+            "public:\n",
+            "    T get() const;\n",
+            "    T value() const { return raw_; }\n",
+            "};\n",
+            "template <typename T>\n",
+            "T Box<T>::get() const { return raw_; }\n",
+            "enum class Color { RED, GREEN };\n",
+            "struct Point { int x; int y; };\n",
+            "int free_fn(int x) { return x + 1; }\n",
+            "}\n"
+        );
+        let symbols = symbols_of(source);
+
+        let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        for s in &symbols {
+            let key = (s.name.clone(), format!("{:?}", s.kind));
+            assert!(seen.insert(key.clone()), "符号重复产出: {:?}", key);
+        }
+
+        // 类与命名空间
+        assert_eq!(count_of(&symbols, "Shape", SymbolKind::Class), 1);
+        assert_eq!(count_of(&symbols, "Circle", SymbolKind::Class), 1);
+        assert_eq!(count_of(&symbols, "Box", SymbolKind::Class), 1);
+        assert_eq!(count_of(&symbols, "Point", SymbolKind::Struct), 1);
+        assert_eq!(count_of(&symbols, "Color", SymbolKind::Enum), 1);
+        assert_eq!(count_of(&symbols, "geom", SymbolKind::Module), 1);
+
+        // 自由函数保持 Function，类成员一律 Method
+        assert_eq!(find(&symbols, "free_fn").kind, SymbolKind::Function);
+        for name in ["scaled", "scaled_out", "area", "value", "get"] {
+            assert_eq!(find(&symbols, name).kind, SymbolKind::Method, "{} 应为方法", name);
+        }
+        assert_eq!(count_of(&symbols, "Shape", SymbolKind::Method), 1);
+        assert_eq!(count_of(&symbols, "~Shape", SymbolKind::Method), 1);
+        assert_eq!(count_of(&symbols, "Circle", SymbolKind::Method), 1);
+    }
+
+    #[test]
+    fn test_parse_pointer_reference_return_types() {
+        let source = "int* ptr_ret() { return 0; }\nint& ref_ret() { static int x = 1; return x; }\nclass K {\npublic:\n    K& operator+=(const K& o);\n    int* m_ptr();\n};\nint* K::m_ptr() { return 0; }\n";
+        let symbols = symbols_of(source);
+
+        assert_eq!(find(&symbols, "ptr_ret").kind, SymbolKind::Function);
+        assert_eq!(find(&symbols, "ref_ret").kind, SymbolKind::Function);
+        assert_eq!(find(&symbols, "operator+=").kind, SymbolKind::Method);
+        assert_eq!(count_of(&symbols, "m_ptr", SymbolKind::Method), 1);
+        assert_eq!(find(&symbols, "m_ptr").location.line, 8);
+    }
+
+    #[test]
+    fn test_parse_data_members_skipped() {
+        let source = "class K {\npublic:\n    static int count;\n    double radius_;\n    int (*fp)(int);\n};\n";
+        let symbols = symbols_of(source);
+        assert_eq!(symbols.len(), 1, "数据成员与函数指针不应产出符号: {:?}", names(&symbols));
+        assert_eq!(find(&symbols, "K").kind, SymbolKind::Class);
+    }
+
+    #[test]
+    fn test_parse_union_mapped_to_struct() {
+        let symbols = symbols_of("union Value { int i; float f; };\n");
+        // SymbolKind 无 Union 变体，映射为 Struct
+        assert_eq!(find(&symbols, "Value").kind, SymbolKind::Struct);
+    }
+
+    #[test]
+    fn test_parse_alias_and_enum_class() {
+        let source = "using Size = unsigned long;\ntypedef int Handle;\nenum class Color { RED };\n";
+        let symbols = symbols_of(source);
+        assert_eq!(find(&symbols, "Size").kind, SymbolKind::TypeAlias);
+        assert_eq!(find(&symbols, "Handle").kind, SymbolKind::TypeAlias);
+        assert_eq!(find(&symbols, "Color").kind, SymbolKind::Enum);
+    }
+
+    #[test]
+    fn test_parse_function_pointer_skipped() {
+        let symbols = symbols_of("int (*fp)(int);\nvoid proto(int a);\n");
+        assert_eq!(count_of(&symbols, "proto", SymbolKind::Function), 1);
+        assert!(symbols.iter().all(|s| s.name != "fp"), "函数指针变量不应产出符号");
     }
 
     #[test]
