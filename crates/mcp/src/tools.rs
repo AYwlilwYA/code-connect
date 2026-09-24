@@ -1288,14 +1288,17 @@ fn start_watcher_after_index(registry: &ToolRegistry) -> bool {
         return false;
     }
 
-    let excludes = registry
+    let (excludes, roots) = registry
         .config
         .as_ref()
-        .map(|c| c.workspace.excludes.clone())
+        .map(|c| (c.workspace.excludes.clone(), c.workspace.roots.clone()))
         .unwrap_or_default();
 
+    // roots 与 handle_reindex 里给 FullIndexer 的一致，否则 reindex 遵守范围、
+    // 随后挂上的监控却把范围外的文件灌回索引
     let indexer =
-        codeconnect_index::incremental::IncrementalIndexer::new(&root, sled, tantivy, edges, parsers);
+        codeconnect_index::incremental::IncrementalIndexer::new(&root, sled, tantivy, edges, parsers)
+            .with_roots(roots);
 
     tokio::spawn(async move {
         tracing::info!("索引已构建，文件监控已启动，将持续增量更新");
@@ -1357,6 +1360,24 @@ pub async fn handle_reindex(
         None => return McpResponse::error("解析器注册表未初始化，无法执行重新索引"),
     };
 
+    // workspace.roots 限定索引范围；未配置时为空列表 = 不限定，与 CLI `index` 行为一致
+    let workspace_roots = registry
+        .config
+        .as_ref()
+        .map(|c| c.workspace.roots.clone())
+        .unwrap_or_default();
+
+    // 供「一个文件都没索引」的告警文案回显，便于 AI 直接看出范围配错
+    let roots_desc = if workspace_roots.is_empty() {
+        "整个项目根目录".to_string()
+    } else {
+        workspace_roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
     // 全量索引在 spawn_blocking 中运行以避免阻塞 MCP 事件循环
     let result = tokio::task::spawn_blocking(move || -> Result<IndexStats, String> {
         let indexer = FullIndexer::new(
@@ -1365,7 +1386,8 @@ pub async fn handle_reindex(
             call_edge_index,
             sled,
             parser_registry,
-        );
+        )
+        .with_roots(workspace_roots);
         indexer.run().map_err(|e| e.to_string())
     })
     .await
@@ -1392,11 +1414,21 @@ pub async fn handle_reindex(
                 },
             });
             let elapsed = start.elapsed().as_millis() as u64;
-            let response = McpResponse::success(result, 1, 1, elapsed);
+            let mut response = McpResponse::success(result, 1, 1, elapsed);
+
+            // 「扫到 0 个文件」不等于「索引重建成功」：
+            // roots 写错时索引器会报错（走不到这里），但 roots 有效却全是空目录时
+            // 仍会走到这里，必须让 AI 看见，而不是只发一条 stderr 告警。
+            if stats.files_scanned == 0 {
+                response = response.with_warning(format!(
+                    "本次未扫描到任何源文件（索引范围: {}）—— 索引可能为空，请检查 .codeconnect.toml 的 workspace.roots 与语言开关。",
+                    roots_desc
+                ));
+            }
 
             if !watcher_started && registry.sled.is_none() {
                 // 自举出来的索引实例不在 registry 里，本进程查询不到也监控不了
-                return response.with_warning(
+                response = response.with_warning(
                     "索引已构建到磁盘，但本服务启动时索引目录不存在，其索引实例未加载 —— 请重启本服务，之后查询与自动监控才会生效。".into(),
                 );
             }

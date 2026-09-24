@@ -130,6 +130,11 @@ struct ParseFailure {
 pub struct FullIndexer {
     /// 项目根目录
     pub project_root: PathBuf,
+    /// 索引范围限定：相对 `project_root` 的子目录列表
+    ///
+    /// 为空或含 `"."` 表示整个 `project_root`。
+    /// 仅控制「遍历哪些目录」，相对路径仍以 `project_root` 为基准计算。
+    roots: Vec<PathBuf>,
     /// tantivy 全文搜索索引（共享引用，支持同时读写）
     pub tantivy: Arc<TantivyIndex>,
     /// tantivy 调用边索引（替代 sled edges 命名空间，避免 sled 磁盘膨胀）
@@ -158,6 +163,7 @@ impl FullIndexer {
     ) -> Self {
         Self {
             project_root: project_root.to_path_buf(),
+            roots: Vec::new(),
             tantivy,
             call_edge_index,
             sled,
@@ -165,10 +171,28 @@ impl FullIndexer {
         }
     }
 
+    /// 设置索引范围限定（相对 `project_root` 的子目录列表）
+    ///
+    /// 传空列表或 `["."]` 表示索引整个 `project_root`（与不调用本方法等价）。
+    /// 未配置到实际存在的项会在遍历时被跳过并告警。
+    pub fn with_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.roots = roots;
+        self
+    }
+
+    /// 计算本次实际参与遍历的目录列表（转调自由函数，保持单一事实来源）
+    fn effective_walk_roots(&self) -> Vec<PathBuf> {
+        effective_walk_roots(&self.project_root, &self.roots)
+    }
+
     /// 运行全量索引
     ///
     /// 这是索引引擎的主入口，执行完整的索引流程：
     /// 文件收集 → 并行解析 → 批量写入 → 提交刷盘
+    ///
+    /// 若配置了 `roots` 但全部无效（不存在／越界／非目录），直接返回 `Err`：
+    /// 否则调用方会拿到「0 文件」的成功结果，配合 `index -f` 的先删后建
+    /// 就会把旧索引清空却报成功。
     ///
     /// # 返回
     /// 返回 [`IndexStats`] 包含详细的统计信息。
@@ -176,7 +200,22 @@ impl FullIndexer {
         // ====================================================================
         // 第一步：收集需要解析的文件列表
         // ====================================================================
-        let files = self.collect_files()?;
+        // 只算一次遍历起点：既用于「配置错误」判定，也用于实际遍历，
+        // 避免重复触发 effective_walk_roots 里的告警
+        let walk_roots = self.effective_walk_roots();
+        if walk_roots.is_empty() {
+            return Err(CodeConnectError::Index(format!(
+                "workspace.roots 配置的目录全部无效（{}），未索引任何文件。\
+                 请检查 .codeconnect.toml 中 [workspace].roots 的路径拼写",
+                self.roots
+                    .iter()
+                    .map(|r| r.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+
+        let files = self.collect_files_in(&walk_roots)?;
         let files_scanned = files.len() as u64;
 
         tracing::info!("扫描完成，共发现 {} 个源文件", files_scanned);
@@ -313,41 +352,51 @@ impl FullIndexer {
         })
     }
 
-    /// 收集项目目录下的所有源文件
+    /// 在给定遍历起点下收集源文件
     ///
     /// 使用 `ignore::WalkBuilder` 遍历目录树，自动应用
     /// `.gitignore` 规则过滤，仅收集支持的编程语言源文件。
-    fn collect_files(&self) -> Result<Vec<PathBuf>, CodeConnectError> {
+    ///
+    /// 遍历起点由 [`FullIndexer::with_roots`] 限定；所有起点都是
+    /// `project_root` 的子目录，收集到的路径仍带 `project_root` 前缀，
+    /// 因此后续 `strip_prefix(project_root)` 得到的相对路径语义不变。
+    fn collect_files_in(&self, walk_roots: &[PathBuf]) -> Result<Vec<PathBuf>, CodeConnectError> {
         let mut files = Vec::new();
+        let supported_exts = self.parser_registry.all_extensions();
 
-        let walker = WalkBuilder::new(&self.project_root)
-            .standard_filters(true) // 自动 .gitignore 与常见忽略规则
-            .hidden(false) // 不跳过隐藏文件（某些配置目录需要处理）
-            .build();
+        for walk_root in walk_roots {
+            let walker = WalkBuilder::new(walk_root)
+                .standard_filters(true) // 自动 .gitignore 与常见忽略规则
+                .hidden(false) // 不跳过隐藏文件（某些配置目录需要处理）
+                .build();
 
-        for entry in walker {
-            let entry = entry
-                .map_err(|e| CodeConnectError::Index(format!("目录遍历失败: {}", e)))?;
+            for entry in walker {
+                let entry =
+                    entry.map_err(|e| CodeConnectError::Index(format!("目录遍历失败: {}", e)))?;
 
-            // 只处理普通文件
-            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
-                continue;
-            }
+                // 只处理普通文件
+                if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                    continue;
+                }
 
-            let path = entry.path();
+                let path = entry.path();
 
-            // 按扩展名过滤支持的编程语言（动态从解析器注册表获取）
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                let ext_lower = ext.to_lowercase();
-                let supported_exts = self.parser_registry.all_extensions();
-                if supported_exts.iter().any(|e| e.eq_ignore_ascii_case(&ext_lower)) {
-                    files.push(path.to_path_buf());
+                // 按扩展名过滤支持的编程语言（动态从解析器注册表获取）
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    let ext_lower = ext.to_lowercase();
+                    if supported_exts
+                        .iter()
+                        .any(|e| e.eq_ignore_ascii_case(&ext_lower))
+                    {
+                        files.push(path.to_path_buf());
+                    }
                 }
             }
         }
 
-        // 按路径排序以保证索引顺序稳定
+        // 按路径排序以保证索引顺序稳定；去重避免多个 root 重叠时同一文件被索引两次
         files.sort();
+        files.dedup();
 
         Ok(files)
     }
@@ -592,6 +641,84 @@ fn parse_single_file(
 }
 
 // ============================================================================
+// 路径工具
+// ============================================================================
+
+/// 计算 roots 限定的实际遍历目录
+///
+/// 这是 `workspace.roots` 语义的**唯一实现** —— 全量索引、增量索引、文件监控、
+/// CLI 的 `-f` 前置校验都必须走这里，避免同一条配置在不同链路上解释不一致。
+///
+/// - `roots` 为空或含 `"."` → `vec![project_root]`（不限定）
+/// - 否则逐项校验，不存在/越界/非目录的项跳过并 `tracing::warn`
+/// - 全部无效 → 返回空 `Vec`（调用方据此决定报错还是空跑）
+pub fn effective_walk_roots(project_root: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
+    if roots.is_empty() || roots.iter().any(|r| is_whole_project_root(r)) {
+        return vec![project_root.to_path_buf()];
+    }
+
+    let canonical_root = project_root.canonicalize().ok();
+    let mut walk_roots = Vec::new();
+
+    for rel in roots {
+        if !is_safe_relative(rel) {
+            tracing::warn!(
+                "workspace.roots 项 {} 不是 project_root 下的相对子路径，已跳过",
+                rel.display()
+            );
+            continue;
+        }
+
+        let candidate = project_root.join(rel);
+
+        if !candidate.is_dir() {
+            tracing::warn!(
+                "workspace.roots 项 {} 不存在或不是目录，已跳过",
+                candidate.display()
+            );
+            continue;
+        }
+
+        // 软链接等情况下实际位置可能越出 project_root，用规范化路径二次校验
+        let escapes_root = match (&canonical_root, candidate.canonicalize()) {
+            (Some(root_real), Ok(candidate_real)) => !candidate_real.starts_with(root_real),
+            _ => false,
+        };
+        if escapes_root {
+            tracing::warn!(
+                "workspace.roots 项 {} 越出 project_root，已跳过",
+                candidate.display()
+            );
+            continue;
+        }
+
+        walk_roots.push(candidate);
+    }
+
+    if walk_roots.is_empty() {
+        tracing::warn!("workspace.roots 中的所有项都无效，本次不索引任何文件，请修正配置");
+    }
+
+    walk_roots
+}
+
+/// 判断是否为表示「整个 project_root」的路径（空路径、`"."`、`"./"`）
+fn is_whole_project_root(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(
+        (components.next(), components.next()),
+        (None, _) | (Some(std::path::Component::CurDir), None)
+    )
+}
+
+/// 判断是否为不含 `..`、盘符或根前缀的安全相对子路径
+fn is_safe_relative(path: &Path) -> bool {
+    use std::path::Component;
+    path.components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
+// ============================================================================
 // 测试
 // ============================================================================
 
@@ -631,5 +758,210 @@ mod tests {
         assert_eq!(merged.symbols, 30);
         assert_eq!(merged.calls, 13);
         assert_eq!(merged.imports, 5);
+    }
+
+    /// 构造带临时存储的索引器；返回的 TempDir 需随索引器一并持有
+    fn make_indexer(project_root: &Path, roots: Vec<PathBuf>) -> (FullIndexer, tempfile::TempDir) {
+        let storage = tempfile::tempdir().expect("创建临时目录失败");
+        let mut registry = ParserRegistry::new();
+        registry.register(Arc::new(codeconnect_parser::rust::RustParser::new()));
+
+        let tantivy = Arc::new(
+            TantivyIndex::open_or_create(&storage.path().join("tantivy"))
+                .expect("打开 tantivy 失败"),
+        );
+        let edges = Arc::new(
+            CallEdgeIndex::open_or_create(&storage.path().join("tantivy_edges"))
+                .expect("打开调用边索引失败"),
+        );
+        let sled = Arc::new(SledStore::open(&storage.path().join("sled")).expect("打开 sled 失败"));
+
+        let indexer = FullIndexer::new(project_root, tantivy, edges, sled, Arc::new(registry))
+            .with_roots(roots);
+        (indexer, storage)
+    }
+
+    /// 搭建 crates/a、crates/b 两个子目录，各含一个 .rs 文件
+    fn make_project() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("创建临时目录失败");
+        for name in ["a", "b"] {
+            let dir = tmp.path().join("crates").join(name).join("src");
+            std::fs::create_dir_all(&dir).expect("创建目录失败");
+            std::fs::write(dir.join(format!("{}.rs", name)), "pub fn f() {}\n")
+                .expect("写文件失败");
+        }
+        tmp
+    }
+
+    /// roots 为空 = 全量：两个子目录的源文件都要被扫到
+    #[test]
+    fn test_collect_files_empty_roots_scans_whole_project() {
+        let project = make_project();
+        let (indexer, _storage) = make_indexer(project.path(), Vec::new());
+
+        let files = collect(&indexer).expect("收集文件失败");
+        assert_eq!(files.len(), 2, "空 roots 应扫描整个项目: {:?}", files);
+    }
+
+    /// roots 含 "." = 全量
+    #[test]
+    fn test_collect_files_dot_root_scans_whole_project() {
+        let project = make_project();
+        let (indexer, _storage) = make_indexer(project.path(), vec![PathBuf::from(".")]);
+
+        let files = collect(&indexer).expect("收集文件失败");
+        assert_eq!(files.len(), 2, "roots=[\".\"] 应扫描整个项目: {:?}", files);
+    }
+
+    /// roots 限定 = 只扫指定子目录，且相对路径仍以 project_root 为基准
+    #[test]
+    fn test_collect_files_roots_limit_to_subdir() {
+        let project = make_project();
+        let (indexer, _storage) = make_indexer(project.path(), vec![PathBuf::from("crates/a")]);
+
+        let files = collect(&indexer).expect("收集文件失败");
+        assert_eq!(files.len(), 1, "应只扫描 crates/a: {:?}", files);
+
+        let relative = files[0]
+            .strip_prefix(project.path())
+            .expect("相对路径必须以 project_root 为基准")
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert_eq!(relative, "crates/a/src/a.rs");
+    }
+
+    /// roots 多个项重叠时同一文件只出现一次
+    #[test]
+    fn test_collect_files_dedup_overlapping_roots() {
+        let project = make_project();
+        let (indexer, _storage) = make_indexer(
+            project.path(),
+            vec![PathBuf::from("crates"), PathBuf::from("crates/a")],
+        );
+
+        let files = collect(&indexer).expect("收集文件失败");
+        assert_eq!(files.len(), 2, "重叠 roots 不应重复收集: {:?}", files);
+    }
+
+    /// 测试辅助：按 roots 限定的遍历起点收集文件（等价于 `run()` 的第一步）
+    fn collect(indexer: &FullIndexer) -> Result<Vec<PathBuf>, CodeConnectError> {
+        let walk_roots = indexer.effective_walk_roots();
+        indexer.collect_files_in(&walk_roots)
+    }
+
+    /// 不存在或越出 project_root 的 root 被跳过（不 panic、不扩大范围）
+    #[test]
+    fn test_collect_files_invalid_roots_skipped() {
+        let project = make_project();
+
+        let (indexer, _storage) = make_indexer(project.path(), vec![PathBuf::from("crates/nope")]);
+        assert!(
+            collect(&indexer).expect("收集文件失败").is_empty(),
+            "不存在的 root 应被跳过"
+        );
+
+        let (indexer, _storage) = make_indexer(project.path(), vec![PathBuf::from("../escape")]);
+        assert!(
+            collect(&indexer).expect("收集文件失败").is_empty(),
+            "越出 project_root 的 root 应被跳过"
+        );
+
+        let (indexer, _storage) = make_indexer(project.path(), vec![PathBuf::from("/etc")]);
+        assert!(
+            collect(&indexer).expect("收集文件失败").is_empty(),
+            "绝对路径 root 应被跳过"
+        );
+    }
+
+    /// roots 全部无效时 `run()` 必须报错，而不是静默返回 0 文件
+    ///
+    /// 这是 H2 的一半：只有报错，`index -f` 才不会「删光旧索引还报成功」
+    #[test]
+    fn test_run_errors_when_all_roots_invalid() {
+        let project = make_project();
+        let (indexer, _storage) = make_indexer(project.path(), vec![PathBuf::from("subb")]);
+
+        let err = indexer.run().expect_err("roots 全无效时必须返回 Err");
+        assert!(
+            err.to_string().contains("全部无效"),
+            "错误信息应说明 roots 无效: {}",
+            err
+        );
+    }
+
+    /// roots 有效但目录下确实没有源文件 → 仍然是 Ok(0)（合法情况，不报错）
+    #[test]
+    fn test_run_ok_when_roots_valid_but_no_sources() {
+        let project = make_project();
+        let empty_dir = project.path().join("empty");
+        std::fs::create_dir_all(&empty_dir).expect("创建目录失败");
+
+        let (indexer, _storage) = make_indexer(project.path(), vec![PathBuf::from("empty")]);
+        let stats = indexer.run().expect("合法空范围不应报错");
+        assert_eq!(stats.files_scanned, 0);
+        assert_eq!(stats.files_parsed, 0);
+    }
+
+    /// roots 为空（不限定）且项目无源文件 → 仍是 Ok(0)
+    #[test]
+    fn test_run_ok_when_unlimited_and_no_sources() {
+        let tmp = tempfile::tempdir().expect("创建临时目录失败");
+        let (indexer, _storage) = make_indexer(tmp.path(), Vec::new());
+
+        let stats = indexer.run().expect("不限定范围且无源文件不应报错");
+        assert_eq!(stats.files_scanned, 0);
+    }
+
+    /// 自由函数 `effective_walk_roots`：全量与限定两种语义
+    #[test]
+    fn test_effective_walk_roots_free_function() {
+        let project = make_project();
+
+        // 空 roots = 不限定
+        assert_eq!(
+            effective_walk_roots(project.path(), &[]),
+            vec![project.path().to_path_buf()]
+        );
+        // 含 "." = 不限定
+        assert_eq!(
+            effective_walk_roots(project.path(), &[PathBuf::from(".")]),
+            vec![project.path().to_path_buf()]
+        );
+        // 合法子目录 = 限定
+        assert_eq!(
+            effective_walk_roots(project.path(), &[PathBuf::from("crates/a")]),
+            vec![project.path().join("crates/a")]
+        );
+        // 全无效 = 空
+        assert!(effective_walk_roots(project.path(), &[PathBuf::from("nope")]).is_empty());
+        // 部分无效 = 只留有效的
+        assert_eq!(
+            effective_walk_roots(
+                project.path(),
+                &[PathBuf::from("nope"), PathBuf::from("crates/b")]
+            ),
+            vec![project.path().join("crates/b")]
+        );
+    }
+
+    /// 表示「整个 project_root」的路径判定
+    #[test]
+    fn test_is_whole_project_root() {
+        assert!(is_whole_project_root(Path::new("")));
+        assert!(is_whole_project_root(Path::new(".")));
+        assert!(is_whole_project_root(Path::new("./")));
+        assert!(!is_whole_project_root(Path::new("crates")));
+        assert!(!is_whole_project_root(Path::new("crates/cli")));
+    }
+
+    /// 安全相对子路径判定：拒绝 `..`、绝对路径与盘符前缀
+    #[test]
+    fn test_is_safe_relative() {
+        assert!(is_safe_relative(Path::new("crates/cli")));
+        assert!(is_safe_relative(Path::new("crates/cli/src")));
+        assert!(!is_safe_relative(Path::new("../outside")));
+        assert!(!is_safe_relative(Path::new("crates/../../outside")));
+        assert!(!is_safe_relative(Path::new("/etc")));
+        assert!(!is_safe_relative(Path::new("C:/Windows")));
     }
 }

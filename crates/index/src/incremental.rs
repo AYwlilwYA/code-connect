@@ -38,6 +38,12 @@ use tokio::sync::mpsc;
 pub struct IncrementalIndexer {
     /// 项目根目录
     project_root: PathBuf,
+    /// 索引范围限定：相对 `project_root` 的子目录列表
+    ///
+    /// 为空或含 `"."` 表示整个 `project_root`。语义与
+    /// [`FullIndexer`](crate::full_indexer::FullIndexer) 完全一致，
+    /// 否则「全量索引限定范围、增量索引却把范围外文件灌回索引」。
+    roots: Vec<PathBuf>,
     /// sled K/V 存储
     sled: Arc<SledStore>,
     /// tantivy 全文搜索索引
@@ -68,11 +74,21 @@ impl IncrementalIndexer {
     ) -> Self {
         Self {
             project_root: project_root.to_path_buf(),
+            roots: Vec::new(),
             sled,
             tantivy,
             call_edge_index,
             parser_registry,
         }
+    }
+
+    /// 设置索引范围限定（相对 `project_root` 的子目录列表）
+    ///
+    /// 传空列表或 `["."]` 表示监控整个 `project_root`。
+    /// 与 [`FullIndexer::with_roots`](crate::full_indexer::FullIndexer::with_roots) 同语义。
+    pub fn with_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.roots = roots;
+        self
     }
 
     /// 启动文件监控和增量索引
@@ -85,6 +101,10 @@ impl IncrementalIndexer {
     ///
     /// - `excludes` — 文件排除模式列表
     ///
+    /// 只监控 `workspace.roots` 限定的目录（由
+    /// [`IncrementalIndexer::with_roots`] 设置），而不是「监控全项目再过滤事件」，
+    /// 否则 serve 一跑就会把范围外的文件重新灌回索引。
+    ///
     /// # 返回
     ///
     /// 此方法在文件监控持续运行期间不会返回，返回 `Ok(())`
@@ -95,7 +115,9 @@ impl IncrementalIndexer {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (tx, mut rx) = mpsc::unbounded_channel::<Vec<PathBuf>>();
 
-        let watcher = FileWatcher::new(&self.project_root, excludes);
+        // 复用 full_indexer 的 roots 语义作为唯一事实来源，避免出现第二套校验逻辑
+        let watch_roots = crate::full_indexer::effective_walk_roots(&self.project_root, &self.roots);
+        let watcher = FileWatcher::new(&self.project_root, excludes).with_watch_roots(watch_roots);
 
         // 在后台任务中运行文件监控
         let watch_handle = tokio::spawn(async move {
@@ -476,6 +498,56 @@ mod tests {
         );
 
         assert!(indexer.project_root.ends_with("project"));
+    }
+
+    /// roots 默认空 = 监控整个 project_root（向后兼容）
+    #[test]
+    fn test_incremental_indexer_roots_default_empty() {
+        let tmp = tempfile::tempdir().expect("创建临时目录失败");
+        let sled = Arc::new(SledStore::open(&tmp.path().join("sled")).expect("打开 sled 失败"));
+        let tantivy = Arc::new(
+            TantivyIndex::open_or_create(&tmp.path().join("tantivy"))
+                .expect("创建 tantivy 失败"),
+        );
+        let call_edge_index = Arc::new(
+            CallEdgeIndex::open_or_create(&tmp.path().join("tantivy_edges"))
+                .expect("创建调用边索引失败"),
+        );
+        let parser_registry = Arc::new(ParserRegistry::new());
+
+        let indexer =
+            IncrementalIndexer::new(tmp.path(), sled, tantivy, call_edge_index, parser_registry)
+                .with_roots(vec![PathBuf::from("sub")]);
+
+        assert_eq!(indexer.roots, vec![PathBuf::from("sub")]);
+    }
+
+    /// roots 全部无效时监控不启动（而不是回退到监控整个项目根）
+    #[test]
+    fn test_start_watching_invalid_roots_watches_nothing() {
+        let tmp = tempfile::tempdir().expect("创建临时目录失败");
+        let sled = Arc::new(SledStore::open(&tmp.path().join("sled")).expect("打开 sled 失败"));
+        let tantivy = Arc::new(
+            TantivyIndex::open_or_create(&tmp.path().join("tantivy"))
+                .expect("创建 tantivy 失败"),
+        );
+        let call_edge_index = Arc::new(
+            CallEdgeIndex::open_or_create(&tmp.path().join("tantivy_edges"))
+                .expect("创建调用边索引失败"),
+        );
+        let parser_registry = Arc::new(ParserRegistry::new());
+
+        let indexer =
+            IncrementalIndexer::new(tmp.path(), sled, tantivy, call_edge_index, parser_registry)
+                .with_roots(vec![PathBuf::from("subb")]);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("创建运行时失败");
+
+        // 监控起点为空 → 立即返回 Ok，不会挂住
+        let result = rt.block_on(indexer.start_watching(Vec::new()));
+        assert!(result.is_ok(), "无效 roots 应安全退出而非回退全项目监控");
     }
 
     #[test]

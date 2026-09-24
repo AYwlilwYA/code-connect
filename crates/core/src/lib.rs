@@ -6,9 +6,11 @@
 //! - [`config`] — CodeConnectConfig 与 .codeconnect.toml 解析
 //! - [`error`] — 分层的错误类型 CodeConnectError
 //! - [`response`] — 统一的 MCP 响应信封
+//! - [`path_util`] — 路径展示工具（剥离 Windows `\\?\` verbatim 前缀）
 
 pub mod config;
 pub mod error;
+pub mod path_util;
 pub mod response;
 pub mod symbol_id;
 pub mod types;

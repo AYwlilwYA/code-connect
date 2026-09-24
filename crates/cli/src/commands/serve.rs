@@ -138,15 +138,19 @@ pub async fn run(
         if registry.try_claim_watcher() {
             let project_root_owned = project_root.to_path_buf();
             let excludes = config.workspace.excludes.clone();
+            let roots = config.workspace.roots.clone();
 
             // 创建增量索引器（复用 serve 已打开的索引实例，避免 sled 锁冲突）
+            // roots 必须传下去：否则全量索引限定范围、这里却监控整个项目根，
+            // 任何一次保存都会把范围外的文件重新灌回索引
             let incremental_indexer = IncrementalIndexer::new(
                 &project_root_owned,
                 sled_monitor,
                 tantivy_monitor,
                 call_edge_monitor,
                 Arc::clone(&parser_registry),
-            );
+            )
+            .with_roots(roots);
 
             tokio::spawn(async move {
                 tracing::info!("文件监控已启动，将自动检测源文件变更并增量更新索引");

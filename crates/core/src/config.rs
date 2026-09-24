@@ -1,13 +1,13 @@
 //! 配置文件解析模块
 //!
-//! 支持从当前目录向上查找 `.codeconnect.toml` 项目配置，
+//! 支持从指定项目根目录（而非 cwd）向上查找 `.codeconnect.toml` 项目配置，
 //! 并与 `~/.codeconnect/config.toml` 全局配置合并。
 //!
 //! 配置涵盖：工作区设置、语言支持、索引策略、搜索参数、
 //! 复杂度阈值、死代码检测规则和图校验规则。
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ============================================================================
 // CodeConnect 主配置
@@ -278,62 +278,155 @@ pub struct RuleConfig {
 // 配置加载函数
 // ============================================================================
 
-/// 加载配置
+/// 加载配置（以当前工作目录为基准）
 ///
-/// 从当前目录开始向上查找 `.codeconnect.toml`，找到后读取。
+/// `load_config_from(&current_dir())` 的薄封装，保留给未显式指定项目根目录的调用点。
+pub fn load_config() -> CodeConnectConfig {
+    match std::env::current_dir() {
+        Ok(cwd) => load_config_from(&cwd),
+        // cwd 不可用时退化为仅全局配置
+        Err(_) => load_global_config(),
+    }
+}
+
+/// 加载配置（以 `root` 为基准）
+///
+/// 从 `root` 开始向上查找 `.codeconnect.toml`，找到后读取；
 /// 同时尝试读取 `~/.codeconnect/config.toml` 作为全局配置基准，
 /// 项目配置会覆盖全局配置。
 ///
 /// 如果找不到任何配置文件，返回默认配置。
-pub fn load_config() -> CodeConnectConfig {
-    let mut config = load_global_config();
+pub fn load_config_from(root: &Path) -> CodeConnectConfig {
+    load_config_from_with_source(root).0
+}
 
-    // 从当前目录向上查找项目配置
-    if let Some(project_config) = find_and_load_project_config() {
-        merge_configs(&mut config, project_config);
+/// 配置来源信息
+///
+/// 供 CLI 如实打印「某个值到底来自哪里」。先前用「合并后的值是否为空」当判据，
+/// 而 `index.data_dir` 的 serde 默认值非空，导致无论有没有配置文件都标成
+/// 「配置文件 index.data_dir」—— 用户会照着日志去找并不存在的配置项。
+#[derive(Debug, Clone, Default)]
+pub struct ConfigSource {
+    /// 命中的项目配置文件 `.codeconnect.toml`；`None` 表示向上查找无果
+    pub project_file: Option<PathBuf>,
+
+    /// 生效的 `index.data_dir` 显式写在哪个配置文件里；
+    /// `None` 表示没有任何配置文件写过它，用的是内置默认值
+    pub data_dir_file: Option<PathBuf>,
+}
+
+/// 项目配置文件的解析结果
+struct ProjectConfig {
+    config: CodeConnectConfig,
+    /// 命中的配置文件路径
+    path: PathBuf,
+    /// 该文件里是否显式写了 `[index].data_dir`
+    data_dir_explicit: bool,
+}
+
+/// 加载配置，并返回来源信息
+pub fn load_config_from_with_source(root: &Path) -> (CodeConnectConfig, ConfigSource) {
+    let (mut config, global_data_dir_file) = load_global_config_with_source();
+
+    match find_project_config(root) {
+        Some(project) => {
+            // 来源判定必须与 merge_configs 的实际语义一致：它只在
+            // 「项目里的值 != 内置默认值」时才采纳该值，否则 data_dir
+            // 实际来自全局配置或内置默认，不能标成项目配置文件。
+            let data_dir_file = if project.data_dir_explicit
+                && project.config.index.data_dir != default_data_dir()
+            {
+                Some(project.path.clone())
+            } else {
+                global_data_dir_file
+            };
+
+            merge_configs(&mut config, project.config);
+            (
+                config,
+                ConfigSource {
+                    project_file: Some(project.path),
+                    data_dir_file,
+                },
+            )
+        }
+        None => (
+            config,
+            ConfigSource {
+                project_file: None,
+                data_dir_file: global_data_dir_file,
+            },
+        ),
     }
-
-    config
 }
 
 /// 加载全局配置文件 `~/.codeconnect/config.toml`
 fn load_global_config() -> CodeConnectConfig {
+    load_global_config_with_source().0
+}
+
+/// 加载全局配置文件，并附带「它是否显式写了 `index.data_dir`」的来源信息
+fn load_global_config_with_source() -> (CodeConnectConfig, Option<PathBuf>) {
     let global_path = dirs_home().join(".codeconnect").join("config.toml");
 
     match std::fs::read_to_string(&global_path) {
-        Ok(content) => toml::from_str(&content).unwrap_or_default(),
-        Err(_) => CodeConnectConfig::default(),
+        Ok(content) => {
+            let explicit = has_explicit_data_dir(&content);
+            let config = toml::from_str(&content).unwrap_or_default();
+            (config, explicit.then_some(global_path))
+        }
+        Err(_) => (CodeConnectConfig::default(), None),
     }
 }
 
-/// 从当前目录向上查找并加载 `.codeconnect.toml`
-fn find_and_load_project_config() -> Option<CodeConnectConfig> {
-    let current_dir = std::env::current_dir().ok()?;
-    let mut dir = current_dir.as_path();
+/// 从 `root` 向上查找并解析 `.codeconnect.toml`
+///
+/// 返回命中的配置及其文件路径；某个候选文件解析失败时打印警告并继续向上查找。
+fn find_project_config(root: &Path) -> Option<ProjectConfig> {
+    let mut dir = Some(root);
 
-    loop {
-        let config_path = dir.join(".codeconnect.toml");
+    while let Some(d) = dir {
+        let config_path = d.join(".codeconnect.toml");
         if config_path.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&config_path) {
-                match toml::from_str::<CodeConnectConfig>(&content) {
+            match std::fs::read_to_string(&config_path) {
+                Ok(content) => match toml::from_str::<CodeConnectConfig>(&content) {
                     Ok(config) => {
-                        return Some(config);
+                        return Some(ProjectConfig {
+                            data_dir_explicit: has_explicit_data_dir(&content),
+                            config,
+                            path: config_path,
+                        });
                     }
                     Err(e) => {
                         eprintln!("警告：TOML 配置文件解析失败 ({}) : {}", config_path.display(), e);
                     }
+                },
+                Err(e) => {
+                    eprintln!("警告：无法读取配置文件 ({}) : {}", config_path.display(), e);
                 }
             }
         }
 
         // 向上一级目录
-        match dir.parent() {
-            Some(parent) => dir = parent,
-            None => break,
-        }
+        dir = d.parent();
     }
 
     None
+}
+
+/// 判断 TOML 文本里是否**显式**写了 `[index].data_dir`
+///
+/// 复用已读到的文本再按 `toml::Value` 解析一次，不额外做 IO；
+/// 需要它是因为反序列化后的结构体无法区分「显式写了默认值」与「没写」。
+fn has_explicit_data_dir(content: &str) -> bool {
+    toml::from_str::<toml::Value>(content)
+        .ok()
+        .and_then(|v| {
+            v.get("index")
+                .and_then(|index| index.get("data_dir"))
+                .map(|_| ())
+        })
+        .is_some()
 }
 
 /// 将项目配置合并到基准配置中（项目配置覆盖全局配置）
@@ -437,4 +530,17 @@ mod tests {
         assert_eq!(config.roots, vec![PathBuf::from(".")]);
         assert!(!config.excludes.is_empty());
     }
+
+    #[test]
+    fn test_has_explicit_data_dir() {
+        // 显式写到 `[index]` 段里才算
+        assert!(has_explicit_data_dir("[index]\ndata_dir = \"idx\"\n"));
+        // 段落存在但没写 data_dir
+        assert!(!has_explicit_data_dir("[index]\nincremental = true\n"));
+        // 完全没有配置
+        assert!(!has_explicit_data_dir(""));
+        // 写错段名不算（serde 也会静默忽略）
+        assert!(!has_explicit_data_dir("[idx]\ndata_dir = \"idx\"\n"));
+    }
+
 }

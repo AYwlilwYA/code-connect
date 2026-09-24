@@ -38,10 +38,44 @@ pub async fn run(
     println!("开始构建代码索引...");
     println!("  项目根目录: {}", project_root.display());
     println!("  数据目录:   {}", data_dir.display());
+    // 索引范围限定（workspace.roots）；"." 表示整个项目根目录
+    if !config.workspace.roots.is_empty() {
+        let scope = config
+            .workspace
+            .roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  索引范围:   {}", scope);
+    }
     if force {
         println!("  模式:       强制全量重建");
     }
     println!();
+
+    // 校验 roots 合法性 —— 必须发生在删除旧索引之前。
+    //
+    // 否则用户把 roots 写错（如 ["sub"] 手抖成 ["subb"]）时，
+    // `-f` 会先删光旧索引、再由索引器静默扫出 0 个文件、最后退出码 0：
+    // 索引被清空却报成功，所有 MCP 工具返回空，CI 还判通过。
+    if !config.workspace.roots.is_empty()
+        && codeconnect_index::full_indexer::effective_walk_roots(project_root, &config.workspace.roots)
+            .is_empty()
+    {
+        return Err(format!(
+            "workspace.roots 配置的目录全部无效（{}），已中止且未改动现有索引。\
+             请检查 .codeconnect.toml 中 [workspace].roots 的路径拼写",
+            config
+                .workspace
+                .roots
+                .iter()
+                .map(|r| r.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .into());
+    }
 
     // 确保数据目录存在
     std::fs::create_dir_all(data_dir)?;
@@ -114,7 +148,8 @@ pub async fn run(
     let tantivy_arc = Arc::new(tantivy);
     let call_edge_arc = Arc::new(call_edge_index);
     let sled_arc = Arc::new(sled);
-    let indexer = FullIndexer::new(project_root, tantivy_arc, call_edge_arc, sled_arc, parser_registry);
+    let indexer = FullIndexer::new(project_root, tantivy_arc, call_edge_arc, sled_arc, parser_registry)
+        .with_roots(config.workspace.roots.clone());
 
     println!();
     println!("正在扫描并解析源文件...");

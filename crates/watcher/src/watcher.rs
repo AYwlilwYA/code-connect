@@ -45,6 +45,11 @@ const DEBOUNCE_MS: u64 = 500;
 pub struct FileWatcher {
     /// 项目根目录
     project_root: PathBuf,
+    /// 监控起点列表（默认即 `project_root` 本身）
+    ///
+    /// 由 [`FileWatcher::with_watch_roots`] 收窄到 `workspace.roots` 限定的目录，
+    /// 避免为了「只关心子目录」而递归监控整个仓库。
+    watch_roots: Vec<PathBuf>,
     /// 排除模式列表（glob 格式）
     excludes: Vec<String>,
 }
@@ -56,11 +61,25 @@ impl FileWatcher {
     ///
     /// - `project_root` — 项目根目录路径，所有监控事件路径均以此为基准
     /// - `excludes` — 排除模式列表，用于过滤不需要监控的目录/文件
+    ///
+    /// 默认监控起点为 `project_root` 本身；需要收窄范围时链式调用
+    /// [`FileWatcher::with_watch_roots`]。
     pub fn new(project_root: &Path, excludes: Vec<String>) -> Self {
         Self {
             project_root: project_root.to_path_buf(),
+            watch_roots: vec![project_root.to_path_buf()],
             excludes,
         }
+    }
+
+    /// 设置监控起点列表（递归监控其中每个目录）
+    ///
+    /// - 传入空列表 → **不监控任何目录**（调用方应视为「配置无效」，
+    ///   绝不回退到 `project_root`，否则会静默扩大监控范围）
+    /// - 多处重叠（`["crates", "crates/a"]`）会被规整为最短的那几个，避免重复事件
+    pub fn with_watch_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.watch_roots = normalize_watch_roots(&roots);
+        self
     }
 
     /// 启动异步文件监控
@@ -74,7 +93,7 @@ impl FileWatcher {
     ///
     /// # 工作流程
     ///
-    /// 1. 创建 `PollWatcher` 并递归监控项目根目录
+    /// 1. 创建 `PollWatcher` 并递归监控每个监控起点
     /// 2. 在事件循环中接收原始 notify 事件
     /// 3. 过滤无关事件（排除不支持的文件、匹配排除规则的文件）
     /// 4. 在 500ms debounce 窗口内收集变更路径
@@ -83,8 +102,16 @@ impl FileWatcher {
         &self,
         tx: mpsc::UnboundedSender<Vec<PathBuf>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let project_root = self.project_root.clone();
         let excludes = Arc::new(self.excludes.clone());
+        let watch_roots = self.watch_roots.clone();
+
+        // 监控起点为空 = 限定范围全部无效，宁可不监控也不扩大到全项目
+        if watch_roots.is_empty() {
+            tracing::warn!(
+                "监控范围为空（workspace.roots 全部无效），文件监控未启动；请修正 .codeconnect.toml"
+            );
+            return Ok(());
+        }
 
         // 创建 notify PollWatcher
         let config = Config::default()
@@ -101,8 +128,20 @@ impl FileWatcher {
             config,
         )?;
 
-        // 递归监控项目根目录
-        poll_watcher.watch(&project_root, RecursiveMode::Recursive)?;
+        // 递归监控每个起点
+        for root in &watch_roots {
+            poll_watcher.watch(root, RecursiveMode::Recursive)?;
+        }
+        tracing::info!(
+            "文件监控启动: 项目根 {}，监控起点 {} 个（{}）",
+            self.project_root.display(),
+            watch_roots.len(),
+            watch_roots
+                .iter()
+                .map(|r| r.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
 
         // --------------------------------------------------------------------
         // Debounce 事件循环（在独立的 tokio 阻塞任务中运行）
@@ -175,6 +214,25 @@ impl FileWatcher {
     }
 }
 
+/// 规整监控起点：去重并剔除被其他项包含的目录
+///
+/// `["crates", "crates/a"]` → `["crates"]` —— 父子目录同时监控会让
+/// 同一文件产生重复事件。排序保证前缀项一定排在子项之前。
+fn normalize_watch_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut sorted: Vec<PathBuf> = roots.to_vec();
+    sorted.sort();
+    sorted.dedup();
+
+    let mut result: Vec<PathBuf> = Vec::new();
+    for root in sorted {
+        if result.iter().any(|kept| root.starts_with(kept)) {
+            continue;
+        }
+        result.push(root);
+    }
+    result
+}
+
 /// 从 notify Event 中提取变更的文件路径集合
 ///
 /// 处理以下事件类型：
@@ -223,6 +281,54 @@ mod tests {
     fn test_file_watcher_empty_excludes() {
         let watcher = FileWatcher::new(Path::new("/tmp/project"), vec![]);
         assert!(watcher.excludes.is_empty());
+    }
+
+    /// 默认不设置监控起点时，监控起点就是 project_root（向后兼容）
+    #[test]
+    fn test_default_watch_roots_is_project_root() {
+        let watcher = FileWatcher::new(Path::new("/tmp/project"), vec![]);
+        assert_eq!(watcher.watch_roots, vec![PathBuf::from("/tmp/project")]);
+    }
+
+    /// 显式设置监控起点后，不再监控 project_root
+    #[test]
+    fn test_with_watch_roots_overrides_default() {
+        let watcher = FileWatcher::new(Path::new("/tmp/project"), vec![])
+            .with_watch_roots(vec![PathBuf::from("/tmp/project/sub")]);
+        assert_eq!(
+            watcher.watch_roots,
+            vec![PathBuf::from("/tmp/project/sub")]
+        );
+    }
+
+    /// 空监控起点 = 不监控任何目录（不回退到 project_root）
+    #[test]
+    fn test_empty_watch_roots_stays_empty() {
+        let watcher =
+            FileWatcher::new(Path::new("/tmp/project"), vec![]).with_watch_roots(Vec::new());
+        assert!(watcher.watch_roots.is_empty());
+    }
+
+    /// 重叠监控起点被规整为最短的那些
+    #[test]
+    fn test_normalize_watch_roots_removes_nested() {
+        let roots = vec![
+            PathBuf::from("/p/crates/a"),
+            PathBuf::from("/p/crates"),
+            PathBuf::from("/p/crates"),
+            PathBuf::from("/p/other"),
+        ];
+        assert_eq!(
+            normalize_watch_roots(&roots),
+            vec![PathBuf::from("/p/crates"), PathBuf::from("/p/other")]
+        );
+    }
+
+    /// 规整不会误伤同名前缀（`/p/crates2` 不是 `/p/crates` 的子目录）
+    #[test]
+    fn test_normalize_watch_roots_keeps_sibling_prefix() {
+        let roots = vec![PathBuf::from("/p/crates"), PathBuf::from("/p/crates2")];
+        assert_eq!(normalize_watch_roots(&roots).len(), 2);
     }
 
     #[test]
