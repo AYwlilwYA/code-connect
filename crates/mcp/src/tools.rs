@@ -73,6 +73,11 @@ pub struct ToolRegistry {
     /// `None` 表示索引由旧版本构建、未记录时间 —— 此时不得谎报「刚刚构建」，
     /// 响应中会提示索引时间未知。
     pub index_built_at_unix: Option<i64>,
+    /// 文件监控是否已启动
+    ///
+    /// serve 启动时与 MCP `reindex` 建完索引后都会尝试挂监控，
+    /// 用该标记保证只挂一次。
+    pub watcher_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ToolRegistry {
@@ -88,7 +93,17 @@ impl ToolRegistry {
             config: None,
             parser_registry: None,
             index_built_at_unix: None,
+            watcher_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// 尝试认领「启动文件监控」的名额
+    ///
+    /// 返回 `true` 表示本次调用应当去启动监控，`false` 表示已经启动过了。
+    pub fn try_claim_watcher(&self) -> bool {
+        !self
+            .watcher_active
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 设置索引最后构建时间（Unix 秒）
@@ -995,17 +1010,31 @@ pub fn handle_detect_dead_code(
         None => return McpResponse::error("调用边索引未初始化"),
     };
 
-    // 收集所有已知的符号 ID 和名称（从 tantivy 获取，不再从 sled 扫描）
-    let all_ids = match &registry.query_engine {
-        Some(q) => match q.scan_all_ids() {
-            Ok(ids) => ids,
-            Err(e) => return McpResponse::error(&format!("扫描符号 ID 失败: {}", e)),
-        },
+    let query_engine = match &registry.query_engine {
+        Some(q) => q,
         None => return McpResponse::error("查询引擎未初始化"),
     };
 
-    // 提取所有符号名称供死代码检测使用
-    let all_symbols: Vec<String> = all_ids.iter().map(|(_, name)| name.clone()).collect();
+    // 收集所有已知的符号 ID（从 tantivy 获取，不再从 sled 扫描）——调用图需要全集
+    let all_ids = match query_engine.scan_all_ids() {
+        Ok(ids) => ids,
+        Err(e) => return McpResponse::error(&format!("扫描符号 ID 失败: {}", e)),
+    };
+
+    // 死代码候选**只取可被调用的符号**（function / method）。
+    // 字段、参数、局部变量从不作为调用目标，按定义永远不可达 ——
+    // 把它们计入会让死代码比例严重虚高：实测本项目 3650 个符号里
+    // 报出 3643 条「死代码」，绝大多数就是这类噪音。
+    let (all_scanned, skipped_docs) = match query_engine.scan_all_symbols() {
+        Ok(v) => v,
+        Err(e) => return McpResponse::error(&format!("扫描符号失败: {}", e)),
+    };
+    let total_scanned = all_scanned.len();
+    let all_symbols: Vec<String> = all_scanned
+        .iter()
+        .filter(|s| s.kind == "function" || s.kind == "method")
+        .map(|s| s.name.clone())
+        .collect();
 
     let call_graph = match codeconnect_graph::call_graph::CallGraph::build_from_tantivy_edges(call_edge_index, &all_ids) {
         Ok(g) => g,
@@ -1016,6 +1045,14 @@ pub fn handle_detect_dead_code(
     let entry_points = params.entry_points.unwrap_or_else(|| {
         vec!["main".to_string()]
     });
+
+    // 入口点若在候选集里根本不存在，可达性分析就没有意义 ——
+    // 必须说出来，否则「全部不可达」会被当成结论
+    let missing_entries: Vec<String> = entry_points
+        .iter()
+        .filter(|e| !all_symbols.iter().any(|n| n == *e))
+        .cloned()
+        .collect();
 
     let dead_entries = codeconnect_graph::metrics::MetricCalculator::detect_dead_code(
         &all_symbols,
@@ -1028,7 +1065,9 @@ pub fn handle_detect_dead_code(
 
     let result = serde_json::json!({
         "entry_points": entry_points,
-        "total_symbols": all_symbols.len(),
+        "candidate_symbols": all_symbols.len(),
+        "total_indexed_symbols": total_scanned,
+        "missing_entry_points": missing_entries,
         "dead_code_count": total_dead,
         "dead_entries": dead_entries[..shown_dead].iter().map(|d| {
             serde_json::json!({
@@ -1047,6 +1086,43 @@ pub fn handle_detect_dead_code(
     if let Some(w) = truncation_warning(shown_dead, total_dead, "死代码条目") {
         response = response.with_warning(w);
     }
+
+    // 可达性覆盖度过低时，结论不可信必须说出来。
+    //
+    // 已查实：调用图的**被调用者解析能力不足** —— 例如 trace_callees("run_command")
+    // 只返回 Ok/unwrap_or/map 这类标准库方法名，项目内真实的路径调用
+    // （commands::serve::run）与方法调用链不上边，于是从入口点 BFS 走不了几步，
+    // 结果是「99% 符号都是死代码」这种明显荒谬却看起来正常的结论。
+    // 在解析能力修好之前，宁可让调用方知道这个数字不能用。
+    let reachable_count = all_symbols.len().saturating_sub(total_dead);
+    let coverage = if all_symbols.is_empty() {
+        1.0
+    } else {
+        reachable_count as f64 / all_symbols.len() as f64
+    };
+    if all_symbols.len() >= 20 && coverage < 0.05 {
+        response = response.with_warning(format!(
+            "可达性覆盖度异常低（仅 {} / {} 个可调用符号可达，{:.1}%）—— 这几乎可以肯定是调用图的被调用者解析能力不足所致（路径调用与方法调用未能连边），**不是**真实的死代码结论，请勿据此删除代码。本工具在被调用者解析修复前仅供粗略参考。",
+            reachable_count,
+            all_symbols.len(),
+            coverage * 100.0
+        ));
+    }
+
+    if !missing_entries.is_empty() {
+        response = response.with_warning(format!(
+            "入口点 {:?} 在索引中不存在（候选集仅含 function/method），可达性分析因此不成立 —— 上面的结果不能当作死代码结论。请在 .codeconnect.toml 的 [[dead_code]].entry_points 中配置真实入口点。",
+            missing_entries
+        ));
+    }
+
+    if skipped_docs > 0 {
+        response = response.with_warning(format!(
+            "扫描时有 {} 个索引文档读取失败或已损坏，已跳过，结果可能不完整；建议运行一次 reindex(full=true)。",
+            skipped_docs
+        ));
+    }
+
     response
 }
 
@@ -1191,6 +1267,46 @@ pub fn handle_find_references(
     McpResponse::success(result, total, total, elapsed)
 }
 
+/// 索引构建完成后启动文件监控
+///
+/// 返回 `true` 表示本次确实启动了监控；`false` 表示已启动过，
+/// 或索引存储不在 registry 中（本服务启动时索引目录不存在，
+/// 自举出的实例只存在于那次 reindex 的局部作用域里）。
+fn start_watcher_after_index(registry: &ToolRegistry) -> bool {
+    let (Some(sled), Some(tantivy), Some(edges), Some(parsers), Some(root)) = (
+        registry.sled.clone(),
+        registry.tantivy.clone(),
+        registry.call_edge_index.clone(),
+        registry.parser_registry.clone(),
+        registry.project_root.clone(),
+    ) else {
+        return false;
+    };
+
+    // 先确认资源齐备再认领，避免认领后失败导致再也没机会启动
+    if !registry.try_claim_watcher() {
+        return false;
+    }
+
+    let excludes = registry
+        .config
+        .as_ref()
+        .map(|c| c.workspace.excludes.clone())
+        .unwrap_or_default();
+
+    let indexer =
+        codeconnect_index::incremental::IncrementalIndexer::new(&root, sled, tantivy, edges, parsers);
+
+    tokio::spawn(async move {
+        tracing::info!("索引已构建，文件监控已启动，将持续增量更新");
+        if let Err(e) = indexer.start_watching(excludes).await {
+            tracing::error!("文件监控异常停止: {}", e);
+        }
+    });
+
+    true
+}
+
 /// 重新索引 handler
 ///
 /// 在进程内直接调用 [`FullIndexer`] 构建索引，不再 spawn 子进程，
@@ -1257,9 +1373,15 @@ pub async fn handle_reindex(
 
     match result {
         Ok(Ok(stats)) => {
+            // 索引建好后把文件监控挂上 —— 此前只有 serve 启动时才会挂，
+            // 于是「先起服务、再用 reindex 建索引」时监控永远不生效，
+            // 必须重启进程，与「建过一次之后自动监听」的预期不符
+            let watcher_started = start_watcher_after_index(registry);
+
             let result = serde_json::json!({
                 "status": "reindex_complete",
                 "mode": if params.full { "full" } else { "incremental" },
+                "watcher_started": watcher_started,
                 "stats": {
                     "files_scanned": stats.files_scanned,
                     "files_parsed": stats.files_parsed,
@@ -1270,7 +1392,15 @@ pub async fn handle_reindex(
                 },
             });
             let elapsed = start.elapsed().as_millis() as u64;
-            McpResponse::success(result, 1, 1, elapsed)
+            let response = McpResponse::success(result, 1, 1, elapsed);
+
+            if !watcher_started && registry.sled.is_none() {
+                // 自举出来的索引实例不在 registry 里，本进程查询不到也监控不了
+                return response.with_warning(
+                    "索引已构建到磁盘，但本服务启动时索引目录不存在，其索引实例未加载 —— 请重启本服务，之后查询与自动监控才会生效。".into(),
+                );
+            }
+            response
         }
         Ok(Err(e)) => {
             McpResponse::error(&format!("索引构建失败: {}", e))

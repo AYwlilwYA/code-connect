@@ -123,17 +123,19 @@ pub async fn run(
         .with_parser_registry(Arc::clone(&parser_registry))
         .with_index_built_at(index_built_at);
 
-    // 启动文件监控 — 在后台监控源文件变更，触发增量索引
-    // 仅在索引已加载且数据具备时才启动监控
-    if doc_count > 0 {
-        // 从 registry 中克隆索引的 Arc（复用已打开的实例，无需重新打开）
-        let tantivy_monitor = registry.tantivy.clone();
-        let sled_monitor = registry.sled.clone();
-        let call_edge_monitor = registry.call_edge_index.clone();
+    // 启动文件监控 — 在后台监控源文件变更，触发增量索引。
+    //
+    // 判据是「索引存储是否已加载」而非「doc_count > 0」：
+    // 后者会让「先启动服务、再用 reindex 建索引」的场景下监控永远不启动，
+    // 必须重启进程才行。
+    let tantivy_monitor = registry.tantivy.clone();
+    let sled_monitor = registry.sled.clone();
+    let call_edge_monitor = registry.call_edge_index.clone();
 
-        if let (Some(tantivy_monitor), Some(sled_monitor), Some(call_edge_monitor)) =
-            (tantivy_monitor, sled_monitor, call_edge_monitor)
-        {
+    if let (Some(tantivy_monitor), Some(sled_monitor), Some(call_edge_monitor)) =
+        (tantivy_monitor, sled_monitor, call_edge_monitor)
+    {
+        if registry.try_claim_watcher() {
             let project_root_owned = project_root.to_path_buf();
             let excludes = config.workspace.excludes.clone();
 
@@ -152,11 +154,11 @@ pub async fn run(
                     tracing::error!("文件监控异常停止: {}", e);
                 }
             });
-        } else {
-            tracing::warn!("无法启动文件监控: 索引存储未完整加载");
         }
     } else {
-        tracing::info!("索引为空，跳过文件监控启动（索引构建后再重启即可）");
+        tracing::warn!(
+            "无法启动文件监控：索引存储未加载（本服务启动时索引目录不存在）。请先运行 `codeconnect index`，再重启本服务。"
+        );
     }
 
     // 创建并启动服务器

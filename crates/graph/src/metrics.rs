@@ -251,13 +251,36 @@ impl MetricCalculator {
         entry_points: &[String],
     ) -> Vec<DeadCodeEntry> {
         // 第1步: 构建可达性集合
-        let mut reachable = HashSet::new();
+        //
+        // 关键：get_callees 返回的是**符号 ID**，而 all_symbols 传进来的是**符号名**。
+        // 此前只把（入口点名 + 后续 ID）存进可达集，第 2 步却拿**名字**去 contains，
+        // 两者永远对不上 —— 于是除入口点自身外全部被判为死代码，本函数长期失效。
+        // 这里改为在遍历过程中**同时记录 ID 与名字**，让后续按名字比对能够命中。
+        //
+        // 注意不能等 BFS 结束再统一映射 ID→名字：图里可能压根没有入口点这个节点
+        // （例如只传了入口点名、图由别的来源构建），那样连入口点都会丢。
+        // `reachable` 是「名字 + ID」的并集，只用于最后的比对；
+        // 是否入队必须另用 visited_ids 判定 —— 若拿 reachable 判，
+        // 入口点的 ID 往往与其名字相同，第二次 insert 返回 false，
+        // 会导致入口点压根不进队列、BFS 一步都不走。
+        let mut reachable: HashSet<String> = HashSet::new();
+        let mut visited_ids: HashSet<String> = HashSet::new();
         let mut queue = VecDeque::new();
 
-        // 从入口点开始
+        // 从入口点开始（入口点允许用符号名或符号 ID 指定）
         for entry in entry_points {
+            let id = call_graph
+                .get_node_by_id(entry)
+                .map(|n| n.symbol_id.clone())
+                .unwrap_or_else(|| entry.clone());
+
             reachable.insert(entry.clone());
-            queue.push_back(entry.clone());
+            if let Some(node) = call_graph.get_node_by_id(&id) {
+                reachable.insert(node.name.clone());
+            }
+            if visited_ids.insert(id.clone()) {
+                queue.push_back(id);
+            }
         }
 
         // BFS 正向遍历：从入口点沿出边找到被调用的符号
@@ -265,7 +288,10 @@ impl MetricCalculator {
             // 获取 current 调用的所有符号（被调用者）
             let callees = call_graph.get_callees(&current);
             for callee in callees {
-                if reachable.insert(callee.clone()) {
+                if let Some(node) = call_graph.get_node_by_id(&callee) {
+                    reachable.insert(node.name.clone());
+                }
+                if visited_ids.insert(callee.clone()) {
                     queue.push_back(callee);
                 }
             }

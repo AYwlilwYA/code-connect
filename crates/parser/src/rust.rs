@@ -62,6 +62,21 @@ impl RustParser {
     }
 }
 
+/// 判断节点是否存在指定类型的祖先
+///
+/// 用于区分「顶层函数」与「impl 块内的方法」—— 查询模式本身不锚定层级，
+/// 只能在此按语法树上下文剔除重复匹配。
+fn has_ancestor(node: tree_sitter::Node, kind: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == kind {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
 impl Default for RustParser {
     fn default() -> Self {
         Self::new()
@@ -109,6 +124,8 @@ impl LanguageParser for RustParser {
             let mut name = String::new();
             let mut parent = String::new();
             let mut kind = SymbolKind::Unknown("unknown".to_string());
+            // 本条匹配是否应当丢弃（见 @symbol.function 分支）
+            let mut skip_match = false;
             let mut location = SourceLocation {
                 file_path: file_path_str.clone(),
                 line: 0,
@@ -126,6 +143,16 @@ impl LanguageParser for RustParser {
                         name = self.node_text(node, source).to_string();
                     }
                     "symbol.function" => {
+                        // queries/rust/symbols.scm 里 `(function_item …) @symbol.function`
+                        // 不锚定层级，而 impl 内的 function_item 又会被
+                        // `(impl_item … (function_item …) @symbol.method)` 匹配一次 ——
+                        // 同一行代码因此产出 function 与 method 两个符号（kind 参与
+                        // stable_id 计算 → 两个不同 ID → 索引里两份）。
+                        // impl 内的函数只保留 method 这一条。
+                        if has_ancestor(node, "impl_item") {
+                            skip_match = true;
+                            break;
+                        }
                         kind = SymbolKind::Function;
                         location = self.node_to_location(node, &file_path_str);
                     }
@@ -172,7 +199,7 @@ impl LanguageParser for RustParser {
                 }
             }
 
-            if name.is_empty() {
+            if skip_match || name.is_empty() {
                 continue;
             }
 
