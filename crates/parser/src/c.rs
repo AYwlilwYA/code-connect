@@ -104,6 +104,8 @@ impl LanguageParser for CParser {
 
         while let Some(m) = matches.next() {
             let mut name = String::new();
+            // 名字节点：枚举量的位置以它为准
+            let mut name_node: Option<tree_sitter::Node> = None;
             let mut kind = SymbolKind::Unknown("unknown".to_string());
             let mut location = SourceLocation {
                 file_path: file_path_str.clone(),
@@ -120,6 +122,7 @@ impl LanguageParser for CParser {
                 match capture_name {
                     "name" => {
                         name = self.node_text(node, source).to_string();
+                        name_node = Some(node);
                     }
                     "func" => {
                         kind = SymbolKind::Function;
@@ -138,6 +141,11 @@ impl LanguageParser for CParser {
                         kind = SymbolKind::Enum;
                         location = self.node_to_location(node, &file_path_str);
                     }
+                    // 枚举量（spec A）：8 个语言统一用 @enumerator 这个 capture 名
+                    "enumerator" | "symbol.enumerator" => {
+                        kind = SymbolKind::Constant;
+                        location = self.node_to_location(node, &file_path_str);
+                    }
                     "macro" => {
                         kind = SymbolKind::Macro;
                         location = self.node_to_location(node, &file_path_str);
@@ -154,12 +162,18 @@ impl LanguageParser for CParser {
                 continue;
             }
 
+            // 枚举量的位置以**名字节点**为准，不用成员节点
+            if let Some(n) = name_node.filter(|_| matches!(kind, SymbolKind::Constant)) {
+                location = self.node_to_location(n, &file_path_str);
+            }
+
             let kind_str = match &kind {
                 SymbolKind::Function => "function",
                 SymbolKind::Struct => "struct",
                 SymbolKind::Enum => "enum",
                 SymbolKind::Macro => "macro",
                 SymbolKind::TypeAlias => "type_alias",
+                SymbolKind::Constant => "constant",
                 _ => "unknown",
             };
 
@@ -173,6 +187,7 @@ impl LanguageParser for CParser {
                     | SymbolKind::Enum
                     | SymbolKind::TypeAlias
                     | SymbolKind::Macro
+                    | SymbolKind::Constant
             );
 
             let modifiers = if is_exported {

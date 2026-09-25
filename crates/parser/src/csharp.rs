@@ -99,6 +99,7 @@ impl CSharpParser {
             SymbolKind::Method => "method",
             SymbolKind::Field => "field",
             SymbolKind::Module => "namespace",
+            SymbolKind::Constant => "constant",
             SymbolKind::Unknown(s) if s == "property" => "property",
             _ => "unknown",
         }
@@ -148,6 +149,8 @@ impl LanguageParser for CSharpParser {
 
         while let Some(m) = matches.next() {
             let mut name = String::new();
+            // 名字节点：枚举量的位置以它为准（见下方说明）
+            let mut name_node: Option<tree_sitter::Node> = None;
             let mut kind = SymbolKind::Unknown("unknown".to_string());
             let mut location = SourceLocation {
                 file_path: file_path_str.clone(),
@@ -164,6 +167,7 @@ impl LanguageParser for CSharpParser {
                 match capture_name {
                     "symbol.name" => {
                         name = self.node_text(node, source).to_string();
+                        name_node = Some(node);
                     }
                     "symbol.class" => {
                         kind = SymbolKind::Class;
@@ -179,6 +183,11 @@ impl LanguageParser for CSharpParser {
                     }
                     "symbol.enum" => {
                         kind = SymbolKind::Enum;
+                        location = self.node_to_location(node, &file_path_str);
+                    }
+                    // 枚举量（spec A）：8 个语言统一用 @enumerator 这个 capture 名
+                    "enumerator" | "symbol.enumerator" => {
+                        kind = SymbolKind::Constant;
                         location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.method" => {
@@ -222,6 +231,14 @@ impl LanguageParser for CSharpParser {
             // 过滤掉只有声明位置但没有节点类型的匹配（可能是字段查询的中间节点）
             if location.line == 0 {
                 continue;
+            }
+
+            // 枚举量的位置以**名字节点**为准，不用成员节点：
+            // `[Obsolete]\nLegacy` 这种带属性的成员，enum_member_declaration 节点从 `[` 起算，
+            // 用成员节点会把行号报到属性那行（与 `grep -n Legacy` 对不上）。
+            // 覆盖度审计对这种错位有「容器包含」兜底，不依赖这里的取舍。
+            if let Some(n) = name_node.filter(|_| matches!(kind, SymbolKind::Constant)) {
+                location = self.node_to_location(n, &file_path_str);
             }
 
             let kind_str = self.kind_str(&kind);

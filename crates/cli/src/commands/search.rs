@@ -2,10 +2,17 @@
 //!
 //! 通过 tantivy 全文索引按名称搜索符号，
 //! 返回匹配符号的位置和类型信息。
+//!
+//! 同时回显「文本真值」：在**已索引文件集**内做纯文本扫描，
+//! 使「符号索引里没有」与「代码里没有」不再同形 ——
+//! 二者行为、阈值、文案与 MCP 的 `search_symbol` 完全一致。
 
 use std::path::Path;
 
 use codeconnect_index::tantivy_index::TantivyIndex;
+use codeconnect_index::text_scan::TextTruthContext;
+
+use super::{print_text_truth, scan_text_truth};
 
 /// 执行符号搜索
 ///
@@ -25,8 +32,6 @@ pub async fn run(
     language: Option<String>,
     kind: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = project_root;
-
     let tantivy_dir = data_dir.join("tantivy");
 
     // 检查索引目录是否存在（不自动创建——索引应由 `codeconnect index` 命令构建）
@@ -41,6 +46,11 @@ pub async fn run(
         .search_by_name(query, language.as_deref(), kind.as_deref(), limit)
         .map_err(|e| format!("搜索失败: {}", e))?;
 
+    // 文本真值：只在已索引文件集内扫，且不受 language/kind 过滤影响
+    let text = super::open_sled(data_dir)
+        .as_ref()
+        .and_then(|sled| scan_text_truth(project_root, sled, query));
+
     if search_results.is_empty() {
         println!("未找到匹配 '{}' 的符号", query);
 
@@ -54,6 +64,8 @@ pub async fn run(
                 }
             }
         }
+
+        print_text_truth(text.as_ref(), TextTruthContext::SymbolNotIndexed, 0);
         return Ok(());
     }
 
@@ -78,6 +90,12 @@ pub async fn run(
 
     println!("{0:-<80}", "");
     println!("共显示 {} 条结果", search_results.len());
+
+    print_text_truth(
+        text.as_ref(),
+        TextTruthContext::SymbolNotIndexed,
+        search_results.len(),
+    );
 
     Ok(())
 }

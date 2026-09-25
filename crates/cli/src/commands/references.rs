@@ -10,6 +10,9 @@ use codeconnect_graph::call_graph::CallGraph;
 use codeconnect_index::query_engine::QueryEngine;
 use codeconnect_index::sled_store::SledStore;
 use codeconnect_index::tantivy_index::{CallEdgeIndex, TantivyIndex};
+use codeconnect_index::text_scan::TextTruthContext;
+
+use super::{print_text_truth, scan_text_truth};
 
 /// 执行符号引用查找
 ///
@@ -25,8 +28,6 @@ pub async fn run(
     symbol: &str,
     include_declaration: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = project_root;
-
     // 检查索引目录是否存在
     super::check_index_dirs_exist(data_dir)?;
 
@@ -126,6 +127,12 @@ pub async fn run(
             println!("  {}  ({})", caller.name, simplify_call_type(&caller.call_type));
         }
     }
+
+    // 文本真值：调用边覆盖不全（限定名调用、宏、间接调用）时，
+    // 「没有调用方」与「调用边没建」在输出上同形 —— 必须把文本命中一并摆出来。
+    // 复用上面已打开的 sled 句柄：同一进程里二次打开同一 DB 会失败
+    let text = scan_text_truth(project_root, &sled_arc, &query_name);
+    print_text_truth(text.as_ref(), TextTruthContext::NoCallers, callers.len());
 
     Ok(())
 }

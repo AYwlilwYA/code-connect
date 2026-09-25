@@ -9,6 +9,7 @@ members = [
     "crates/graph",
     "crates/services",
     "crates/diff",
+    "crates/embed",
     "crates/mcp",
     "crates/watcher",
     "crates/cli",

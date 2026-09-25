@@ -193,6 +193,7 @@ pub fn symbol_search_result_to_symbol(result: &SymbolSearchResult) -> Symbol {
         "interface" => SymbolKind::Interface,
         "struct" => SymbolKind::Struct,
         "enum" => SymbolKind::Enum,
+        "constant" => SymbolKind::Constant,
         "trait" => SymbolKind::Trait,
         "type_alias" => SymbolKind::TypeAlias,
         "variable" => SymbolKind::Variable,

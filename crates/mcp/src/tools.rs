@@ -39,6 +39,10 @@ use codeconnect_index::full_indexer::{FullIndexer, IndexStats};
 use codeconnect_index::query_engine::QueryEngine;
 use codeconnect_index::sled_store::SledStore;
 use codeconnect_index::tantivy_index::{CallEdgeIndex, TantivyIndex};
+use codeconnect_index::text_scan::{
+    TEXT_DETAIL_LIMIT, TEXT_SUMMARY_THRESHOLD, TextScanReport, TextTruthContext,
+    scan_indexed_corpus,
+};
 use codeconnect_parser::factory::ParserRegistry;
 
 use crate::schemas::*;
@@ -78,6 +82,19 @@ pub struct ToolRegistry {
     /// serve 启动时与 MCP `reindex` 建完索引后都会尝试挂监控，
     /// 用该标记保证只挂一次。
     pub watcher_active: Arc<std::sync::atomic::AtomicBool>,
+    /// 已索引文件列表缓存（文本真值扫描的范围）
+    ///
+    /// sled 的**首次**前缀遍历实测要 1.8s（同进程随后降到 1ms），
+    /// 放在每次搜索的热路径上不可接受，故按进程缓存。
+    indexed_files_cache: Arc<std::sync::Mutex<Option<IndexedFilesCache>>>,
+}
+
+/// 已索引文件列表的缓存条目
+struct IndexedFilesCache {
+    /// 建缓存时的 tantivy 文档数 —— 索引一变它必变，是近乎零成本的失效判据
+    doc_count: u64,
+    /// 已索引文件的相对路径
+    files: Arc<Vec<String>>,
 }
 
 impl ToolRegistry {
@@ -94,7 +111,38 @@ impl ToolRegistry {
             parser_registry: None,
             index_built_at_unix: None,
             watcher_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            indexed_files_cache: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// 取已索引文件列表（进程内缓存）
+    ///
+    /// 缓存命中判据是 tantivy 文档数：reindex 与文件监控的增量更新都会改变它。
+    /// 极小概率的例外是「新增了一个不含任何已索引符号的文件」——
+    /// 这种文件在文本扫描里本来也只会贡献「非符号文本」，影响可忽略。
+    fn indexed_files(
+        &self,
+        tantivy: &TantivyIndex,
+        sled: &SledStore,
+    ) -> Option<Arc<Vec<String>>> {
+        let doc_count = tantivy.doc_count().ok()?;
+
+        let mut guard = self
+            .indexed_files_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cached) = guard.as_ref() {
+            if cached.doc_count == doc_count {
+                return Some(cached.files.clone());
+            }
+        }
+
+        let files = Arc::new(codeconnect_index::text_scan::indexed_file_paths(sled));
+        *guard = Some(IndexedFilesCache {
+            doc_count,
+            files: files.clone(),
+        });
+        Some(files)
     }
 
     /// 尝试认领「启动文件监控」的名额
@@ -232,8 +280,15 @@ pub fn handle_search_symbol(
         Err(e) => return McpResponse::error(&format!("搜索失败: {}", e)),
     };
 
+    // 文本真值：只在已索引文件集内扫，不受 language/kind 过滤影响 ——
+    // 那两个过滤只作用于符号检索，而「过滤太窄」本身就是查不到的常见原因
+    let text = params
+        .text_truth
+        .then(|| text_truth_scan(registry, &params.query))
+        .flatten();
+
     if results.is_empty() {
-        return no_match_response(registry, &params, start);
+        return no_match_response(registry, &params, start, text.as_ref());
     }
 
     // 搜索结果已包含完整的符号信息（从 tantivy STORED 字段）
@@ -252,7 +307,13 @@ pub fn handle_search_symbol(
     let total = symbols.len();
     let elapsed = start.elapsed().as_millis() as u64;
 
-    McpResponse::success(serde_json::Value::Array(symbols), total, total, elapsed)
+    let response = McpResponse::success(serde_json::Value::Array(symbols), total, total, elapsed);
+    attach_text_truth(
+        response,
+        text.as_ref(),
+        TextTruthContext::SymbolNotIndexed,
+        total,
+    )
 }
 
 /// brief 模式下签名保留的最大字符数
@@ -289,10 +350,31 @@ fn clip<T>(items: &[T], limit: usize) -> (usize, usize) {
 
 /// 生成截断告警文案；未截断时返回 None（不制造噪音）
 fn truncation_warning(shown: usize, total: usize, what: &str) -> Option<String> {
+    truncation_warning_with_hint(
+        shown,
+        total,
+        what,
+        &format!(
+            "需要更多请调大 limit（上限 {}），或缩小查询范围。",
+            MAX_RESULT_LIMIT
+        ),
+    )
+}
+
+/// 同上，但由调用方给出「怎么拿到更多」的提示
+///
+/// 文本真值明细的条数上限是固定常量、不是 `limit` 参数，
+/// 直接套用默认提示会给出做不到的建议。
+fn truncation_warning_with_hint(
+    shown: usize,
+    total: usize,
+    what: &str,
+    hint: &str,
+) -> Option<String> {
     (total > shown).then(|| {
         format!(
-            "{}共 {} 条，本次仅返回前 {} 条（已截断）。需要更多请调大 limit（上限 {}），或缩小查询范围。",
-            what, total, shown, MAX_RESULT_LIMIT
+            "{}共 {} 条，本次仅返回前 {} 条（已截断）。{}",
+            what, total, shown, hint
         )
     })
 }
@@ -307,14 +389,92 @@ fn truncate_chars(s: &str, max: usize) -> String {
     truncated
 }
 
+/// 在已索引文件集内做文本扫描，取得「文本真值」
+///
+/// 返回 `None` 表示这一层保护不可用（缺项目根 / 缺 sled / 已索引文件列表为空），
+/// 此时如实当作「无文本信息」处理 —— **不伪造「文本里也没有」**。
+fn text_truth_scan(registry: &ToolRegistry, needle: &str) -> Option<TextScanReport> {
+    let root = registry.project_root.as_deref()?;
+    let tantivy = registry.tantivy.as_deref()?;
+    let sled = registry.sled.as_deref()?;
+
+    let files = registry.indexed_files(tantivy, sled)?;
+    scan_indexed_corpus(root, &files, needle, TEXT_DETAIL_LIMIT)
+}
+
+/// 构造文本真值提示块（覆盖率告警 + 真值提示，二者都可能缺省）
+///
+/// MCP 与 CLI 共用同一份文案来源，保证两条路径行为一致。
+fn text_truth_suffix(
+    text: Option<&TextScanReport>,
+    context: TextTruthContext,
+    symbol_hits: usize,
+) -> Option<String> {
+    let report = text?;
+
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(coverage) = report.coverage_warning() {
+        parts.push(coverage);
+    }
+    if let Some(notice) = report.text_truth_notice(context, symbol_hits) {
+        parts.push(notice);
+    }
+    // 明细被截断时必须给出真实总数，复用既有的截断告警，不另造一套。
+    // 只在**确实展开了明细**时报 —— 充足命中时一行汇总都没列，说「仅返回前 50 条」是假话
+    if symbol_hits < TEXT_SUMMARY_THRESHOLD {
+        let (shown, _) = clip(&report.hits, TEXT_DETAIL_LIMIT);
+        if let Some(warning) = truncation_warning_with_hint(
+            shown,
+            report.total_hits,
+            "文本命中",
+            "文本明细条数上限固定为 50；可用 text_truth=false 关闭回显，或缩小查询范围。",
+        ) {
+            parts.push(warning);
+        }
+    }
+
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+/// 把文本真值提示挂到响应上（渐进披露，spec §2.2）
+///
+/// - 符号命中**充足**（≥ [`TEXT_SUMMARY_THRESHOLD`]）：只附一行汇总，
+///   直接进 `warnings` 而**不降级状态** —— 符号结果本身是完整的，这只是附注，
+///   若每次搜索都降为 Partial，真正需要警惕的 Partial 就失去意义了。
+/// - 符号命中**稀少或为 0**：走 `with_warning`（状态降为 Partial）——
+///   符号结果**不完整**，这正是需要调用方停下来的情形，
+///   与既有 `no_match_response` 的语义保持一致。
+fn attach_text_truth<T: serde::Serialize>(
+    response: McpResponse<T>,
+    text: Option<&TextScanReport>,
+    context: TextTruthContext,
+    symbol_hits: usize,
+) -> McpResponse<T> {
+    match text_truth_suffix(text, context, symbol_hits) {
+        None => response,
+        Some(block) => {
+            if symbol_hits >= TEXT_SUMMARY_THRESHOLD {
+                let mut response = response;
+                response.warnings.push(block);
+                response
+            } else {
+                response.with_warning(block)
+            }
+        }
+    }
+}
+
 /// 构造「无匹配」响应
 ///
 /// 关键点：不返回看起来正常的空 Success —— 那会让调用方把「没匹配上」
-/// 误读为「该符号不存在」并转而重复实现。此处显式给出相近候选与排查方向。
+/// 误读为「该符号不存在」并转而重复实现。此处显式给出相近候选与排查方向，
+/// 并附上文本真值：**符号索引里没有、文本里却有**时，必须说清那不是「不存在」。
+/// 这些内容并进**同一条** warning，避免出现两套并存的「没找到」提示。
 fn no_match_response(
     registry: &ToolRegistry,
     params: &SearchSymbolParams,
     start: Instant,
+    text: Option<&TextScanReport>,
 ) -> McpResponse<serde_json::Value> {
     let mut message = format!("未找到匹配 '{}' 的符号。", params.query);
 
@@ -327,6 +487,11 @@ fn no_match_response(
     }
 
     message.push_str(&describe_similar_symbols(registry, &params.query));
+
+    if let Some(block) = text_truth_suffix(text, TextTruthContext::SymbolNotIndexed, 0) {
+        message.push('\n');
+        message.push_str(&block);
+    }
 
     let elapsed = start.elapsed().as_millis() as u64;
     McpResponse::success(serde_json::Value::Array(Vec::new()), 0, 0, elapsed)
@@ -429,6 +594,27 @@ fn resolve_or_respond<T: serde::Serialize>(
     input: &str,
     tool: &str,
 ) -> Result<Symbol, McpResponse<T>> {
+    resolve_or_respond_impl(registry, input, tool, false)
+}
+
+/// 与 [`resolve_or_respond`] 相同，但解析失败时额外附上文本真值
+///
+/// 供「查不到 ≠ 不存在」风险最高的工具使用：符号引用完全不匹配时，
+/// 文本里可能到处都是它 —— 只回「未找到」会让调用方直接下「不存在」的结论。
+fn resolve_or_respond_with_text_truth<T: serde::Serialize>(
+    registry: &ToolRegistry,
+    input: &str,
+    tool: &str,
+) -> Result<Symbol, McpResponse<T>> {
+    resolve_or_respond_impl(registry, input, tool, true)
+}
+
+fn resolve_or_respond_impl<T: serde::Serialize>(
+    registry: &ToolRegistry,
+    input: &str,
+    tool: &str,
+    with_text_truth: bool,
+) -> Result<Symbol, McpResponse<T>> {
     match resolve_symbol_ref(registry, input) {
         Ok(SymbolRef::Resolved(symbol)) => Ok(*symbol),
         Ok(SymbolRef::Ambiguous(candidates)) => {
@@ -445,12 +631,26 @@ fn resolve_or_respond<T: serde::Serialize>(
                 listed.join(" | ")
             )))
         }
-        Ok(SymbolRef::NotFound) => Err(McpResponse::error(&format!(
-            "{}: 未找到符号 '{}' —— 它既不是有效的 symbol_id，也不匹配任何已索引的符号名。{}",
-            tool,
-            input,
-            describe_similar_symbols(registry, input)
-        ))),
+        Ok(SymbolRef::NotFound) => {
+            let mut message = format!(
+                "{}: 未找到符号 '{}' —— 它既不是有效的 symbol_id，也不匹配任何已索引的符号名。{}",
+                tool,
+                input,
+                describe_similar_symbols(registry, input)
+            );
+
+            if with_text_truth {
+                let text = text_truth_scan(registry, input);
+                if let Some(block) =
+                    text_truth_suffix(text.as_ref(), TextTruthContext::SymbolNotIndexed, 0)
+                {
+                    message.push('\n');
+                    message.push_str(&block);
+                }
+            }
+
+            Err(McpResponse::error(&message))
+        }
         Err(e) => Err(McpResponse::error(&format!("{}: {}", tool, e))),
     }
 }
@@ -1220,10 +1420,11 @@ pub fn handle_find_references(
     };
 
     // 支持直接传符号名，解析为唯一符号
-    let target = match resolve_or_respond(registry, &params.symbol_id, "find_references") {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let target =
+        match resolve_or_respond_with_text_truth(registry, &params.symbol_id, "find_references") {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
 
     // 从调用图获取所有调用者（从 tantivy 构建）
     let all_ids = match &registry.query_engine {
@@ -1262,9 +1463,23 @@ pub fn handle_find_references(
         "total_references": callers.len(),
     });
 
+    // 调用边覆盖不全（限定名调用、宏、间接调用）时「没有调用方」与「真的没人调」
+    // 在返回值上同形 —— 据此判定「改签名很安全」已造成过真实事故，
+    // 所以这里按调用者总数（而非截断后的返回数）决定展开还是汇总
+    let text = params
+        .text_truth
+        .then(|| text_truth_scan(registry, &target.name))
+        .flatten();
+
     let total = references.len();
     let elapsed = start.elapsed().as_millis() as u64;
-    McpResponse::success(result, total, total, elapsed)
+    let response = McpResponse::success(result, total, total, elapsed);
+    attach_text_truth(
+        response,
+        text.as_ref(),
+        TextTruthContext::NoCallers,
+        callers.len(),
+    )
 }
 
 /// 索引构建完成后启动文件监控
@@ -1411,6 +1626,12 @@ pub async fn handle_reindex(
                     "calls_found": stats.calls_found,
                     "imports_found": stats.imports_found,
                     "failed_files": stats.failed_files.len(),
+                    // 覆盖度审计（spec B）：让「没索引」与「不存在」在响应上可区分
+                    "coverage": {
+                        "files_with_gaps": stats.coverage.files_with_gaps,
+                        "kinds_without_symbols": stats.coverage.kinds_without_symbols,
+                        "note": stats.coverage.note,
+                    },
                 },
             });
             let elapsed = start.elapsed().as_millis() as u64;
@@ -1424,6 +1645,12 @@ pub async fn handle_reindex(
                     "本次未扫描到任何源文件（索引范围: {}）—— 索引可能为空，请检查 .codeconnect.toml 的 workspace.roots 与语言开关。",
                     roots_desc
                 ));
+            }
+
+            // 覆盖度缺口必须进 warning 通道：它不是「一切正常」的一部分，
+            // 而是「有些名字查不到，但那不代表不存在」——正是前三次事故被误读的地方
+            if let Some(note) = &stats.coverage.note {
+                response = response.with_warning(note.clone());
             }
 
             if !watcher_started && registry.sled.is_none() {
@@ -2271,6 +2498,7 @@ mod tests {
             language: None,
             limit: 10,
             detail: "brief".to_string(),
+            text_truth: true,
         };
         let response = handle_search_symbol(&registry, params);
         assert_eq!(response.status, codeconnect_core::response::ResponseStatus::Error);
@@ -2496,5 +2724,323 @@ mod tests {
         let result = extract_source(&registry, &symbol_at("src/demo.rs", 1, 2));
         assert_eq!(result["available"], false);
         assert!(result["reason"].as_str().unwrap().contains("未配置项目根目录"));
+    }
+
+    // ===== 文本真值回显（文本真值 spec §2）=====
+    //
+    // 共同前提：符号索引必然覆盖不全（枚举量、限定名、宏……），
+    // 而「索引里没有」与「代码里没有」在返回值上同形 —— 都是 0、都无告警。
+    // 下面这些用例守住的就是「0 不许裸奔」。
+
+    /// 构造一个带**真实索引**的测试项目，返回（项目根目录, 装配好的 ToolRegistry）
+    ///
+    /// 用真实 `FullIndexer` 建索引而不是塞假数据：只有这样，
+    /// 「已索引文件集」与文本扫描范围的关系才是真的。
+    fn indexed_project(
+        name: &str,
+        files: &[(&str, &str)],
+    ) -> (std::path::PathBuf, ToolRegistry) {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (rel, content) in files {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, content).unwrap();
+        }
+
+        let data_dir = dir.join(".codeconnect");
+        let tantivy = Arc::new(TantivyIndex::open_or_create(&data_dir.join("tantivy")).unwrap());
+        let edges =
+            Arc::new(CallEdgeIndex::open_or_create(&data_dir.join("tantivy_edges")).unwrap());
+        let sled = Arc::new(SledStore::open(&data_dir.join("sled")).unwrap());
+
+        let mut parsers = ParserRegistry::new();
+        parsers.register(Arc::new(codeconnect_parser::rust::RustParser::new()));
+
+        let indexer = FullIndexer::new(
+            &dir,
+            tantivy.clone(),
+            edges.clone(),
+            sled.clone(),
+            Arc::new(parsers),
+        );
+        indexer.run().expect("建立测试索引失败");
+
+        let registry = ToolRegistry::new()
+            .with_tantivy(tantivy.clone())
+            .with_call_edge_index(edges)
+            .with_query_engine(Arc::new(QueryEngine::from_arc(tantivy, sled.clone())))
+            .with_sled(sled)
+            .with_project_root(dir.clone());
+
+        (dir, registry)
+    }
+
+    /// 拆掉测试项目（必须先 drop registry，否则 sled 仍占着目录锁）
+    fn cleanup(dir: std::path::PathBuf, registry: ToolRegistry) {
+        drop(registry);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn search_params(query: &str, text_truth: bool) -> SearchSymbolParams {
+        SearchSymbolParams {
+            query: query.to_string(),
+            kind: None,
+            language: None,
+            limit: 20,
+            detail: "brief".to_string(),
+            text_truth,
+        }
+    }
+
+    /// 验收 1：符号索引 0 命中、文本有命中 —— 必须点明「这不代表不存在」
+    #[test]
+    fn test_search_symbol_zero_index_hits_echoes_text_truth() {
+        let (dir, registry) = indexed_project(
+            "cc_text_truth_zero",
+            &[(
+                "src/a.rs",
+                "// Zzqqxxsentinelzzqqxx 只在文本里，不是任何符号\nfn main() {}\n",
+            )],
+        );
+
+        let response = handle_search_symbol(&registry, search_params("Zzqqxxsentinelzzqqxx", true));
+
+        assert_eq!(
+            response.status,
+            codeconnect_core::response::ResponseStatus::Partial,
+            "0 命中必须降级为 Partial，不能装成 Success"
+        );
+        assert!(response.data.as_ref().unwrap().as_array().unwrap().is_empty());
+
+        let warning = response.warnings.join("\n");
+        assert!(
+            warning.contains("符号索引中未找到 `Zzqqxxsentinelzzqqxx`"),
+            "缺少关键文案:\n{}",
+            warning
+        );
+        assert!(
+            warning.contains("文本检索在 1 个文件、1 处找到了它"),
+            "缺少真实命中数:\n{}",
+            warning
+        );
+        assert!(
+            warning.contains("这不代表 Zzqqxxsentinelzzqqxx 不存在"),
+            "缺少「不代表不存在」这一句 = 白做:\n{}",
+            warning
+        );
+        assert!(
+            warning.contains("改动前请以这些位置为准"),
+            "缺少行动指引:\n{}",
+            warning
+        );
+        assert!(
+            warning.contains("src/a.rs:1"),
+            "必须给出文本命中位置:\n{}",
+            warning
+        );
+        assert!(
+            warning.contains("Zzqqxxsentinelzzqqxx 只在文本里"),
+            "必须给出原文片段:\n{}",
+            warning
+        );
+
+        cleanup(dir, registry);
+    }
+
+    /// 验收 2：高频词命中充足 —— 只给一行汇总，不展开明细
+    #[test]
+    fn test_search_symbol_abundant_hits_only_summarizes() {
+        let files: Vec<(String, String)> = (0..6)
+            .map(|i| (format!("src/m{}.rs", i), "pub fn common() {}\n".to_string()))
+            .collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_str()))
+            .collect();
+        let (dir, registry) = indexed_project("cc_text_truth_abundant", &refs);
+
+        let response = handle_search_symbol(&registry, search_params("common", true));
+
+        let symbols = response.data.as_ref().unwrap().as_array().unwrap();
+        assert!(symbols.len() >= 5, "前提不成立：符号命中应充足，实际 {}", symbols.len());
+
+        // 符号结果本身完整，只是多了条附注 → 不得降级状态
+        assert_eq!(
+            response.status,
+            codeconnect_core::response::ResponseStatus::Success,
+            "充足命中时不应降级状态"
+        );
+        let warning = response.warnings.join("\n");
+        assert!(
+            warning.contains("文本另有 6 个文件 6 处出现"),
+            "应只给一行汇总:\n{}",
+            warning
+        );
+        assert!(!warning.contains("文本命中明细"), "充足命中不得展开明细:\n{}", warning);
+        assert!(!warning.contains("src/m0.rs:"), "充足命中不得列出位置:\n{}", warning);
+
+        cleanup(dir, registry);
+    }
+
+    /// 验收 3：文本扫描只覆盖已索引文件 —— 索引外的文件绝不能被扫到
+    #[test]
+    fn test_text_scan_skips_files_outside_index() {
+        let (dir, registry) = indexed_project(
+            "cc_text_truth_scope",
+            &[("src/in.rs", "// Zzqqxxmarkedzzqqxx 已索引\nfn main() {}\n")],
+        );
+
+        // 建完索引才出现：不在 sled 的已索引文件集里，文本扫描不该碰它
+        std::fs::write(
+            dir.join("src").join("late.rs"),
+            "// Zzqqxxmarkedzzqqxx 索引外\n",
+        )
+        .unwrap();
+
+        let response = handle_search_symbol(&registry, search_params("Zzqqxxmarkedzzqqxx", true));
+        let warning = response.warnings.join("\n");
+
+        assert!(warning.contains("src/in.rs:1"), "索引内文件必须被扫到:\n{}", warning);
+        assert!(
+            !warning.contains("late.rs"),
+            "索引外的文件不得出现在结果里:\n{}",
+            warning
+        );
+        assert!(
+            warning.contains("文本检索在 1 个文件、1 处找到了它"),
+            "计数必须只含索引内文件:\n{}",
+            warning
+        );
+
+        cleanup(dir, registry);
+    }
+
+    /// 验收 4：明细超限 —— 必须有告警且给出**真实总数**
+    #[test]
+    fn test_text_truth_truncation_reports_true_total() {
+        let body: String = (0..120)
+            .map(|i| format!("// Zzqqxxmanyzzqqxx 第 {} 行\n", i))
+            .collect();
+        let (dir, registry) = indexed_project("cc_text_truth_trunc", &[("src/a.rs", &body)]);
+
+        let response = handle_search_symbol(&registry, search_params("Zzqqxxmanyzzqqxx", true));
+        let warning = response.warnings.join("\n");
+
+        assert!(
+            warning.contains("文本检索在 1 个文件、120 处找到了它"),
+            "必须给出真实总数:\n{}",
+            warning
+        );
+        assert!(
+            warning.contains("文本命中共 120 条，本次仅返回前 50 条（已截断）"),
+            "超限必须告警:\n{}",
+            warning
+        );
+
+        let detail_lines = warning
+            .lines()
+            .filter(|l| l.trim_start().starts_with("src/a.rs:"))
+            .count();
+        assert_eq!(detail_lines, 50, "明细行数应恰好等于上限");
+
+        cleanup(dir, registry);
+    }
+
+    /// 验收 5-a：find_references 0 调用方 + 文本有命中 —— 必须点明「不代表没有调用方」
+    #[test]
+    fn test_find_references_zero_callers_echoes_text_truth() {
+        let (dir, registry) = indexed_project(
+            "cc_text_truth_refs",
+            &[(
+                "src/a.rs",
+                "pub fn Add(a: i32, b: i32) -> i32 { a + b }\n",
+            )],
+        );
+
+        let response = handle_find_references(
+            &registry,
+            FindReferencesParams {
+                symbol_id: "Add".to_string(),
+                limit: 50,
+                text_truth: true,
+            },
+        );
+
+        assert_eq!(response.status, codeconnect_core::response::ResponseStatus::Partial);
+        assert_eq!(response.data.as_ref().unwrap()["total_references"], 0);
+
+        let warning = response.warnings.join("\n");
+        assert!(
+            warning.contains("调用图中没有 `Add` 的调用方"),
+            "缺少关键文案:\n{}",
+            warning
+        );
+        assert!(
+            warning.contains("这不代表它没有调用方"),
+            "缺少「不代表没有调用方」这一句:\n{}",
+            warning
+        );
+        assert!(warning.contains("src/a.rs:1"), "必须给出文本命中位置:\n{}", warning);
+
+        cleanup(dir, registry);
+    }
+
+    /// 验收 5-b：符号引用完全不匹配时，错误消息里也要带上文本真值
+    #[test]
+    fn test_find_references_unresolvable_symbol_still_shows_text_truth() {
+        let (dir, registry) = indexed_project(
+            "cc_text_truth_unresolved",
+            &[(
+                "src/a.rs",
+                "fn main() { /* Zzqqxxghostzzqqxx */ }\n",
+            )],
+        );
+
+        let response = handle_find_references(
+            &registry,
+            FindReferencesParams {
+                symbol_id: "Zzqqxxghostzzqqxx()".to_string(),
+                limit: 50,
+                text_truth: true,
+            },
+        );
+
+        assert_eq!(response.status, codeconnect_core::response::ResponseStatus::Error);
+        let warning = response.warnings.join("\n");
+        assert!(warning.contains("未找到符号"), "{}", warning);
+        assert!(
+            warning.contains("这不代表 Zzqqxxghostzzqqxx() 不存在"),
+            "解析失败也要给出文本真值:\n{}",
+            warning
+        );
+        assert!(warning.contains("src/a.rs:1"), "{}", warning);
+
+        cleanup(dir, registry);
+    }
+
+    /// 文本真值可关闭（响应体积/耗时敏感时）
+    #[test]
+    fn test_text_truth_can_be_disabled() {
+        let (dir, registry) = indexed_project(
+            "cc_text_truth_off",
+            &[(
+                "src/a.rs",
+                "// Zzqqxxswitchedzzqqxx\nfn main() {}\n",
+            )],
+        );
+
+        let response =
+            handle_search_symbol(&registry, search_params("Zzqqxxswitchedzzqqxx", false));
+        let warning = response.warnings.join("\n");
+
+        assert!(
+            !warning.contains("文本检索在"),
+            "关闭后不得再做文本回显:\n{}",
+            warning
+        );
+
+        cleanup(dir, registry);
     }
 }

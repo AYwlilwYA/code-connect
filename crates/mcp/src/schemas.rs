@@ -20,7 +20,10 @@ use serde::Deserialize;
 pub struct SearchSymbolParams {
     /// 搜索查询字符串（支持精确名称或模糊匹配）
     pub query: String,
-    /// 符号类型过滤（如 function、class、method 等）
+    /// 符号类型过滤（如 function、class、method、enum、constant 等）
+    ///
+    /// `constant` 指枚举量（C/C++ enumerator、Rust enum variant、
+    /// Java enum constant、C# enum member、TS enum 成员）。
     #[serde(default)]
     pub kind: Option<String>,
     /// 编程语言过滤（如 rust、typescript、java 等）
@@ -35,6 +38,13 @@ pub struct SearchSymbolParams {
     /// 因此默认 brief 以避免单次调用吃掉大量上下文。
     #[serde(default = "default_detail_brief")]
     pub detail: String,
+    /// 是否在已索引文件内做文本检索并回显文本真值，默认 true
+    ///
+    /// 符号索引覆盖不全时（枚举量、限定名调用、宏等），
+    /// 「索引里没有」与「代码里没有」在返回值上同形 —— 关掉它会失去这层保护。
+    /// 仅在对响应体积/耗时敏感时关掉。
+    #[serde(default = "default_true")]
+    pub text_truth: bool,
 }
 
 fn default_limit_20() -> usize {
@@ -266,6 +276,13 @@ pub struct FindReferencesParams {
     /// 最大返回结果数，默认 50
     #[serde(default = "default_limit_50")]
     pub limit: usize,
+    /// 是否在已索引文件内做文本检索并回显文本真值，默认 true
+    ///
+    /// 调用边覆盖不全时（限定名调用、宏、间接调用等），
+    /// 「没有调用方」与「调用边没建」在返回值上同形，
+    /// 据此判定「改签名很安全」已造成过真实事故 —— 关掉它会失去这层保护。
+    #[serde(default = "default_true")]
+    pub text_truth: bool,
 }
 
 fn default_limit_50() -> usize {
@@ -437,10 +454,12 @@ mod tests {
             language: None,
             limit: default_limit_20(),
             detail: "brief".to_string(),
+            text_truth: default_true(),
         };
         assert_eq!(params.query, "main");
         assert_eq!(params.limit, 20);
         assert!(params.kind.is_none());
+        assert!(params.text_truth, "文本真值回显默认开启");
     }
 
     #[test]

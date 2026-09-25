@@ -26,6 +26,12 @@
 (enum_specifier
   name: (type_identifier) @name) @enum
 
+;; 枚举量（enum class Dir { Up, Down } 里的 Up/Down）
+;; 此前完全未索引（见 doc/spec/2026-09-25-symbol-coverage-completeness.md）。
+;; @enumerator 挂在成员节点 enumerator 本身（不是容器 enumerator_list）。
+(enumerator
+  name: (identifier) @name) @enumerator
+
 ;; ---- 命名空间 ----
 
 ;; namespace geometry / namespace outer::inner（匿名 namespace 无 name，跳过）

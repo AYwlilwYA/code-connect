@@ -198,6 +198,7 @@ impl CppParser {
                 | SymbolKind::Enum
                 | SymbolKind::TypeAlias
                 | SymbolKind::Macro
+                | SymbolKind::Constant
         );
 
         let mut modifiers = if is_exported {
@@ -287,6 +288,8 @@ impl LanguageParser for CppParser {
 
         while let Some(m) = matches.next() {
             let mut name = String::new();
+            // 名字节点：枚举量的位置以它为准
+            let mut name_node: Option<tree_sitter::Node> = None;
             let mut kind = SymbolKind::Unknown("unknown".to_string());
             let mut location = SourceLocation {
                 file_path: file_path_str.clone(),
@@ -307,6 +310,7 @@ impl LanguageParser for CppParser {
                 match capture_name {
                     "name" => {
                         name = self.node_text(node, source).to_string();
+                        name_node = Some(node);
                     }
                     "declarator" => {
                         declarator = Some(node);
@@ -331,6 +335,12 @@ impl LanguageParser for CppParser {
                         kind = SymbolKind::Enum;
                         location = self.node_to_location(node, &file_path_str);
                         stmt = Some(node);
+                    }
+                    // 枚举量（spec A）：8 个语言统一用 @enumerator 这个 capture 名，
+                    // 另兼容 @symbol.enumerator 命名习惯
+                    "enumerator" | "symbol.enumerator" => {
+                        kind = SymbolKind::Constant;
+                        location = self.node_to_location(node, &file_path_str);
                     }
                     "namespace" => {
                         kind = SymbolKind::Module;
@@ -373,6 +383,12 @@ impl LanguageParser for CppParser {
                 continue;
             }
 
+            // 枚举量的位置以**名字节点**为准，不用成员节点（放在 declarator 解析之后，
+            // 枚举量没有 declarator，两者互不影响）
+            if let Some(n) = name_node.filter(|_| matches!(kind, SymbolKind::Constant)) {
+                location = self.node_to_location(n, &file_path_str);
+            }
+
             let kind_str = match &kind {
                 SymbolKind::Function => "function",
                 SymbolKind::Method => "method",
@@ -382,6 +398,7 @@ impl LanguageParser for CppParser {
                 SymbolKind::Module => "module",
                 SymbolKind::Macro => "macro",
                 SymbolKind::TypeAlias => "type_alias",
+                SymbolKind::Constant => "constant",
                 _ => "unknown",
             };
 

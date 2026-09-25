@@ -20,6 +20,12 @@
   name: (type_identifier) @symbol.name
 ) @symbol.enum
 
+;; 枚举量（enum 的各个 variant）
+;; 此前只索引了枚举类型本身，成员一个都没有。
+;; @enumerator 挂在成员节点 enum_variant 本身，位置即该 variant 的起点。
+(enum_variant
+  name: (identifier) @symbol.name) @enumerator
+
 ;; impl 块（方法定义）
 (impl_item
   type: (type_identifier) @symbol.parent

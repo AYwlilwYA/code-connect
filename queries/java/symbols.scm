@@ -13,6 +13,12 @@
   (identifier) @symbol.name
 ) @symbol.enum
 
+;; 枚举量（enum 体里的各个常量）
+;; 此前只索引了枚举类型本身，成员一个都没有。
+;; @enumerator 挂在成员节点 enum_constant 本身（不是容器 enum_body）。
+(enum_constant
+  name: (identifier) @symbol.name) @enumerator
+
 ;; 方法声明
 (method_declaration
   (identifier) @symbol.name

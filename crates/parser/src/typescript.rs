@@ -126,6 +126,8 @@ impl LanguageParser for TypeScriptParser {
 
         while let Some(m) = matches.next() {
             let mut name = String::new();
+            // 名字节点：枚举量的位置以它为准
+            let mut name_node: Option<tree_sitter::Node> = None;
             let mut kind = SymbolKind::Unknown("unknown".to_string());
             let mut location = self.node_to_location(tree.root_node(), &file_path_str);
             for capture in m.captures {
@@ -135,6 +137,7 @@ impl LanguageParser for TypeScriptParser {
                 match capture_name {
                     "symbol.name" => {
                         name = self.node_text(node, source).to_string();
+                        name_node = Some(node);
                     }
                     "symbol.function" => {
                         kind = SymbolKind::Function;
@@ -156,6 +159,11 @@ impl LanguageParser for TypeScriptParser {
                         kind = SymbolKind::Enum;
                         location = self.node_to_location(node, &file_path_str);
                     }
+                    // 枚举量（spec A）：8 个语言统一用 @enumerator 这个 capture 名
+                    "enumerator" | "symbol.enumerator" => {
+                        kind = SymbolKind::Constant;
+                        location = self.node_to_location(node, &file_path_str);
+                    }
                     "symbol.type_alias" => {
                         kind = SymbolKind::TypeAlias;
                         location = self.node_to_location(node, &file_path_str);
@@ -170,6 +178,11 @@ impl LanguageParser for TypeScriptParser {
 
             if name.is_empty() {
                 continue;
+            }
+
+            // 枚举量的位置以**名字节点**为准，不用成员节点
+            if let Some(n) = name_node.filter(|_| matches!(kind, SymbolKind::Constant)) {
+                location = self.node_to_location(n, &file_path_str);
             }
 
             // 去重：同一文件中同名符号优先保留更具体的类型
@@ -364,6 +377,7 @@ fn kind_to_str(kind: &SymbolKind) -> &str {
         SymbolKind::Enum => "enum",
         SymbolKind::TypeAlias => "type_alias",
         SymbolKind::Variable => "variable",
+        SymbolKind::Constant => "constant",
         _ => "unknown",
     }
 }
@@ -377,6 +391,7 @@ fn kind_priority_val(kind: &SymbolKind) -> u32 {
         SymbolKind::Interface => 7,
         SymbolKind::Enum => 6,
         SymbolKind::TypeAlias => 5,
+        SymbolKind::Constant => 3,
         SymbolKind::Variable => 1,
         _ => 0,
     }
@@ -391,6 +406,7 @@ fn kind_priority_val_for_str(kind_str: &str) -> u32 {
         "interface" => 7,
         "enum" => 6,
         "type_alias" => 5,
+        "constant" => 3,
         "variable" => 1,
         _ => 0,
     }

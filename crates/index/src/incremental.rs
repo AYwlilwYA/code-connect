@@ -430,6 +430,7 @@ impl IncrementalIndexer {
             SymbolKind::Interface => "interface",
             SymbolKind::Struct => "struct",
             SymbolKind::Enum => "enum",
+            SymbolKind::Constant => "constant",
             SymbolKind::Trait => "trait",
             SymbolKind::TypeAlias => "type_alias",
             SymbolKind::Variable => "variable",

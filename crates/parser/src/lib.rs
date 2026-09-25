@@ -7,6 +7,7 @@
 //! - [`LanguageParser`] — 语言解析器统一接口
 //! - [`ImportResolver`] — 跨文件导入解析策略
 
+pub mod coverage;
 pub mod factory;
 pub mod import_resolver;
 pub mod query_loader;

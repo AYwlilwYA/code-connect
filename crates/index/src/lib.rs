@@ -6,9 +6,11 @@
 //! - [`full_indexer`] — 全量索引引擎（目录遍历 → parallel 解析 → 批量写入）
 //! - [`incremental`] — 增量索引（文件变更检测 → 差分更新）
 //! - [`query_engine`] — 统一查询入口
+//! - [`text_scan`] — 已索引文件集内的文本扫描（文本真值回显）
 
 pub mod full_indexer;
 pub mod incremental;
 pub mod query_engine;
 pub mod sled_store;
 pub mod tantivy_index;
+pub mod text_scan;

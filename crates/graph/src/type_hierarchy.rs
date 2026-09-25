@@ -393,6 +393,7 @@ fn kind_to_string(kind: &SymbolKind) -> String {
         SymbolKind::Interface => "interface".to_string(),
         SymbolKind::Struct => "struct".to_string(),
         SymbolKind::Enum => "enum".to_string(),
+        SymbolKind::Constant => "constant".to_string(),
         SymbolKind::Trait => "trait".to_string(),
         SymbolKind::Function => "function".to_string(),
         SymbolKind::Method => "method".to_string(),

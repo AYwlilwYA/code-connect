@@ -1,0 +1,48 @@
+[package]
+name = "codeconnect-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "本地 ONNX 文本嵌入：离线语义检索基座（模型缺失时明确报错，绝不退回词法匹配）"
+
+[dependencies]
+# 构建期不下载运行时：load-dynamic 会打开 ort-sys 的 disable-linking，build.rs 直接提前返回。
+# 动态库在运行期由 ORT_DYLIB_PATH（或 CODECONNECT_ORT_DYLIB / exe 同目录 / PATH）解析。
+#
+# api-N 必须 ≤ 运行期实际 ONNX Runtime 的次版本号，否则 ort 报 BadVersion 拒绝加载。
+# 本机实测：D:\Python311\...\capi\onnxruntime.dll 的 GetVersionString 是 "1.24.4"
+# （该目录被 onnxruntime-directml 1.24.4 覆盖，pip 元数据却写着 1.28.0，勿信 pip）。
+# api-24 同时向上兼容更新运行时（1.25+ 只打一条 info 日志，不报错）。
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+    "std",
+    "load-dynamic",
+    "api-24",
+] }
+# default-features = false 去掉 onig(需要 C 工具链)/progressbar；
+# tokenizers 强制要求 onig 或 fancy-regex 二选一，这里选纯 Rust 的 fancy-regex。
+tokenizers = { version = "0.23", default-features = false, features = [
+    "fancy-regex",
+] }
+# 仅用于在把控制权交给 ort 之前预校验动态库可加载且版本够新
+libloading = "0.9"
+
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# 仅 download-model 这个 bin 需要
+ureq = { version = "3", default-features = false, features = [
+    "native-tls",
+    "win-system-proxy",
+], optional = true }
+
+[features]
+downloader = ["dep:ureq"]
+
+[[bin]]
+name = "download-model"
+path = "src/bin/download_model.rs"
+required-features = ["downloader"]

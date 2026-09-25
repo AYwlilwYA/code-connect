@@ -10,7 +10,7 @@
 //! 4. `crossbeam` channel 收集结果
 //! 5. 批量写入 tantivy + sled
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -20,6 +20,7 @@ use rayon::prelude::*;
 
 use codeconnect_core::error::CodeConnectError;
 use codeconnect_core::types::{FileMeta, SymbolKind};
+use codeconnect_parser::coverage::{self, FileCoverage, KindGapSummary};
 use codeconnect_parser::factory::ParserRegistry;
 use ignore::WalkBuilder;
 
@@ -48,7 +49,23 @@ pub struct IndexStats {
     pub imports_found: u64,
     /// 解析失败的文件列表（路径 + 错误信息）
     pub failed_files: Vec<String>,
+    /// 覆盖度审计（spec B）：哪些声明节点种类在本项目里有节点却没产出符号
+    pub coverage: CoverageSummary,
 }
+
+/// 全项目覆盖度汇总
+///
+/// 「没索引」与「不存在」必须在返回值上可区分：这个结构就是那个区分本身。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct CoverageSummary {
+    /// 存在缺口的文件数
+    pub files_with_gaps: u64,
+    /// 逐种类汇总（按节点数降序）
+    pub kinds_without_symbols: Vec<KindGapSummary>,
+    /// 说人话的告警；无缺口时为 None
+    pub note: Option<String>,
+}
+
 
 /// 单个文件的索引统计（内部用）
 #[derive(Debug, Clone, Default)]
@@ -94,6 +111,8 @@ struct ParsedFile {
     calls: Vec<codeconnect_core::types::CallSite>,
     /// 提取的导入列表
     imports: Vec<codeconnect_core::types::Import>,
+    /// 覆盖度审计结果（spec B）
+    coverage: FileCoverage,
     /// 统计计数
     stats: FileIndexStats,
 }
@@ -228,6 +247,7 @@ impl FullIndexer {
                 calls_found: 0,
                 imports_found: 0,
                 failed_files: Vec::new(),
+                coverage: CoverageSummary::default(),
             });
         }
 
@@ -281,6 +301,8 @@ impl FullIndexer {
         let mut calls_found: u64 = 0;
         let mut imports_found: u64 = 0;
         let mut failed_files: Vec<String> = Vec::new();
+        let mut coverage_gaps: BTreeMap<String, KindGapSummary> = BTreeMap::new();
+        let mut files_with_gaps: u64 = 0;
 
         // 按文件收集符号 ID 列表，用于写文件→符号映射
         let mut file_symbol_map: HashMap<String, FileIndexStats> = HashMap::new();
@@ -291,6 +313,12 @@ impl FullIndexer {
             let symbols_count = parsed.stats.symbols;
             let calls_count = parsed.stats.calls;
             let imports_count = parsed.stats.imports;
+
+            // 覆盖度审计（spec B）：缺口按文件累计，索引结束后上浮到 IndexStats
+            if parsed.coverage.has_gaps() {
+                files_with_gaps += 1;
+                coverage::merge_into(&mut coverage_gaps, &relative_path, &parsed.coverage);
+            }
 
             // 写入 sled 和 tantivy — 写入完成后 parsed 在此次迭代结束时 drop
             self.write_parsed_file(&parsed)?;
@@ -342,6 +370,11 @@ impl FullIndexer {
             imports_found
         );
 
+        let coverage = build_coverage_summary(files_with_gaps, coverage_gaps);
+        if let Some(note) = &coverage.note {
+            tracing::warn!("{}", note);
+        }
+
         Ok(IndexStats {
             files_scanned,
             files_parsed,
@@ -349,6 +382,7 @@ impl FullIndexer {
             calls_found,
             imports_found,
             failed_files,
+            coverage,
         })
     }
 
@@ -536,6 +570,7 @@ impl FullIndexer {
             SymbolKind::Interface => "interface",
             SymbolKind::Struct => "struct",
             SymbolKind::Enum => "enum",
+            SymbolKind::Constant => "constant",
             SymbolKind::Trait => "trait",
             SymbolKind::TypeAlias => "type_alias",
             SymbolKind::Variable => "variable",
@@ -618,6 +653,9 @@ fn parse_single_file(
     let calls = parser.extract_calls(&tree, &source, relative_path_ref);
     let imports = parser.extract_imports(&tree, &source, relative_path_ref);
 
+    // 覆盖度审计（spec B）：必须在 drop(tree) 之前做，它要再走一遍 AST
+    let coverage = parser.audit_coverage(&tree, &symbols);
+
     // 提取完成后立即释放 source 和 tree，减少内存峰值
     // source 字符串可能很大（几 MB），早释放 = 早归还给 allocator
     drop(tree);
@@ -636,6 +674,7 @@ fn parse_single_file(
         symbols,
         calls,
         imports,
+        coverage,
         stats,
     })
 }
@@ -643,6 +682,60 @@ fn parse_single_file(
 // ============================================================================
 // 路径工具
 // ============================================================================
+
+/// 把逐文件的缺口汇总成索引级结论（含一句给人/给 AI 看的话）
+///
+/// 排序把最危险的一类顶到前面：`not_captured`（查询压根没这条模式 → 查询会返回假 0），
+/// 其次是 `captured_but_no_symbol`，最后是 `known_gap`（已知、有理由）。
+fn build_coverage_summary(
+    files_with_gaps: u64,
+    gaps: BTreeMap<String, KindGapSummary>,
+) -> CoverageSummary {
+    if gaps.is_empty() {
+        return CoverageSummary::default();
+    }
+
+    let severity = |status: &str| match status {
+        "not_captured" => 0,
+        "captured_but_no_symbol" => 1,
+        _ => 2,
+    };
+    let mut kinds: Vec<KindGapSummary> = gaps.into_values().collect();
+    kinds.sort_by(|a, b| {
+        severity(&a.status)
+            .cmp(&severity(&b.status))
+            .then(b.node_count.cmp(&a.node_count))
+            .then(a.kind.cmp(&b.kind))
+    });
+
+    let uncaptured: Vec<&str> = kinds
+        .iter()
+        .filter(|k| k.status == "not_captured")
+        .map(|k| k.kind.as_str())
+        .collect();
+
+    let note = if uncaptured.is_empty() {
+        format!(
+            "覆盖度审计：{} 个文件存在「有声明节点但没产出符号」的种类（均为已知缺口或部分覆盖），\
+             明细见 coverage.kinds_without_symbols。对这些名字的查询返回 0 时，请先确认是不是没建索引。",
+            files_with_gaps
+        )
+    } else {
+        format!(
+            "覆盖度审计：{} 个文件存在「有声明节点但没产出符号」的种类，其中 [{}] 在 symbols.scm 里\
+             压根没有对应模式 —— 对这类名字的查询会返回 0，那是「没建索引」而不是「不存在」，\
+             不要据此判断可以安全改删。明细见 coverage.kinds_without_symbols。",
+            files_with_gaps,
+            uncaptured.join(", ")
+        )
+    };
+
+    CoverageSummary {
+        files_with_gaps,
+        kinds_without_symbols: kinds,
+        note: Some(note),
+    }
+}
 
 /// 计算 roots 限定的实际遍历目录
 ///

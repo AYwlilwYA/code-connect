@@ -122,6 +122,8 @@ impl LanguageParser for RustParser {
 
         while let Some(m) = matches.next() {
             let mut name = String::new();
+            // 名字节点：枚举量的位置以它为准
+            let mut name_node: Option<tree_sitter::Node> = None;
             let mut parent = String::new();
             let mut kind = SymbolKind::Unknown("unknown".to_string());
             // 本条匹配是否应当丢弃（见 @symbol.function 分支）
@@ -141,6 +143,7 @@ impl LanguageParser for RustParser {
                 match capture_name {
                     "symbol.name" => {
                         name = self.node_text(node, source).to_string();
+                        name_node = Some(node);
                     }
                     "symbol.function" => {
                         // queries/rust/symbols.scm 里 `(function_item …) @symbol.function`
@@ -170,6 +173,11 @@ impl LanguageParser for RustParser {
                     }
                     "symbol.enum" => {
                         kind = SymbolKind::Enum;
+                        location = self.node_to_location(node, &file_path_str);
+                    }
+                    // 枚举量（spec A）：8 个语言统一用 @enumerator 这个 capture 名
+                    "enumerator" | "symbol.enumerator" => {
+                        kind = SymbolKind::Constant;
                         location = self.node_to_location(node, &file_path_str);
                     }
                     "symbol.type_alias" => {
@@ -203,6 +211,11 @@ impl LanguageParser for RustParser {
                 continue;
             }
 
+            // 枚举量的位置以**名字节点**为准，不用成员节点
+            if let Some(n) = name_node.filter(|_| matches!(kind, SymbolKind::Constant)) {
+                location = self.node_to_location(n, &file_path_str);
+            }
+
             let kind_str = match &kind {
                 SymbolKind::Function => "function",
                 SymbolKind::Method => "method",
@@ -214,6 +227,7 @@ impl LanguageParser for RustParser {
                 SymbolKind::Module => "module",
                 SymbolKind::Variable => "variable",
                 SymbolKind::Field => "field",
+                SymbolKind::Constant => "constant",
                 _ => "unknown",
             };
 

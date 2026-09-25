@@ -45,4 +45,15 @@ pub trait LanguageParser: Send + Sync {
 
     /// 从文件路径和源码推断模块/包名
     fn infer_package(&self, file_path: &Path, source: &str) -> Option<String>;
+
+    /// 审计本文件的声明节点覆盖度（spec B）
+    ///
+    /// 把「AST 里存在、属于声明类节点」的种类与「真的产出了符号」的种类做差集，
+    /// 差集非空即上浮 —— 避免「没索引」被调用方读成「不存在」。
+    ///
+    /// 默认实现对所有语言通用（清单与判定都在 [`crate::coverage`]），
+    /// 各语言解析器无需覆写。
+    fn audit_coverage(&self, tree: &Tree, symbols: &[Symbol]) -> crate::coverage::FileCoverage {
+        crate::coverage::audit(self.language(), tree, symbols)
+    }
 }

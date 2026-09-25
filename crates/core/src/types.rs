@@ -49,6 +49,12 @@ pub enum SymbolKind {
     Struct,
     /// 枚举
     Enum,
+    /// 枚举量 / 常量
+    ///
+    /// 指枚举体里的单个成员：C/C++ `enumerator`、Rust `enum_variant`、
+    /// Java `enum_constant`、C# `enum_member_declaration`、TS `enum_body` 的 name 字段。
+    /// 与 `Variable` 的区别是「它是枚举类型的一部分」，不是独立可赋值的变量。
+    Constant,
     /// 特质（Rust trait 专用）
     Trait,
     /// 类型别名

@@ -86,7 +86,7 @@ enum Commands {
         /// 编程语言过滤
         #[arg(long)]
         language: Option<String>,
-        /// 符号类型过滤（function, class, method 等）
+        /// 符号类型过滤（function, class, method, enum, constant 等；constant 指枚举量）
         #[arg(long)]
         kind: Option<String>,
     },

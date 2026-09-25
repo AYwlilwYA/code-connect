@@ -170,6 +170,25 @@ pub async fn run(
     println!("  耗时:         {:.2}s", elapsed.as_secs_f64());
     println!("  ──────────────────────────────────");
 
+    // 打印覆盖度告警（spec B）—— 「没索引」必须与「不存在」可区分
+    if let Some(note) = &stats.coverage.note {
+        println!();
+        println!("⚠ 覆盖度审计:");
+        println!("  {}", note);
+        for kind in stats.coverage.kinds_without_symbols.iter().take(10) {
+            println!(
+                "  - {}：{} 个节点 / {} 个文件未产出符号{}",
+                kind.kind,
+                kind.node_count,
+                kind.files,
+                kind.reason
+                    .as_ref()
+                    .map(|r| format!("（{}）", r))
+                    .unwrap_or_default()
+            );
+        }
+    }
+
     // 打印失败详情（如果有）
     if !stats.failed_files.is_empty() {
         println!();
