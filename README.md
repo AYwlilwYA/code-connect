@@ -14,6 +14,8 @@
 - **变更影响评估** — 基于 Git 分支对比的符号级变更分析，精确评估修改影响范围
 - **死代码检测** — 自动识别项目中未被引用的函数、类型和导入
 - **架构规则验证** — 可配置的分层架构约束、循环依赖检测，适合 CI 集成
+- **向量语义检索（可选）** — 用自然语言描述找符号（本地 ONNX 嵌入模型，离线）；
+  **未配置模型时明确告知不可用，不会退回词法匹配假装成功**。配置见 [`[semantic]`](#semantic)
 - **MCP 服务** — stdio 模式 MCP 服务器，可直接接入 Claude Desktop、VS Code Copilot 等 AI 助手
 
 ## 支持的编程语言
@@ -310,6 +312,49 @@ allowed = [
     { from = "infrastructure", to = "application" },
 ]
 ```
+
+### `[semantic]`
+
+`semantic_search`（自然语言找符号）用的**本地向量模型**配置。这是**可选能力**：
+不写本节 = 关闭，其余工具照常用。
+
+```toml
+[semantic]
+enabled = true
+model = "paraphrase-multilingual-MiniLM-L12-v2"   # 模型名（在模型根目录下查找）或模型目录绝对路径
+# model_dir = "D:/models"                         # 可选：覆盖模型根目录
+```
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `enabled` | `bool` | 由 `model` 推断 | 是否启用；不写但写了 `model` 即视为启用（写了模型却被静默忽略是另一种坑） |
+| `model` | `string` | 无 | 模型名或模型目录路径；为空 = 未配置 |
+| `model_dir` | `string` | `~/.codeconnect/models` | 模型根目录；也可被环境变量 `CODECONNECT_MODEL_DIR` 覆盖（两者同时存在时以本字段为准） |
+
+**模型**：默认 `paraphrase-multilingual-MiniLM-L12-v2`（384 维、mean 池化，约 130 MB），
+应放在 `<模型根目录>/paraphrase-multilingual-MiniLM-L12-v2/`，内含 `model.onnx` 与 `tokenizer.json`：
+
+```bash
+# 下载（落在 <模型根目录>，默认 ~/.codeconnect/models）
+cargo run -p codeconnect-embed --features downloader --bin download-model
+```
+
+**ONNX Runtime**：另需系统上有 `onnxruntime.dll`（≥ 1.24）。解析顺序：
+`ORT_DYLIB_PATH` > `CODECONNECT_ORT_DYLIB` > codeconnect 可执行文件同目录 > `PATH`。
+
+**`semantic_search` 的三种状态**（`retrieval` 字段会如实标注本次实际用了哪种检索方式）：
+
+| 状态 | 行为 |
+|------|------|
+| 未配置（缺本节 / `enabled = false`） | 明确回「未配置向量模型，语义检索不可用」+ 配置方法；**不是错误**，**绝不退回**按名字的词法搜索 |
+| 已配置但模型没就绪 | 回明确错误（`status: Partial`）+ 期望路径 + 已搜索路径 + 获取方式 |
+| 已配置且就绪 | 真向量检索：查询串嵌入 → 与符号（**名称 + 签名 + doc 注释首行，不含函数体**）的向量做余弦相似取 top-K |
+
+参数 `mode` 可选 `vector`（默认）/ `lexical`（词法对照，**不是**语义结果）/ `both`（结果逐条标注来源）。
+语料是全部已索引符号，向量缓存在 `<数据目录>/embeddings.bin`，语料指纹变化时自动重建。
+
+> ⚠️ 效果依赖索引里有多少文字可嵌：当前 Rust 解析器尚未产出 `signature`/`doc_comment`
+> （索引里为空），此时嵌入文本实际退化为**只有符号名**，中文自然语言查询的召回质量会明显打折。
 
 ## 项目结构
 

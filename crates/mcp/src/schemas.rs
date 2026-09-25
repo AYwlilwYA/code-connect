@@ -247,7 +247,11 @@ pub struct CheckArchRulesParams {
 
 /// 语义搜索请求参数
 ///
-/// 基于自然语言描述在符号名称、签名和文档注释中进行搜索。
+/// 默认真向量检索：查询串经本地嵌入模型编码后，与已索引符号
+/// （名称 + 签名 + doc 注释首行，**不含函数体**）的向量做余弦相似取 top-K。
+///
+/// 向量模型是可选能力，需在 `.codeconnect.toml` 的 `[semantic]` 中配置；
+/// **未配置时本工具如实告知不可用，不会退回词法匹配假装成功**。
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SemanticSearchParams {
     /// 自然语言搜索描述
@@ -258,6 +262,33 @@ pub struct SemanticSearchParams {
     /// 编程语言过滤（可选）
     #[serde(default)]
     pub language: Option<String>,
+    /// 检索方式：vector（默认，真向量）/ lexical（词法对照）/ both
+    #[serde(default)]
+    pub mode: SemanticMode,
+}
+
+/// 语义检索的检索方式
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SemanticMode {
+    /// 真向量检索（默认）
+    #[default]
+    Vector,
+    /// 词法检索（名称/BM25）——**不是**语义结果，仅作对照
+    Lexical,
+    /// 两种都跑，结果逐条标注来源
+    Both,
+}
+
+impl SemanticMode {
+    /// 配置/响应里回显用的名字
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SemanticMode::Vector => "vector",
+            SemanticMode::Lexical => "lexical",
+            SemanticMode::Both => "both",
+        }
+    }
 }
 
 fn default_limit_10() -> usize {

@@ -40,6 +40,29 @@ incremental = true
 # 全局默认最大返回结果数（搜索结果上限）
 max_results = 100
 
+[semantic]
+# 向量语义检索（semantic_search 用的本地嵌入模型）——**可选能力**。
+# 不写本节 = 关闭（默认）：工具照常用，只是 semantic_search 会明确回「未配置向量模型，
+# 语义检索不可用」，**不会**退回按名字的词法搜索假装成功。
+#
+# 启用三步（把下面两行取消注释即为启用）：
+#   1. enabled = true
+#   2. model 写模型名（在模型根目录下查找）或模型目录的绝对路径
+#   3. 确认模型已就位；缺模型时 semantic_search 会给出期望路径与获取方式
+#
+# 模型默认应放在 <模型根目录>/paraphrase-multilingual-MiniLM-L12-v2/，内含
+# model.onnx 与 tokenizer.json。下载（约 130 MB）：
+#   cargo run -p codeconnect-embed --features downloader --bin download-model
+# enabled = true
+# model = "paraphrase-multilingual-MiniLM-L12-v2"
+# 可选：覆盖模型根目录，默认 ~/.codeconnect/models（用户级，所有项目共用一份）。
+# 该默认值也可被环境变量 CODECONNECT_MODEL_DIR 覆盖；两者同时存在时以本字段为准。
+# model_dir = "D:/models"
+#
+# 另需系统上有 ONNX Runtime 动态库（onnxruntime.dll，≥1.24）。解析顺序：
+#   ORT_DYLIB_PATH > CODECONNECT_ORT_DYLIB > codeconnect 可执行文件同目录 > PATH。
+# 找不到时 semantic_search 会明确报「运行时不可用」并给出修复指引。
+
 [complexity]
 # 圈复杂度告警阈值（超过会输出警告信息）
 warning_threshold = 15

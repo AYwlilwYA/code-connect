@@ -18,7 +18,7 @@
 //! | `get_metrics` | 代码质量指标 | [`GetMetricsParams`] |
 //! | `detect_dead_code` | 死代码检测 | [`DetectDeadCodeParams`] |
 //! | `check_arch_rules` | 架构规则验证 | [`CheckArchRulesParams`] |
-//! | `semantic_search` | 语义搜索 | [`SemanticSearchParams`] |
+//! | `semantic_search` | 向量语义检索（可选能力，未配置时明确回不可用） | [`SemanticSearchParams`] |
 //! | `find_references` | 查找引用 | [`FindReferencesParams`] |
 //! | `reindex` | 重新索引 | [`ReindexParams`] |
 //! | `get_index_status` | 索引状态 | [`GetIndexStatusParams`] |
@@ -46,6 +46,10 @@ use codeconnect_index::text_scan::{
 use codeconnect_parser::factory::ParserRegistry;
 
 use crate::schemas::*;
+use crate::semantic::{
+    CorpusEntry, SemanticCache, VectorRequest, model_not_ready_message, model_root, model_source,
+    not_configured_message,
+};
 
 // ============================================================================
 // 工具注册表 — 共享状态
@@ -87,6 +91,9 @@ pub struct ToolRegistry {
     /// sled 的**首次**前缀遍历实测要 1.8s（同进程随后降到 1ms），
     /// 放在每次搜索的热路径上不可接受，故按进程缓存。
     indexed_files_cache: Arc<std::sync::Mutex<Option<IndexedFilesCache>>>,
+
+    /// 向量语义检索缓存（模型只加载一次、语料向量按指纹复用）
+    semantic_cache: Arc<std::sync::Mutex<SemanticCache>>,
 }
 
 /// 已索引文件列表的缓存条目
@@ -112,6 +119,7 @@ impl ToolRegistry {
             index_built_at_unix: None,
             watcher_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             indexed_files_cache: Arc::new(std::sync::Mutex::new(None)),
+            semantic_cache: Arc::new(std::sync::Mutex::new(SemanticCache::default())),
         }
     }
 
@@ -1370,11 +1378,23 @@ pub fn handle_check_arch_rules(
     McpResponse::success(result, total, total, elapsed)
 }
 
-/// 语义搜索 handler
+/// 语义搜索 handler —— **真向量检索**
+///
+/// 三态必须给出三种不同响应（spec §3.6）：
+///
+/// | 状态 | 行为 |
+/// |---|---|
+/// | 未配置（`[semantic]` 缺失 / `enabled = false`） | 明确说明「未配置向量模型，语义检索不可用」+ 配置方法；**不报错**（状态仍是 success，说明进 warnings），**绝不退回词法** |
+/// | 已配置但模型没就绪 | 明确故障（状态 partial）+ 期望路径 + 已搜索路径 + 获取方式 |
+/// | 已配置且就绪 | 真向量检索：名称+签名+doc 首行嵌入 → 余弦 top-K |
+///
+/// 响应一律带 `retrieval` 字段如实标注实际用了哪种检索方式 ——
+/// 这个工具此前名字叫语义、行为是 `search_by_name`（纯词法），
+/// 名实不符本身就是一次静默误导，这里用字段把它钉死。
 pub fn handle_semantic_search(
     registry: &ToolRegistry,
     params: SemanticSearchParams,
-) -> McpResponse<Vec<Symbol>> {
+) -> McpResponse<serde_json::Value> {
     let start = Instant::now();
 
     let query_engine = match &registry.query_engine {
@@ -1383,28 +1403,329 @@ pub fn handle_semantic_search(
     };
 
     let limit = params.limit.min(50);
-    let results = match query_engine.search_by_name(&params.description, None, None, limit) {
-        Ok(r) => r,
-        Err(e) => return McpResponse::error(&format!("语义搜索失败: {}", e)),
-    };
+    let cfg = registry
+        .config
+        .as_ref()
+        .map(|c| c.semantic.clone())
+        .unwrap_or_default();
 
-    let mut symbols: Vec<Symbol> = Vec::new();
-    for result in &results {
-        // 语言过滤
-        if let Some(ref lang_filter) = params.language {
-            let lang = result.stable_id.split("::").next().unwrap_or("");
-            if lang != lang_filter.as_str() {
-                continue;
+    let want_vector = matches!(params.mode, SemanticMode::Vector | SemanticMode::Both);
+    let want_lexical = matches!(params.mode, SemanticMode::Lexical | SemanticMode::Both);
+
+    // 「不是故障」的说明：进 warnings 但**不降级状态**
+    let mut notices: Vec<String> = Vec::new();
+    // 真故障：进 warnings 并把状态降为 partial
+    let mut problems: Vec<String> = Vec::new();
+
+    let mut vector_used = false;
+    let mut lexical_used = false;
+    let mut vector_meta = serde_json::json!({});
+    let mut vector_hits: Vec<(usize, f32)> = Vec::new();
+    let mut lexical_hits: Vec<codeconnect_index::tantivy_index::SymbolSearchResult> = Vec::new();
+    let mut corpus: Vec<codeconnect_index::tantivy_index::SymbolSearchResult> = Vec::new();
+
+    // ---------------- 向量这一侧 ----------------
+    if !want_vector {
+        // 显式要词法时不加载模型（加载代价不小），但向量这一侧的状态照样如实标注
+        vector_meta = serde_json::json!({
+            "state": "not_requested",
+            "configured": model_source(&cfg).is_configured(),
+            "message": "本次 mode=lexical，未使用向量检索；下面返回的是词法（名称/BM25）结果，**不是**语义结果。",
+        });
+    } else {
+        let source = model_source(&cfg);
+        let root = model_root(&cfg);
+
+        if !source.is_configured() {
+            // 未配置 = 能力关闭，不是故障：说清楚，且**绝不退回词法**
+            let mut msg = not_configured_message(&cfg, &root);
+            if params.mode == SemanticMode::Both {
+                msg.push_str("\n（本次 mode=both：下面只有词法结果，向量的那一半没有跑。）");
+            }
+            vector_meta = serde_json::json!({
+                "state": "not_configured",
+                "message": msg,
+            });
+            notices.push(msg);
+        } else {
+            match query_engine.scan_all_symbols() {
+                Ok((scanned, corrupted)) => {
+                    corpus = scanned;
+                    if corrupted > 0 {
+                        notices.push(format!(
+                            "索引中有 {corrupted} 个符号文档无法读取，未纳入向量语料，本次向量结果可能不完整。"
+                        ));
+                    }
+                }
+                Err(e) => return McpResponse::error(&format!("扫描符号语料失败: {}", e)),
+            }
+
+            // 索引里存在「同一个 stable_id 落在多行」的文档（id 不含行列号），
+            // 它们指向同一个符号，重复计入只会挤占结果位 —— 去重并如实计数
+            let mut duplicate_docs = 0usize;
+            let mut seen_ids = std::collections::HashSet::new();
+            corpus.retain(|r| {
+                if seen_ids.insert(r.stable_id.clone()) {
+                    true
+                } else {
+                    duplicate_docs += 1;
+                    false
+                }
+            });
+
+            if corpus.is_empty() {
+                // 语料为 0 不是「没有相关符号」，而是「还没索引」—— 两者必须分开说
+                let msg = "向量语料为空：索引里没有任何符号，无法做语义检索。请先建立索引（reindex 或 codeconnect index），语义检索的语料就是已索引符号的名称+签名。"
+                    .to_string();
+                vector_meta = serde_json::json!({
+                    "state": "empty_corpus",
+                    "message": msg,
+                });
+                notices.push(msg);
+            } else {
+                let entries: Vec<CorpusEntry> =
+                    corpus.iter().map(CorpusEntry::from_search_result).collect();
+                let mut cache = registry
+                    .semantic_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+                match cache.search(VectorRequest {
+                    source: &source,
+                    root: &root,
+                    data_dir: registry.data_dir.as_deref(),
+                    entries: &entries,
+                    query: &params.description,
+                    limit,
+                    language: params.language.as_deref(),
+                }) {
+                    Ok(outcome) => {
+                        vector_used = true;
+                        vector_hits = outcome.hits.iter().map(|h| (h.corpus_index, h.similarity)).collect();
+                        let top = outcome.hits.first().map(|h| h.similarity);
+                        vector_meta = serde_json::json!({
+                            "state": "ok",
+                            "model": outcome.model,
+                            "model_dir": outcome.model_dir.display().to_string(),
+                            "dim": outcome.dim,
+                            "corpus_symbols": outcome.corpus_size,
+                            "duplicate_symbol_docs": duplicate_docs,
+                            "embedded_now": outcome.rebuilt,
+                            "embed_ms": outcome.embed_ms,
+                            "top_similarity": top,
+                            "message": "向量检索：查询串经本地模型嵌入后，与全部已索引符号（名称+签名+doc 首行，不含函数体）的向量做余弦相似取 top-K。",
+                        });
+                        if outcome.low_confidence {
+                            notices.push(format!(
+                                "最高相似度仅 {:.3}（本模型实测：确有对应符号的查询顶分通常 ≥ 0.55），很可能没有真正相关的符号 —— 返回的是「最不沾边里最沾边的」。若其实是在找某个具体名字，请改用 search_symbol。",
+                                top.unwrap_or(0.0)
+                            ));
+                        }
+                    }
+                    Err(e) => match e.kind() {
+                        codeconnect_embed::EmbedErrorKind::NotConfigured => {
+                            // 理论上到不了这里（未配置已在上面拦下），兜底也不退回词法
+                            let msg = not_configured_message(&cfg, &root);
+                            vector_meta = serde_json::json!({
+                                "state": "not_configured",
+                                "message": msg,
+                            });
+                            notices.push(msg);
+                        }
+                        codeconnect_embed::EmbedErrorKind::ModelNotReady => {
+                            let msg = model_not_ready_message(&cfg, &root, &e);
+                            vector_meta = serde_json::json!({
+                                "state": "model_not_ready",
+                                "configured_model": cfg.model_value(),
+                                "model_root": root.display().to_string(),
+                                "expected_dir": root
+                                    .join(cfg.model_value().unwrap_or(codeconnect_embed::DEFAULT_MODEL_NAME))
+                                    .display()
+                                    .to_string(),
+                                "searched": crate::semantic::searched_paths(&cfg, &root)
+                                    .iter()
+                                    .map(|p| p.display().to_string())
+                                    .collect::<Vec<_>>(),
+                                "message": msg,
+                            });
+                            problems.push(msg);
+                        }
+                        codeconnect_embed::EmbedErrorKind::Runtime => {
+                            let msg = format!("向量检索不可用（运行环境问题，非配置问题）：\n{e}");
+                            vector_meta = serde_json::json!({
+                                "state": "runtime_error",
+                                "message": msg,
+                            });
+                            problems.push(msg);
+                        }
+                    },
+                }
             }
         }
-
-        let symbol = codeconnect_index::query_engine::symbol_search_result_to_symbol(result);
-        symbols.push(symbol);
     }
 
-    let total = symbols.len();
+    // ---------------- 词法这一侧（可选对照，不是替代） ----------------
+    if want_lexical {
+        match query_engine.search_by_name(
+            &params.description,
+            params.language.as_deref(),
+            None,
+            limit,
+        ) {
+            Ok(r) => {
+                lexical_used = true;
+                lexical_hits = r;
+            }
+            Err(e) => problems.push(format!("词法检索失败：{e}")),
+        }
+    }
+
+    // ---------------- 合并结果 ----------------
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut vector_only = 0usize;
+    let mut lexical_only = 0usize;
+    let mut both_count = 0usize;
+
+    for (idx, similarity) in &vector_hits {
+        let Some(hit) = corpus.get(*idx) else { continue };
+        // 先查后插：重复时不能写入一个指向不存在下标的 map 项（会让下面的 results[i] 越界）
+        if seen.contains_key(&hit.stable_id) {
+            continue;
+        }
+        seen.insert(hit.stable_id.clone(), results.len());
+        vector_only += 1;
+        results.push(semantic_result_json(hit, Some(*similarity), None));
+    }
+    for hit in &lexical_hits {
+        match seen.get(&hit.stable_id) {
+            Some(&i) => {
+                // 两种检索都命中 → 标注来源，不改动排序（分数不同量纲，不可比）
+                if results[i]["bm25"].is_null() {
+                    both_count += 1;
+                    vector_only -= 1;
+                }
+                results[i]["retrieval"] = serde_json::json!("vector+lexical");
+                results[i]["bm25"] = serde_json::json!(round2(hit.score));
+            }
+            None => {
+                seen.insert(hit.stable_id.clone(), results.len());
+                lexical_only += 1;
+                results.push(semantic_result_json(hit, None, Some(hit.score)));
+            }
+        }
+    }
+
+    let (shown, total) = clip(&results, limit);
+    results.truncate(shown);
+    if let Some(w) = truncation_warning_with_hint(
+        shown,
+        total,
+        "语义检索结果",
+        "调大 limit，或指定 mode 只跑一种检索。",
+    ) {
+        notices.push(w);
+    }
+
+    let used: Vec<&str> = [
+        vector_used.then_some("vector"),
+        lexical_used.then_some("lexical"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let retrieval = serde_json::json!({
+        "mode": params.mode.as_str(),
+        "used": used,
+        "summary": retrieval_summary(&used, &vector_meta),
+        "counts": {
+            "vector_only": vector_only,
+            "lexical_only": lexical_only,
+            "both": both_count,
+            "merged": total,
+            "returned": shown,
+        },
+        "vector": vector_meta,
+        "note": if vector_used && lexical_used {
+            "results 里每条都标了 retrieval 来源；两种方法的分数不同量纲（similarity 为余弦、bm25 为 BM25），不要横向比较。"
+        } else {
+            "results 里每条都标了 retrieval 来源。"
+        },
+    });
+
     let elapsed = start.elapsed().as_millis() as u64;
-    McpResponse::success(symbols, total, total, elapsed)
+    let mut response = McpResponse::success(
+        serde_json::json!({ "retrieval": retrieval, "results": results }),
+        total,
+        shown,
+        elapsed,
+    );
+    // 「没配」这类说明进 warnings 但**不降级状态** —— 它不是故障（spec §3.6）
+    response.warnings.extend(notices);
+    for problem in problems {
+        response = response.with_warning(problem);
+    }
+    response
+}
+
+/// 单条召回结果的 JSON（`retrieval` 标明它由哪种检索给出）
+fn semantic_result_json(
+    r: &codeconnect_index::tantivy_index::SymbolSearchResult,
+    similarity: Option<f32>,
+    bm25: Option<f32>,
+) -> serde_json::Value {
+    let source = match (similarity.is_some(), bm25.is_some()) {
+        (true, true) => "vector+lexical",
+        (true, false) => "vector",
+        (false, true) => "lexical",
+        (false, false) => "none",
+    };
+    let mut value = serde_json::json!({
+        "symbol_id": r.stable_id,
+        "name": r.name,
+        "kind": r.kind,
+        "language": r.language,
+        "file_path": r.file_path,
+        "line": r.line,
+        "signature": truncate_chars(&r.signature, BRIEF_SIGNATURE_MAX_CHARS),
+        "retrieval": source,
+    });
+    if let Some(s) = similarity {
+        value["similarity"] = serde_json::json!(round4(s));
+    }
+    if let Some(b) = bm25 {
+        value["bm25"] = serde_json::json!(round2(b));
+    }
+    value
+}
+
+/// 一句话说明本次用了哪种检索（`retrieval.summary`）
+fn retrieval_summary(used: &[&str], vector_meta: &serde_json::Value) -> String {
+    match used {
+        [] => "本次没有使用任何检索方式（向量不可用、且未要求词法），results 为空 —— 这不代表没有相关符号。"
+            .to_string(),
+        ["lexical"] => "词法检索（名称/BM25）。**不是语义结果**：这里没有任何向量参与。".to_string(),
+        ["vector"] => format!(
+            "向量检索（模型 {}，{} 维，语料 {} 个符号）。",
+            vector_meta["model"].as_str().unwrap_or("?"),
+            vector_meta["dim"].as_u64().unwrap_or(0),
+            vector_meta["corpus_symbols"].as_u64().unwrap_or(0),
+        ),
+        _ => format!(
+            "向量检索（模型 {}，语料 {} 个符号）+ 词法检索（名称/BM25）。",
+            vector_meta["model"].as_str().unwrap_or("?"),
+            vector_meta["corpus_symbols"].as_u64().unwrap_or(0),
+        ),
+    }
+}
+
+fn round4(v: f32) -> f32 {
+    (v * 10000.0).round() / 10000.0
+}
+
+fn round2(v: f32) -> f32 {
+    (v * 100.0).round() / 100.0
 }
 
 /// 查找引用 handler
@@ -2792,6 +3113,209 @@ mod tests {
             detail: "brief".to_string(),
             text_truth,
         }
+    }
+
+    // ========================================================================
+    // semantic_search：三态必须给出三种不同响应（spec §3.6）
+    // ========================================================================
+
+    fn semantic_params(description: &str, mode: SemanticMode) -> SemanticSearchParams {
+        SemanticSearchParams {
+            description: description.to_string(),
+            limit: 10,
+            language: None,
+            mode,
+        }
+    }
+
+    /// 语义检索的 config 装进注册表
+    fn with_semantic(
+        mut registry: ToolRegistry,
+        enabled: Option<bool>,
+        model: Option<&str>,
+    ) -> ToolRegistry {
+        let mut config = CodeConnectConfig::default();
+        config.semantic = codeconnect_core::config::SemanticConfig {
+            enabled,
+            model: model.map(str::to_string),
+            model_dir: None,
+        };
+        registry.config = Some(config);
+        registry
+    }
+
+    /// 未配置：明确说「没配」，**且绝不退回词法**；状态不是 Error（这不是故障）
+    #[test]
+    fn test_semantic_search_not_configured_does_not_fall_back_to_lexical() {
+        let (dir, registry) = indexed_project(
+            "cc_semantic_unconfigured",
+            &[(
+                "src/a.rs",
+                "pub fn semantic_probe_symbol() -> u32 { 1 }\n",
+            )],
+        );
+
+        // 查询串就是符号名本身 —— 词法一定能命中，因此「向量模式下结果为空」
+        // 只可能是「拒绝降级」，而不是「碰巧没有匹配」
+        let response = handle_semantic_search(
+            &registry,
+            semantic_params("semantic_probe_symbol", SemanticMode::Vector),
+        );
+
+        assert_eq!(
+            response.status,
+            codeconnect_core::response::ResponseStatus::Success,
+            "未配置是能力关闭、不是故障，不得报错（也不得降级为 Partial）: {:?}",
+            response.warnings
+        );
+        let data = response.data.clone().unwrap();
+        assert!(
+            data["results"].as_array().unwrap().is_empty(),
+            "未配置时不得返回任何结果: {data}"
+        );
+        assert_eq!(data["retrieval"]["vector"]["state"], "not_configured");
+        assert_eq!(
+            data["retrieval"]["used"].as_array().unwrap().len(),
+            0,
+            "本次没有用任何检索方式"
+        );
+
+        let warning = response.warnings.join("\n");
+        assert!(warning.contains("未配置向量模型"), "{}", warning);
+        assert!(warning.contains("[semantic]"), "必须给出配置方法: {}", warning);
+        assert!(
+            warning.contains("没有退回词法匹配"),
+            "必须点明没有静默降级: {}",
+            warning
+        );
+
+        // 对照组：显式要求词法时同一查询**有**结果 —— 证明上面那个空结果
+        // 是「拒绝降级」而非「词法也找不到」
+        let lexical = handle_semantic_search(
+            &registry,
+            semantic_params("semantic_probe_symbol", SemanticMode::Lexical),
+        );
+        let lexical_data = lexical.data.clone().unwrap();
+        assert_eq!(
+            lexical_data["results"].as_array().unwrap().len(),
+            1,
+            "词法对照必须能命中，否则本用例不具判别性: {lexical_data}"
+        );
+
+        cleanup(dir, registry);
+    }
+
+    /// `enabled = false` 且配了模型：仍是「未配置」，并提示模型被忽略
+    #[test]
+    fn test_semantic_search_disabled_config_is_not_configured() {
+        let (dir, registry) = indexed_project("cc_semantic_disabled", &[("src/a.rs", "fn f() {}\n")]);
+        let registry = with_semantic(registry, Some(false), Some("some-model"));
+
+        let response = handle_semantic_search(
+            &registry,
+            semantic_params("anything", SemanticMode::Vector),
+        );
+
+        let data = response.data.clone().unwrap();
+        assert_eq!(data["retrieval"]["vector"]["state"], "not_configured");
+        let warning = response.warnings.join("\n");
+        assert!(warning.contains("模型被忽略"), "{}", warning);
+
+        cleanup(dir, registry);
+    }
+
+    /// 已配置但模型没就绪：给出期望路径 + 已搜索路径 + 获取方式，且不退回词法
+    #[test]
+    fn test_semantic_search_model_not_ready_reports_expected_paths() {
+        let (dir, registry) = indexed_project(
+            "cc_semantic_model_missing",
+            &[("src/a.rs", "pub fn semantic_probe_symbol() -> u32 { 1 }\n")],
+        );
+        let registry =
+            with_semantic(registry, Some(true), Some("cc-definitely-not-installed-model"));
+
+        let response = handle_semantic_search(
+            &registry,
+            semantic_params("semantic_probe_symbol", SemanticMode::Vector),
+        );
+
+        assert_eq!(
+            response.status,
+            codeconnect_core::response::ResponseStatus::Partial,
+            "模型没就绪是真故障，必须降级为 Partial"
+        );
+        let data = response.data.clone().unwrap();
+        assert_eq!(data["retrieval"]["vector"]["state"], "model_not_ready");
+        assert!(
+            data["results"].as_array().unwrap().is_empty(),
+            "模型没就绪时不得退回词法: {data}"
+        );
+
+        let expected = data["retrieval"]["vector"]["expected_dir"].as_str().unwrap();
+        assert!(
+            expected.ends_with("cc-definitely-not-installed-model"),
+            "期望路径不对: {expected}"
+        );
+        let searched = data["retrieval"]["vector"]["searched"].as_array().unwrap();
+        assert_eq!(searched.len(), 2, "按名解析要回显两条搜索路径: {searched:?}");
+
+        let warning = response.warnings.join("\n");
+        assert!(warning.contains("模型未就绪"), "{}", warning);
+        assert!(warning.contains("获取方式"), "必须给出获取方式: {}", warning);
+
+        cleanup(dir, registry);
+    }
+
+    /// 显式 mode=lexical：如实标注「不是语义结果」，且不加载模型
+    #[test]
+    fn test_semantic_search_lexical_mode_labels_retrieval() {
+        let (dir, registry) = indexed_project(
+            "cc_semantic_lexical",
+            &[("src/a.rs", "pub fn semantic_probe_symbol() -> u32 { 1 }\n")],
+        );
+
+        let response = handle_semantic_search(
+            &registry,
+            semantic_params("semantic_probe_symbol", SemanticMode::Lexical),
+        );
+
+        let data = response.data.clone().unwrap();
+        assert_eq!(data["retrieval"]["used"][0], "lexical");
+        assert_eq!(data["retrieval"]["vector"]["state"], "not_requested");
+        let results = data["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["retrieval"], "lexical");
+        assert!(
+            data["retrieval"]["summary"]
+                .as_str()
+                .unwrap()
+                .contains("不是语义结果"),
+            "词法结果必须明确标注不是语义结果: {}",
+            data["retrieval"]["summary"]
+        );
+
+        cleanup(dir, registry);
+    }
+
+    /// 索引是空的：语料为 0 ≠ 「没有相关符号」，必须分开说
+    #[test]
+    fn test_semantic_search_empty_corpus_is_distinguished_from_no_match() {
+        let (dir, registry) = indexed_project("cc_semantic_empty_corpus", &[]);
+        let registry =
+            with_semantic(registry, Some(true), Some("cc-definitely-not-installed-model"));
+
+        let response = handle_semantic_search(
+            &registry,
+            semantic_params("anything", SemanticMode::Vector),
+        );
+
+        let data = response.data.clone().unwrap();
+        assert_eq!(
+            data["retrieval"]["vector"]["state"], "empty_corpus",
+            "空索引必须先报告「没索引」，不能报「模型没就绪」: {data}"
+        );
+
+        cleanup(dir, registry);
     }
 
     /// 验收 1：符号索引 0 命中、文本有命中 —— 必须点明「这不代表不存在」

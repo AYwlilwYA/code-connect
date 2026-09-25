@@ -261,7 +261,7 @@ CLI 参数 (-p / --data-dir)  >  环境变量  >  .codeconnect.toml  >  内置�
 | `get_metrics` | 代码质量指标 | `symbol_id` / `file_path` |
 | `detect_dead_code` | 死代码检测 | `entry_points` |
 | `check_arch_rules` | 架构规则验证 | `rule_names` |
-| `semantic_search` | 语义搜索 | `description`, `language`, `limit` |
+| `semantic_search` | 语义检索（真向量，需配置 `[semantic]` 模型；未配置时明确回不可用） | `description`, `language`, `limit`, `mode` |
 | `find_references` | 查找引用位置 | `symbol_id`, `limit` |
 | `reindex` | 触发索引重建 | `file_paths`, `full` |
 | `get_index_status` | 查看索引状态 | `verbose` |

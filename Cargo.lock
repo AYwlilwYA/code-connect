@@ -478,6 +478,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "codeconnect-core",
+ "codeconnect-embed",
  "codeconnect-graph",
  "codeconnect-index",
  "codeconnect-parser",

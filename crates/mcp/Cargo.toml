@@ -11,6 +11,9 @@ codeconnect-services = { path = "../services" }
 codeconnect-index = { path = "../index" }
 codeconnect-parser = { path = "../parser" }
 codeconnect-graph = { path = "../graph" }
+# 向量语义检索（semantic_search 的真向量实现）——不启用 downloader 特性，
+# 下载模型是用户在命令行显式做的事，MCP 服务器不联网
+codeconnect-embed = { path = "../embed" }
 
 rmcp.workspace = true
 tokio = { workspace = true, features = ["full"] }

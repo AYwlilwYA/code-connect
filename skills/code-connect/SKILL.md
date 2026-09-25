@@ -71,5 +71,8 @@ codeconnect index -p . -f
 
 - `find_references` 目前**只覆盖调用关系**。字段读取、类型标注这类引用查不到，
   那种需求请改用 `search_symbol`，不要退回 grep。
-- `semantic_search` 当前实为名称匹配，不是真正的语义检索。
+- `semantic_search` 已是**真向量检索**（本地 ONNX 模型，查询串嵌入后与符号向量做余弦相似），
+  但模型是**可选配置**：没配 `[semantic]` 时它只回「未配置向量模型，语义检索不可用」，
+  **不会退回名称匹配**。响应里的 `retrieval.used` 标明本次实际用了哪种检索，别当成语义结果用。
+  要按名字精确查找请直接用 `search_symbol`。
 - `check_arch_rules` 的完整规则验证尚未接通参数，别指望它给出架构违规结论。

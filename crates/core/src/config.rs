@@ -4,7 +4,7 @@
 //! 并与 `~/.codeconnect/config.toml` 全局配置合并。
 //!
 //! 配置涵盖：工作区设置、语言支持、索引策略、搜索参数、
-//! 复杂度阈值、死代码检测规则和图校验规则。
+//! 复杂度阈值、死代码检测规则、图校验规则和语义检索（向量）配置。
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -46,6 +46,10 @@ pub struct CodeConnectConfig {
     /// 图校验规则
     #[serde(default)]
     pub rules: Vec<RuleConfig>,
+
+    /// 向量语义检索配置（可选能力）
+    #[serde(default)]
+    pub semantic: SemanticConfig,
 }
 
 impl Default for CodeConnectConfig {
@@ -58,6 +62,7 @@ impl Default for CodeConnectConfig {
             complexity: ComplexityConfig::default(),
             dead_code: Vec::new(),
             rules: Vec::new(),
+            semantic: SemanticConfig::default(),
         }
     }
 }
@@ -275,6 +280,64 @@ pub struct RuleConfig {
 }
 
 // ============================================================================
+// 语义（向量）检索配置
+// ============================================================================
+
+/// 向量语义检索配置（`semantic_search` 用的本地嵌入模型）
+///
+/// 语义检索是**可选能力**：不写本节 = 关闭，工具照常用，只是没有语义检索。
+///
+/// ```toml
+/// [semantic]
+/// enabled = true
+/// model = "paraphrase-multilingual-MiniLM-L12-v2"   # 模型名或模型目录路径
+/// # model_dir = "D:/models"                         # 可选：覆盖模型根目录
+/// ```
+///
+/// 三个字段都是 `Option`：合并全局配置与项目配置时，只有**写了**的字段才覆盖，
+/// 没写的保持基准值 —— 否则项目配置里的默认值会把全局配置静默抹掉。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SemanticConfig {
+    /// 是否启用；**不写**时按「是否给了 model」推断（给了模型就是想用）
+    #[serde(default)]
+    pub enabled: Option<bool>,
+
+    /// 模型名（在模型根目录下查找）或模型目录路径；空 = 未配置
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// 覆盖模型根目录，默认 `~/.codeconnect/models`（可被 `CODECONNECT_MODEL_DIR` 覆盖）
+    #[serde(default)]
+    pub model_dir: Option<PathBuf>,
+}
+
+impl SemanticConfig {
+    /// 生效的开关
+    ///
+    /// 显式 `enabled` 优先；未写时「配了 model」即视为启用 ——
+    /// 写了模型却被当成没配，是一种静默失效，本文件顶部注释警告过同一类问题。
+    pub fn is_enabled(&self) -> bool {
+        match self.enabled {
+            Some(v) => v,
+            None => self.model_value().is_some(),
+        }
+    }
+
+    /// 模型串（去空白后的非空值）
+    pub fn model_value(&self) -> Option<&str> {
+        self.model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// 显式关闭、却又配了 model —— 模型被忽略，属于容易看走眼的组合
+    pub fn disabled_but_model_set(&self) -> bool {
+        self.enabled == Some(false) && self.model_value().is_some()
+    }
+}
+
+// ============================================================================
 // 配置加载函数
 // ============================================================================
 
@@ -471,6 +534,18 @@ fn merge_configs(base: &mut CodeConnectConfig, overlay: CodeConnectConfig) {
     if !overlay.rules.is_empty() {
         base.rules = overlay.rules;
     }
+
+    // 语义检索配置：**逐字段**覆盖 —— 字段是 Option，None 表示该文件没写这一项，
+    // 此时必须保留基准值（全局配置），否则项目配置会把全局的模型设置静默抹掉
+    if overlay.semantic.enabled.is_some() {
+        base.semantic.enabled = overlay.semantic.enabled;
+    }
+    if overlay.semantic.model.is_some() {
+        base.semantic.model = overlay.semantic.model;
+    }
+    if overlay.semantic.model_dir.is_some() {
+        base.semantic.model_dir = overlay.semantic.model_dir;
+    }
 }
 
 /// 获取用户主目录
@@ -529,6 +604,62 @@ mod tests {
         let config = WorkspaceConfig::default();
         assert_eq!(config.roots, vec![PathBuf::from(".")]);
         assert!(!config.excludes.is_empty());
+    }
+
+    #[test]
+    fn test_semantic_default_is_disabled() {
+        // 不写 [semantic] 本节 = 关闭
+        let config = CodeConnectConfig::default();
+        assert!(!config.semantic.is_enabled());
+        assert!(config.semantic.model_value().is_none());
+        // 空配置文件解析出来也是关闭
+        let back: CodeConnectConfig = toml::from_str("").unwrap();
+        assert!(!back.semantic.is_enabled());
+    }
+
+    #[test]
+    fn test_semantic_model_implies_enabled() {
+        // 只写了 model、没写 enabled：按「想用」处理，而不是静默忽略模型
+        let cfg: SemanticConfig = toml::from_str("model = \"m1\"\n").unwrap();
+        assert!(cfg.is_enabled());
+        assert_eq!(cfg.model_value(), Some("m1"));
+
+        // 显式 enabled = false 时，model 被忽略且能被上层察觉
+        let cfg: SemanticConfig = toml::from_str("enabled = false\nmodel = \"m1\"\n").unwrap();
+        assert!(!cfg.is_enabled());
+        assert!(cfg.disabled_but_model_set());
+
+        // 空白串不算配置
+        let cfg: SemanticConfig = toml::from_str("model = \"   \"\n").unwrap();
+        assert!(!cfg.is_enabled());
+    }
+
+    #[test]
+    fn test_semantic_merge_is_field_wise() {
+        // 全局配了模型，项目配置只写了 enabled —— 模型不能被抹掉
+        let mut base = CodeConnectConfig::default();
+        base.semantic.model = Some("global-model".into());
+        base.semantic.model_dir = Some(PathBuf::from("D:/models"));
+
+        let overlay: CodeConnectConfig = toml::from_str("[semantic]\nenabled = true\n").unwrap();
+        merge_configs(&mut base, overlay);
+
+        assert_eq!(base.semantic.enabled, Some(true));
+        assert_eq!(base.semantic.model.as_deref(), Some("global-model"));
+        assert_eq!(
+            base.semantic.model_dir.as_deref(),
+            Some(Path::new("D:/models"))
+        );
+    }
+
+    #[test]
+    fn test_semantic_toml_section() {
+        // 文档里给用户的写法必须真的能被解析（字段名写错 serde 会静默忽略）
+        let text = "[semantic]\nenabled = true\nmodel = \"bge-m3\"\nmodel_dir = \"E:/m\"\n";
+        let config: CodeConnectConfig = toml::from_str(text).unwrap();
+        assert_eq!(config.semantic.enabled, Some(true));
+        assert_eq!(config.semantic.model_value(), Some("bge-m3"));
+        assert_eq!(config.semantic.model_dir.as_deref(), Some(Path::new("E:/m")));
     }
 
     #[test]

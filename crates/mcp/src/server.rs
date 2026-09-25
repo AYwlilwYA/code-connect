@@ -111,7 +111,7 @@ impl CodeConnectServer {
 impl CodeConnectServer {
     /// 符号搜索 — 按名称、类型和语言搜索代码符号
     #[rmcp::tool(
-        description = "按名称搜索代码符号，返回位置、签名等定位信息（默认 detail=brief 精简输出）。搜索无匹配时会返回相近候选与排查方向；找详情请用 get_symbol。这是替代 grep 的首选：它按符号边界匹配，不会把注释、字符串里的同名文本一起捞出来"
+        description = "按名称搜索代码符号，返回位置、签名等定位信息（默认 detail=brief 精简输出）。搜索无匹配时会返回相近候选与排查方向；符号 0 命中或命中稀少时会额外回显**已索引文件内的文本命中**（含文件:行与原文片段）—— 符号索引没覆盖到的类别（枚举量、宏等）就靠它兜底，「符号没找到」不等于「代码里没有」。找详情请用 get_symbol。这是替代 grep 的首选：它按符号边界匹配，不会把注释、字符串里的同名文本一起捞出来"
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn search_symbol(
@@ -227,12 +227,13 @@ impl CodeConnectServer {
         self.respond(response)
     }
 
-    /// 语义搜索 — 基于自然语言描述搜索符号
+    /// 语义搜索 — 基于自然语言描述做**真向量检索**
     ///
-    /// 注意：当前实现回退为 `search_by_name`（名称匹配），
-    /// 尚未接入真正的语义向量搜索。待 embedding 索引完成后启用。
+    /// 查询串 → 本地模型嵌入 → 与已索引符号（名称+签名+doc 首行）的向量做余弦相似取 top-K。
+    /// 模型需在 `.codeconnect.toml` 的 `[semantic]` 里配置；未配置时如实告知不可用，
+    /// **不退回词法匹配**（响应里的 `retrieval` 字段标明本次实际用了哪种检索）。
     #[rmcp::tool(
-        description = "基于自然语言描述搜索符号。注意：当前为名称匹配模式，语义搜索开发中"
+        description = "语义检索：按自然语言描述找符号（如「计算两个时间点相差多少秒」）。查询串经本地嵌入模型转成向量，与已索引符号（名称+签名+doc 首行，不含函数体）做余弦相似取 top-K，结果的 similarity 是余弦相似度。需先在 .codeconnect.toml 配置 [semantic] 并装好模型；未配置时明确返回「不可用」而不会退回词法。mode 可选 vector（默认）/lexical/both。要按名字精确找符号请用 search_symbol"
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn semantic_search(
@@ -245,7 +246,7 @@ impl CodeConnectServer {
 
     /// 查找引用 — 找出所有引用指定符号的位置
     #[rmcp::tool(
-        description = "查找引用指定符号的位置。注意：当前仅覆盖调用关系，字段读取/类型标注类引用尚未索引，这类需求请改用 search_symbol。参数可传 symbol_id 或符号名"
+        description = "查找引用指定符号的位置。注意：当前仅覆盖调用关系，字段读取/类型标注类引用尚未索引，这类需求请改用 search_symbol。参数可传 symbol_id 或符号名。调用边 0 命中时会额外回显**已索引文件内的文本命中**（含文件:行与原文片段）——「没有调用方」可能是调用边没建（限定名调用、宏、间接调用），改动前请以文本命中位置为准；可用 text_truth=false 关闭"
     )]
     #[allow(clippy::needless_pass_by_value)]
     async fn find_references(
