@@ -4,7 +4,7 @@
 
 use std::path::Path;
 use std::sync::Mutex;
-use tantivy::collector::TopDocs;
+use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, Query, QueryParser, TermQuery};
 use tantivy::schema::*;
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
@@ -268,6 +268,81 @@ impl TantivyIndex {
             .unwrap()
             .commit()
             .map_err(|e| CodeConnectError::Index(format!("提交失败: {}", e)))
+    }
+
+    /// 按文件路径删除该文件的全部符号文档，并**立即提交**
+    ///
+    /// 返回删除前匹配到的文档数（0 表示索引里本来就没有这个文件）。
+    /// 这是「索引必须能删」的入口 —— 没有它，重跑全量索引只会追加，
+    /// 改动过的文件旧符号永远残留。
+    ///
+    /// ⚠️ tantivy 的删除在 `commit()` 时才生效，因此本方法内部已提交。
+    /// 一次要删多个文件时改用 [`TantivyIndex::stage_delete_by_file_path`]
+    /// 批量标记，再统一提交一次，避免每个文件一次段提交。
+    pub fn delete_by_file_path(&self, file_path: &str) -> Result<u64, CodeConnectError> {
+        let matched = self.stage_delete_by_file_path(file_path)?;
+        self.commit()?;
+        Ok(matched)
+    }
+
+    /// 标记删除某文件的全部符号文档（**不提交**）
+    ///
+    /// 返回删除前匹配到的文档数。调用方**必须**在批量结束后调用
+    /// [`TantivyIndex::commit`] —— 只标记不提交，旧文档照旧能被搜到，
+    /// 表现为「删了但没删掉」。
+    ///
+    /// 路径按原样与正斜杠归一化两种形式各删一次：历史索引里存在反斜杠路径，
+    /// 只删一种会留下删不掉的残影（见 [`SymbolSearchResult::file_path`] 的归一化说明）。
+    pub fn stage_delete_by_file_path(&self, file_path: &str) -> Result<u64, CodeConnectError> {
+        let matched = self.count_by_file_path(file_path)?;
+        {
+            let writer = self.writer.lock().unwrap();
+            for variant in file_path_variants(file_path) {
+                writer.delete_term(Term::from_field_text(self.schema.file_path, &variant));
+            }
+        }
+        tracing::debug!(
+            "标记删除符号文档: {} (匹配 {} 条)",
+            file_path,
+            matched
+        );
+        Ok(matched)
+    }
+
+    /// 清空索引中的全部符号文档，并**立即提交**
+    ///
+    /// 返回清空前的文档数。用于全量索引的「替换而非追加」语义：
+    /// 先清空再写入，`index` 跑一次和跑十次结果完全相同。
+    pub fn delete_all_documents(&self) -> Result<u64, CodeConnectError> {
+        let before = self.doc_count()?;
+        {
+            let writer = self.writer.lock().unwrap();
+            writer
+                .delete_all_documents()
+                .map_err(|e| CodeConnectError::Index(format!("清空索引失败: {}", e)))?;
+        }
+        self.commit()?;
+        tracing::info!("已清空符号索引（原有 {} 个文档）", before);
+        Ok(before)
+    }
+
+    /// 统计某文件路径当前在索引里的符号文档数（两种路径写法都算）
+    fn count_by_file_path(&self, file_path: &str) -> Result<u64, CodeConnectError> {
+        self.reader
+            .reload()
+            .map_err(|e| CodeConnectError::Index(format!("重新加载失败: {}", e)))?;
+
+        let searcher = self.reader.searcher();
+        let mut total = 0u64;
+        for variant in file_path_variants(file_path) {
+            let term = Term::from_field_text(self.schema.file_path, &variant);
+            let query = TermQuery::new(term, IndexRecordOption::Basic);
+            let hits = searcher
+                .search(&query, &Count)
+                .map_err(|e| CodeConnectError::Query(format!("统计文件文档数失败: {}", e)))?;
+            total += hits as u64;
+        }
+        Ok(total)
     }
 
     /// 按名称搜索符号
@@ -864,6 +939,70 @@ impl CallEdgeIndex {
             .map_err(|e| CodeConnectError::Index(format!("调用边提交失败: {}", e)))
     }
 
+    /// 按文件路径删除该文件的全部调用边文档，并**立即提交**
+    ///
+    /// 删除依据是 `file` 字段（**调用点所在文件**，即 `CallSite.location.file_path`）：
+    /// 一个文件的调用点全部由该文件重新解析产出，按调用点文件删就能连同旧调用边一起清掉。
+    /// 返回删除前匹配到的文档数。
+    ///
+    /// ⚠️ 同符号索引：删除在 `commit()` 时才生效，本方法内部已提交。
+    /// 批量场景用 [`CallEdgeIndex::stage_delete_by_file_path`]。
+    pub fn delete_by_file_path(&self, file_path: &str) -> Result<u64, CodeConnectError> {
+        let matched = self.stage_delete_by_file_path(file_path)?;
+        self.commit()?;
+        Ok(matched)
+    }
+
+    /// 标记删除某文件的全部调用边文档（**不提交**）
+    ///
+    /// 返回删除前匹配到的文档数。调用方**必须**在批量结束后提交。
+    pub fn stage_delete_by_file_path(&self, file_path: &str) -> Result<u64, CodeConnectError> {
+        let matched = self.count_by_file_path(file_path)?;
+        {
+            let writer = self.writer.lock().unwrap();
+            for variant in file_path_variants(file_path) {
+                writer.delete_term(Term::from_field_text(self.schema.file, &variant));
+            }
+        }
+        tracing::debug!("标记删除调用边文档: {} (匹配 {} 条)", file_path, matched);
+        Ok(matched)
+    }
+
+    /// 清空索引中的全部调用边文档，并**立即提交**
+    ///
+    /// 返回清空前的文档数。与符号索引同为全量索引的「替换」语义服务。
+    pub fn delete_all_documents(&self) -> Result<u64, CodeConnectError> {
+        let before = self.doc_count()?;
+        {
+            let writer = self.writer.lock().unwrap();
+            writer
+                .delete_all_documents()
+                .map_err(|e| CodeConnectError::Index(format!("清空调用边索引失败: {}", e)))?;
+        }
+        self.commit()?;
+        tracing::info!("已清空调用边索引（原有 {} 条）", before);
+        Ok(before)
+    }
+
+    /// 统计某文件路径当前的调用边文档数（两种路径写法都算）
+    fn count_by_file_path(&self, file_path: &str) -> Result<u64, CodeConnectError> {
+        self.reader
+            .reload()
+            .map_err(|e| CodeConnectError::Index(format!("调用边重载失败: {}", e)))?;
+
+        let searcher = self.reader.searcher();
+        let mut total = 0u64;
+        for variant in file_path_variants(file_path) {
+            let term = Term::from_field_text(self.schema.file, &variant);
+            let query = TermQuery::new(term, IndexRecordOption::Basic);
+            let hits = searcher
+                .search(&query, &Count)
+                .map_err(|e| CodeConnectError::Query(format!("统计调用边文档数失败: {}", e)))?;
+            total += hits as u64;
+        }
+        Ok(total)
+    }
+
     /// 按调用者 ID 搜索其所有出边
     ///
     /// 对 caller_id 字段精确匹配，返回该调用者的所有调用边。
@@ -944,6 +1083,21 @@ impl CallEdgeIndex {
         let searcher = self.reader.searcher();
         Ok(searcher.num_docs())
     }
+}
+
+/// 文件路径的匹配变体：原样 + 正斜杠 + 反斜杠（同一形式只留一份）
+///
+/// 索引里本该只存正斜杠路径，但历史索引存在反斜杠写法，而 term 查询不做归一化
+/// —— 只按一种写法删，另一批文档会静默留下（表现为「删了却还在」）。
+/// 读取侧（[`SymbolSearchResult`]）之所以也要归一化，是同一个原因。
+fn file_path_variants(file_path: &str) -> Vec<String> {
+    let mut variants = vec![file_path.to_string()];
+    for candidate in [file_path.replace('\\', "/"), file_path.replace('/', "\\")] {
+        if !variants.contains(&candidate) {
+            variants.push(candidate);
+        }
+    }
+    variants
 }
 
 /// 组合全文查询与等值过滤条件
@@ -1027,4 +1181,173 @@ pub struct SymbolSearchResult {
     pub end_column: u64,
     /// 相关度评分（BM25）
     pub score: f32,
+}
+
+// ============================================================================
+// 测试
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 往符号索引里塞一条文档 —— 只关心 file_path 字段的用例用这个
+    fn add(index: &TantivyIndex, name: &str, file_path: &str) {
+        index
+            .add_symbol(
+                &format!("{}::{}", file_path, name),
+                name,
+                "function",
+                "rust",
+                file_path,
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                0,
+                "",
+                true,
+                1,
+                1,
+                2,
+                1,
+            )
+            .expect("写符号文档失败");
+    }
+
+    fn sym_index(dir: &Path) -> TantivyIndex {
+        TantivyIndex::open_or_create(dir).expect("创建符号索引失败")
+    }
+
+    fn edge_index(dir: &Path) -> CallEdgeIndex {
+        CallEdgeIndex::open_or_create(dir).expect("创建调用边索引失败")
+    }
+
+    /// 按文件路径删除：报告条数 + 文档数真的下降 + 不误伤别的文件
+    #[test]
+    fn test_delete_by_file_path_removes_documents() {
+        let tmp = tempfile::tempdir().expect("临时目录");
+        let index = sym_index(&tmp.path().join("tantivy"));
+
+        add(&index, "alpha", "src/a.rs");
+        add(&index, "beta", "src/a.rs");
+        add(&index, "gamma", "src/b.rs");
+        index.commit().expect("提交失败");
+        assert_eq!(index.doc_count().unwrap(), 3);
+
+        let removed = index.delete_by_file_path("src/a.rs").expect("删除失败");
+        assert_eq!(removed, 2, "应报告删掉 2 篇");
+        assert_eq!(
+            index.doc_count().unwrap(),
+            1,
+            "删除必须真的让文档数下降（tantivy 的删除只在 commit 时生效）"
+        );
+        assert!(index.search_by_file_path("src/a.rs").unwrap().is_empty());
+        assert_eq!(index.search_by_file_path("src/b.rs").unwrap().len(), 1);
+        assert_eq!(index.search_by_name("gamma", None, None, 10).unwrap().len(), 1);
+    }
+
+    /// 反复删同一文件是幂等的：第二次匹配 0 条，不是报错
+    #[test]
+    fn test_delete_by_file_path_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("临时目录");
+        let index = sym_index(&tmp.path().join("tantivy"));
+
+        add(&index, "alpha", "src/a.rs");
+        index.commit().unwrap();
+
+        assert_eq!(index.delete_by_file_path("src/a.rs").unwrap(), 1);
+        assert_eq!(index.delete_by_file_path("src/a.rs").unwrap(), 0);
+        assert_eq!(index.doc_count().unwrap(), 0);
+    }
+
+    /// 「标记删除」在 commit 前不生效 —— 这条把「漏 commit = 没删掉」钉死
+    #[test]
+    fn test_stage_delete_needs_commit() {
+        let tmp = tempfile::tempdir().expect("临时目录");
+        let index = sym_index(&tmp.path().join("tantivy"));
+
+        add(&index, "alpha", "src/a.rs");
+        add(&index, "beta", "src/a.rs");
+        add(&index, "gamma", "src/b.rs");
+        index.commit().unwrap();
+
+        assert_eq!(index.stage_delete_by_file_path("src/a.rs").unwrap(), 2);
+        assert_eq!(
+            index.doc_count().unwrap(),
+            3,
+            "只标记不提交时文档仍然可见 —— 这正是「删了没删掉」的现象"
+        );
+
+        index.commit().unwrap();
+        assert_eq!(index.doc_count().unwrap(), 1, "提交后才真正消失");
+    }
+
+    /// 清空整个索引：返回清空前的文档数
+    #[test]
+    fn test_delete_all_documents() {
+        let tmp = tempfile::tempdir().expect("临时目录");
+        let index = sym_index(&tmp.path().join("tantivy"));
+
+        add(&index, "alpha", "src/a.rs");
+        add(&index, "beta", "src/b.rs");
+        index.commit().unwrap();
+
+        assert_eq!(index.delete_all_documents().unwrap(), 2);
+        assert_eq!(index.doc_count().unwrap(), 0);
+        assert!(index.search_by_name("alpha", None, None, 10).unwrap().is_empty());
+
+        // 清空之后还能继续写 —— 全量索引正是「先清空再写」
+        add(&index, "gamma", "src/c.rs");
+        index.commit().unwrap();
+        assert_eq!(index.doc_count().unwrap(), 1);
+    }
+
+    /// 历史索引里的反斜杠路径，用正斜杠删也要删得掉
+    #[test]
+    fn test_delete_matches_backslash_path() {
+        let tmp = tempfile::tempdir().expect("临时目录");
+        let index = sym_index(&tmp.path().join("tantivy"));
+
+        add(&index, "alpha", "src\\a.rs");
+        add(&index, "beta", "src\\b.rs");
+        index.commit().unwrap();
+        assert_eq!(index.doc_count().unwrap(), 2);
+
+        assert_eq!(index.delete_by_file_path("src/a.rs").unwrap(), 1);
+        assert_eq!(index.doc_count().unwrap(), 1);
+        assert_eq!(index.delete_by_file_path("src\\b.rs").unwrap(), 1);
+        assert_eq!(index.doc_count().unwrap(), 0);
+    }
+
+    /// 调用边索引同样能按文件删，且不误伤别的文件
+    #[test]
+    fn test_call_edge_delete_by_file_path() {
+        let tmp = tempfile::tempdir().expect("临时目录");
+        let edges = edge_index(&tmp.path().join("tantivy_edges"));
+
+        edges
+            .add_call_edge("caller_a", "callee", "callee", "src/a.rs", 3, 5, "Direct", 1.0, "{}")
+            .expect("写调用边失败");
+        edges
+            .add_call_edge("caller_b", "callee", "callee", "src/b.rs", 4, 5, "Direct", 1.0, "{}")
+            .expect("写调用边失败");
+        edges.commit().unwrap();
+        assert_eq!(edges.doc_count().unwrap(), 2);
+
+        assert_eq!(edges.delete_by_file_path("src/a.rs").unwrap(), 1);
+        assert_eq!(edges.doc_count().unwrap(), 1);
+        assert!(edges.search_edges_by_caller("caller_a").unwrap().is_empty());
+        assert_eq!(edges.search_edges_by_caller("caller_b").unwrap().len(), 1);
+    }
+
+    /// 路径变体去重：正斜杠输入不应产生重复变体
+    #[test]
+    fn test_file_path_variants() {
+        assert_eq!(file_path_variants("src/a.rs"), vec!["src/a.rs", "src\\a.rs"]);
+        assert_eq!(file_path_variants("src\\a.rs"), vec!["src\\a.rs", "src/a.rs"]);
+        assert_eq!(file_path_variants("a.rs"), vec!["a.rs"]);
+    }
 }

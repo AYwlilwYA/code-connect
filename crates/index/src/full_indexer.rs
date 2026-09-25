@@ -10,7 +10,7 @@
 //! 4. `crossbeam` channel 收集结果
 //! 5. 批量写入 tantivy + sled
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -207,11 +207,21 @@ impl FullIndexer {
     /// 运行全量索引
     ///
     /// 这是索引引擎的主入口，执行完整的索引流程：
-    /// 文件收集 → 并行解析 → 批量写入 → 提交刷盘
+    /// 文件收集 → **清空旧索引** → 并行解析 → 批量写入 → 提交刷盘
     ///
-    /// 若配置了 `roots` 但全部无效（不存在／越界／非目录），直接返回 `Err`：
-    /// 否则调用方会拿到「0 文件」的成功结果，配合 `index -f` 的先删后建
-    /// 就会把旧索引清空却报成功。
+    /// **语义是「替换」而不是「追加」**：索引的最终内容恒等于本次扫描到的内容，
+    /// 因此 `index` 是幂等的 —— 跑一次和跑十次，文档数完全相同。
+    ///
+    /// 两道「宁可不做也不清空」的闸门，都在动手清空前判定：
+    ///
+    /// - 配置了 `roots` 但全部无效（不存在／越界／非目录）→ `Err`：
+    ///   否则调用方会拿到「0 文件」的成功结果，配合 `index -f` 的先删后建
+    ///   就会把旧索引清空却报成功。
+    /// - 扫描到 0 个文件但索引本来非空 → `Err`：
+    ///   同样会把好索引清空，要求调用方显式用 `index -f` 表达「确实要清空」。
+    ///
+    /// 已知取舍：清空与写入是两次独立的提交，中途失败会停在「索引已空」的状态
+    /// （与 `index -f` 先删目录的风险等级相同）。
     ///
     /// # 返回
     /// 返回 [`IndexStats`] 包含详细的统计信息。
@@ -239,7 +249,25 @@ impl FullIndexer {
 
         tracing::info!("扫描完成，共发现 {} 个源文件", files_scanned);
 
+        // ====================================================================
+        // 第一步半：替换语义 — 写入前先清空，保证 `index` 幂等
+        // ====================================================================
+        // 此前这里是纯追加：不加 `-f` 重跑一次，同一符号就在索引里多一份。
+        //
+        // 「扫描到 0 个文件」是唯一会误伤的情形（roots/.gitignore 配错就会把好索引
+        // 清空），所以单设一道闸：索引本来非空却扫不出文件 → 报错而非静默清空。
+        // 空索引 + 0 文件是合法状态（项目确实没有源码），照旧返回 Ok(0)。
         if files.is_empty() {
+            let existing = self.tantivy.doc_count()?;
+            if existing > 0 {
+                return Err(CodeConnectError::Index(format!(
+                    "本次扫描到 0 个源文件，但索引里还有 {} 个符号文档，已中止且未改动索引。\
+                     这通常意味着 workspace.roots 或 .gitignore 把源码全滤掉了；\
+                     确认要清空索引请显式执行 `codeconnect index -f`。",
+                    existing
+                )));
+            }
+            tracing::warn!("本次扫描到 0 个源文件，索引本来就是空的，无需改动");
             return Ok(IndexStats {
                 files_scanned: 0,
                 files_parsed: 0,
@@ -250,6 +278,10 @@ impl FullIndexer {
                 coverage: CoverageSummary::default(),
             });
         }
+
+        // 清空两个索引：本次索引的最终内容 == 本次扫描到的内容，与跑了多少次无关
+        self.tantivy.delete_all_documents()?;
+        self.call_edge_index.delete_all_documents()?;
 
         // ====================================================================
         // 第二步：流水线模式 — 生产者（rayon 并行解析）与消费者（批量写入）同时运行
@@ -306,6 +338,8 @@ impl FullIndexer {
 
         // 按文件收集符号 ID 列表，用于写文件→符号映射
         let mut file_symbol_map: HashMap<String, FileIndexStats> = HashMap::new();
+        // 本次真正写进索引的文件路径集合，供收尾时收敛 sled 的元信息
+        let mut written_files: HashSet<String> = HashSet::new();
 
         for parsed in success_rx {
             let relative_path = parsed.relative_path.clone();
@@ -328,6 +362,7 @@ impl FullIndexer {
             calls_found += calls_count;
             imports_found += imports_count;
 
+            written_files.insert(relative_path.clone());
             file_symbol_map.insert(relative_path, parsed.stats);
         }
 
@@ -343,13 +378,30 @@ impl FullIndexer {
         // ====================================================================
         // 第四步：提交 tantivy 写入（符号索引 + 调用边索引）
         // ====================================================================
-        let symbol_count = self.tantivy.commit()?;
-        let edge_count = self.call_edge_index.commit()?;
-        tracing::info!("提交完成: {} 个符号文档, {} 条调用边", symbol_count, edge_count);
+        self.tantivy.commit()?;
+        self.call_edge_index.commit()?;
+        // commit() 返回的是 opstamp（单调递增的提交编号），**不是文档数** ——
+        // 直接把它当日志里的「文档数」打印，会给出 4644 这种看着像总数、
+        // 其实与索引内容无关的数字，后续核对文档数时会被误导。这里实查一次。
+        let symbol_count = self.tantivy.doc_count()?;
+        let edge_count = self.call_edge_index.doc_count()?;
+        tracing::info!(
+            "提交完成: 索引共 {} 个符号文档, {} 条调用边",
+            symbol_count,
+            edge_count
+        );
 
         // ====================================================================
         // 第五步：写入 Schema 版本并刷盘
         // ====================================================================
+        // 先把 sled 的文件集合收敛到「本次真正写入的文件」——
+        // 符号已只存 tantivy，但 list_files / status 仍按 sled 的 `meta:` 条目
+        // 统计文件数与符号总数，不清理就会列出已被删除的文件、总数偏高。
+        let pruned = self.sled.prune_files_not_in(&written_files)?;
+        if pruned > 0 {
+            tracing::info!("已清理 {} 条不存在文件的 sled 元信息/指纹", pruned);
+        }
+
         self.sled.put_schema_version(CURRENT_SCHEMA_VERSION)?;
 
         // 记录索引构建时间，供 MCP 侧计算陈旧度
@@ -1003,6 +1055,118 @@ mod tests {
 
         let stats = indexer.run().expect("不限定范围且无源文件不应报错");
         assert_eq!(stats.files_scanned, 0);
+    }
+
+    /// 全量索引是**替换**语义：不加 `-f` 连跑两次，文档数完全相同
+    ///
+    /// 这正是「重复跑 index 让文档翻倍」的回归测试。
+    #[test]
+    fn test_run_is_idempotent() {
+        let project = make_project();
+        let (indexer, _storage) = make_indexer(project.path(), Vec::new());
+
+        let first = indexer.run().expect("第一次索引失败");
+        let first_docs = indexer.tantivy.doc_count().expect("查询文档数失败");
+        let first_edges = indexer.call_edge_index.doc_count().expect("查询调用边数失败");
+
+        let second = indexer.run().expect("第二次索引失败");
+        let second_docs = indexer.tantivy.doc_count().expect("查询文档数失败");
+        let second_edges = indexer.call_edge_index.doc_count().expect("查询调用边数失败");
+
+        assert!(first_docs > 0, "测试项目应产出符号文档");
+        assert_eq!(
+            first_docs, second_docs,
+            "重跑全量索引不应改变文档数（曾经会翻倍）"
+        );
+        assert_eq!(first_edges, second_edges, "调用边同样不应翻倍");
+        assert_eq!(first.symbols_found, second.symbols_found);
+        assert_eq!(
+            second_docs, second.symbols_found,
+            "文档数应恰好等于本次提取的符号数"
+        );
+
+        // 同一 (file, line, name) 不得出现两次
+        let (symbols, skipped) = indexer.tantivy.scan_all_symbols().expect("扫描符号失败");
+        assert_eq!(skipped, 0, "不应有读不出来的损坏文档");
+        let mut seen: HashSet<(String, u64, String)> = HashSet::new();
+        for s in &symbols {
+            assert!(
+                seen.insert((s.file_path.clone(), s.line, s.name.clone())),
+                "同一符号出现两次: {}:{} {}",
+                s.file_path,
+                s.line,
+                s.name
+            );
+        }
+    }
+
+    /// 项目里删掉的文件，重跑全量索引后必须从 tantivy 与 sled 里一并消失
+    #[test]
+    fn test_run_removes_deleted_file() {
+        let project = make_project();
+        let (indexer, _storage) = make_indexer(project.path(), Vec::new());
+
+        indexer.run().expect("首次索引失败");
+        assert_eq!(indexer.tantivy.doc_count().unwrap(), 2);
+        assert!(
+            indexer
+                .sled
+                .get_file_meta("crates/a/src/a.rs")
+                .unwrap()
+                .is_some()
+        );
+
+        std::fs::remove_file(project.path().join("crates/a/src/a.rs")).expect("删除测试文件失败");
+
+        indexer.run().expect("二次索引失败");
+        assert_eq!(indexer.tantivy.doc_count().unwrap(), 1, "已删文件的符号必须消失");
+        assert!(
+            indexer
+                .tantivy
+                .search_by_file_path("crates/a/src/a.rs")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            indexer
+                .sled
+                .get_file_meta("crates/a/src/a.rs")
+                .unwrap()
+                .is_none(),
+            "sled 元信息也要清 —— 否则 list_files / status 会列出已不存在的文件"
+        );
+        assert!(
+            indexer
+                .sled
+                .get_fingerprint("crates/a/src/a.rs")
+                .unwrap()
+                .is_none(),
+            "指纹也必须清 —— 否则文件以相同内容回来时增量索引会误跳过"
+        );
+    }
+
+    /// 扫描到 0 个文件但索引非空 → 报错，而不是把好索引静默清空
+    #[test]
+    fn test_run_errors_when_scan_empty_but_index_not_empty() {
+        let project = make_project();
+        let (indexer, _storage) = make_indexer(project.path(), Vec::new());
+
+        indexer.run().expect("首次索引失败");
+        assert!(indexer.tantivy.doc_count().unwrap() > 0);
+
+        std::fs::remove_file(project.path().join("crates/a/src/a.rs")).unwrap();
+        std::fs::remove_file(project.path().join("crates/b/src/b.rs")).unwrap();
+
+        let err = indexer.run().expect_err("扫描 0 文件且索引非空时必须报错");
+        assert!(
+            err.to_string().contains("0 个源文件"),
+            "错误信息应说明扫描到 0 个文件: {}",
+            err
+        );
+        assert!(
+            indexer.tantivy.doc_count().unwrap() > 0,
+            "报错时索引必须原封不动"
+        );
     }
 
     /// 自由函数 `effective_walk_roots`：全量与限定两种语义

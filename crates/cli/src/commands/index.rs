@@ -26,7 +26,23 @@ use codeconnect_parser::typescript::TypeScriptParser;
 /// - `project_root` — 项目根目录路径
 /// - `data_dir` — 索引数据存储目录
 /// - `config` — CodeConnect 配置（语言开关）
-/// - `force` — 是否强制全量重建（即便有现有索引）
+/// - `force` — 是否强制全量重建
+///
+/// # `-f` 的语义（收窄后）
+///
+/// 全量索引**本身就是替换语义**：无论有没有 `-f`，索引内容都会被本次扫描结果
+/// 整体替换，跑一次和跑十次文档数完全相同，都不会产生重复。
+/// 于是 `-f` 的差别只剩「是否连 sled 一起清」：
+///
+/// | | 不加 `-f` | 加 `-f` |
+/// |---|---|---|
+/// | tantivy 符号 / 调用边 | 清空后重建 | 删目录后重建 |
+/// | sled 的文件元信息 / 指纹 | 收敛到本次写入的文件集合 | 整个目录删除 |
+/// | sled 的历史命名空间（refs / imports / neighbors） | 保留 | 删除 |
+/// | 扫描到 0 个文件时 | 报错中止（防止误清空） | 照常清空 |
+///
+/// 结论：`-f` = 「连历史遗留数据一起清干净」的逃生口，用于 Schema 迁移、
+/// 索引损坏、或确实要把索引清空；日常重建不需要它。
 pub async fn run(
     project_root: &Path,
     data_dir: &Path,
@@ -49,9 +65,14 @@ pub async fn run(
             .join(", ");
         println!("  索引范围:   {}", scope);
     }
-    if force {
-        println!("  模式:       强制全量重建");
-    }
+    println!(
+        "  模式:       {}",
+        if force {
+            "强制全量重建（删掉整个索引目录，含 sled 元信息/指纹）"
+        } else {
+            "替换式全量索引（索引内容整体替换，重复执行结果一致）"
+        }
+    );
     println!();
 
     // 校验 roots 合法性 —— 必须发生在删除旧索引之前。
@@ -85,6 +106,10 @@ pub async fn run(
     let sled_dir = data_dir.join("sled");
 
     // 强制重建时清理旧索引（包括旧的 sled edges 数据）
+    //
+    // 不加 `-f` 时索引器同样会做「替换」（清空 tantivy + 收敛 sled 元信息），
+    // 所以这里删目录多出来的只有两件事：历史命名空间（refs/imports/neighbors）
+    // 一并清掉，以及允许「扫描到 0 个文件」时把索引清空。
     if force {
         let _ = std::fs::remove_dir_all(&tantivy_dir);
         let _ = std::fs::remove_dir_all(&tantivy_edges_dir);

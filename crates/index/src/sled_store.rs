@@ -27,6 +27,11 @@ const PREFIX_IMPORTS: &str = "imports:";
 const PREFIX_FILE_SYMBOLS: &str = "file_symbols:";
 const PREFIX_NEIGHBORS: &str = "neighbors:";
 const PREFIX_INDEX_META: &str = "index_meta:";
+/// 文件指纹键前缀（`index_meta:` + `fingerprint:`）
+///
+/// `PRUNE` 需要按前缀剥离出文件路径，与写入侧共用同一个常量，
+/// 避免两处各写一份字符串、改一处漏一处。
+const PREFIX_FINGERPRINT: &str = "index_meta:fingerprint:";
 
 /// sled 存储管理器
 ///
@@ -362,7 +367,7 @@ impl SledStore {
         file_path: &str,
         data: &[u8],
     ) -> Result<(), CodeConnectError> {
-        let key = format!("{}fingerprint:{}", PREFIX_INDEX_META, file_path);
+        let key = format!("{}{}", PREFIX_FINGERPRINT, file_path);
         self.db
             .insert(key.as_bytes(), data)
             .map_err(|e| CodeConnectError::Index(format!("写入文件指纹失败: {}", e)))?;
@@ -371,7 +376,7 @@ impl SledStore {
 
     /// 读取文件指纹
     pub fn get_fingerprint(&self, file_path: &str) -> Result<Option<Vec<u8>>, CodeConnectError> {
-        let key = format!("{}fingerprint:{}", PREFIX_INDEX_META, file_path);
+        let key = format!("{}{}", PREFIX_FINGERPRINT, file_path);
         Ok(self
             .db
             .get(key.as_bytes())
@@ -381,11 +386,51 @@ impl SledStore {
 
     /// 删除文件指纹
     pub fn remove_fingerprint(&self, file_path: &str) -> Result<(), CodeConnectError> {
-        let key = format!("{}fingerprint:{}", PREFIX_INDEX_META, file_path);
+        let key = format!("{}{}", PREFIX_FINGERPRINT, file_path);
         self.db
             .remove(key.as_bytes())
             .map_err(|e| CodeConnectError::Index(format!("删除文件指纹失败: {}", e)))?;
         Ok(())
+    }
+
+    /// 删除不在 `keep` 集合里的文件元信息与指纹，返回删除的条目数
+    ///
+    /// 全量索引的「替换」语义要求 sled 的文件集合与 tantivy 一致：
+    /// 符号只存 tantivy，但 `list_files`（MCP）与 `status`（CLI）仍按 sled 的
+    /// `meta:` 条目统计文件数、符号总数 —— 不清理就会列出已被删除的文件，
+    /// 并且留下「文件已从索引消失、指纹却还在」的组合：该文件若以相同内容
+    /// 重新出现，增量索引会因指纹相同而跳过，文件就永远进不了索引。
+    ///
+    /// # 参数
+    /// - `keep` — 本次索引真正写入的文件相对路径集合（正斜杠形式）
+    pub fn prune_files_not_in(
+        &self,
+        keep: &std::collections::HashSet<String>,
+    ) -> Result<u64, CodeConnectError> {
+        let mut stale: Vec<Vec<u8>> = Vec::new();
+
+        // 先收集再删除：遍历期间改 sled 会打乱迭代状态
+        for (prefix, strip) in [
+            (PREFIX_META, PREFIX_META.len()),
+            (PREFIX_FINGERPRINT, PREFIX_FINGERPRINT.len()),
+        ] {
+            for item in self.db.scan_prefix(prefix.as_bytes()) {
+                let (key, _) =
+                    item.map_err(|e| CodeConnectError::Index(format!("扫描失败: {}", e)))?;
+                let path = String::from_utf8_lossy(&key[strip..]).replace('\\', "/");
+                if !keep.contains(&path) {
+                    stale.push(key.to_vec());
+                }
+            }
+        }
+
+        if stale.is_empty() {
+            return Ok(0);
+        }
+
+        let removals: Vec<&[u8]> = stale.iter().map(|k| k.as_slice()).collect();
+        self.apply_batch(&[], &removals)?;
+        Ok(stale.len() as u64)
     }
 
     // ===== Schema 版本 =====
