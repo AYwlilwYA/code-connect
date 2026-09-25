@@ -327,10 +327,14 @@ fn default_limit_50() -> usize {
 /// 重新索引请求参数
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ReindexParams {
-    /// 指定要重新索引的文件路径列表（可选，不提供则全量重建）
+    /// **尚未实现**：本工具目前忽略此参数，一律全量重建。
+    ///
+    /// 保留字段是为了不破坏调用方的请求结构；待「按文件重索引」实现后再启用。
     #[serde(default)]
     pub file_paths: Option<Vec<String>>,
-    /// 是否全量重建索引（默认 false，即增量更新）
+    /// **本工具一律全量重建，此参数对行为无影响**，仅为兼容保留。
+    ///
+    /// 增量更新由 `serve` 的文件监控在后台自动完成，无需经此参数触发。
     #[serde(default)]
     pub full: bool,
 }

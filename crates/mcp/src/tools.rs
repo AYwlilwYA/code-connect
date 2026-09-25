@@ -1852,7 +1852,7 @@ fn start_watcher_after_index(registry: &ToolRegistry) -> bool {
 /// 从而避免子进程与父进程的 sled 文件锁冲突。
 pub async fn handle_reindex(
     registry: &ToolRegistry,
-    params: ReindexParams,
+    _params: ReindexParams,
 ) -> McpResponse<serde_json::Value> {
     let start = Instant::now();
 
@@ -1938,7 +1938,10 @@ pub async fn handle_reindex(
 
             let result = serde_json::json!({
                 "status": "reindex_complete",
-                "mode": if params.full { "full" } else { "incremental" },
+                // 恒为 "full"：本工具始终走 FullIndexer 全量重建（见上方 spawn_blocking）。
+                // 此前按 params.full 回报 "incremental" 是**假话** —— 该参数对行为零影响，
+                // 只改了这句回报，会让调用方以为做的是增量更新。
+                "mode": "full",
                 "watcher_started": watcher_started,
                 "stats": {
                     "files_scanned": stats.files_scanned,
