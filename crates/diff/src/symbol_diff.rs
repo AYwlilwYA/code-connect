@@ -198,8 +198,12 @@ impl SymbolDiff {
         let after_plus = &header[plus_pos + 1..];
 
         // 提取数字部分（截止到下一个非数字字符或 @@）
+        //
+        // ⚠️ 逗号也是数字部分的一部分：`+1,10 @@` 的 `,` 是 start 与 count 的分隔符，
+        // 若在逗号处就截断，num_part 只剩 `"1"`，下面 find(',') 落空、
+        // 走 else 分支当成「只有起始行号」，于是 count 被吃掉、end 恒等于 start。
         let end_of_num = after_plus
-            .find(|c: char| !c.is_ascii_digit())
+            .find(|c: char| !c.is_ascii_digit() && c != ',')
             .unwrap_or(after_plus.len());
         let num_part = &after_plus[..end_of_num];
 
