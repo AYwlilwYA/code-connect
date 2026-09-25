@@ -14,6 +14,7 @@ use codeconnect_core::types::{
 };
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
 
+use crate::doc;
 use crate::query_loader::load_c_queries;
 use crate::r#trait::LanguageParser;
 
@@ -106,6 +107,8 @@ impl LanguageParser for CParser {
             let mut name = String::new();
             // 名字节点：枚举量的位置以它为准
             let mut name_node: Option<tree_sitter::Node> = None;
+            // 声明节点：签名与文档注释都从它身上取
+            let mut decl_node: Option<tree_sitter::Node> = None;
             let mut kind = SymbolKind::Unknown("unknown".to_string());
             let mut location = SourceLocation {
                 file_path: file_path_str.clone(),
@@ -127,32 +130,39 @@ impl LanguageParser for CParser {
                     "func" => {
                         kind = SymbolKind::Function;
                         location = self.node_to_location(node, &file_path_str);
+                        decl_node = Some(node);
                     }
                     "struct" => {
                         kind = SymbolKind::Struct;
                         location = self.node_to_location(node, &file_path_str);
+                        decl_node = Some(node);
                     }
                     "union" => {
                         // SymbolKind 中没有 Union 变体，union 映射为 Struct
                         kind = SymbolKind::Struct;
                         location = self.node_to_location(node, &file_path_str);
+                        decl_node = Some(node);
                     }
                     "enum" => {
                         kind = SymbolKind::Enum;
                         location = self.node_to_location(node, &file_path_str);
+                        decl_node = Some(node);
                     }
                     // 枚举量（spec A）：8 个语言统一用 @enumerator 这个 capture 名
                     "enumerator" | "symbol.enumerator" => {
                         kind = SymbolKind::Constant;
                         location = self.node_to_location(node, &file_path_str);
+                        decl_node = Some(node);
                     }
                     "macro" => {
                         kind = SymbolKind::Macro;
                         location = self.node_to_location(node, &file_path_str);
+                        decl_node = Some(node);
                     }
                     "type_definition" => {
                         kind = SymbolKind::TypeAlias;
                         location = self.node_to_location(node, &file_path_str);
+                        decl_node = Some(node);
                     }
                     _ => {}
                 }
@@ -196,13 +206,18 @@ impl LanguageParser for CParser {
                 vec!["static".to_string()]
             };
 
+            let (signature, doc_comment) = match decl_node {
+                Some(n) => doc::extract(n, source, doc::TRIPLE_SLASH_DOC, &name),
+                None => (None, None),
+            };
+
             results.push(Symbol {
                 id: id.to_string(),
                 name,
                 kind,
                 location,
-                signature: None,
-                doc_comment: None,
+                signature,
+                doc_comment,
                 parent_id: None,
                 modifiers,
                 is_exported,

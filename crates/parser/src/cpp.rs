@@ -17,6 +17,7 @@ use codeconnect_core::types::{
 };
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
+use crate::doc;
 use crate::query_loader::load_cpp_queries;
 use crate::r#trait::LanguageParser;
 
@@ -186,6 +187,8 @@ impl CppParser {
         kind: SymbolKind,
         location: SourceLocation,
         is_template: bool,
+        signature: Option<String>,
+        doc_comment: Option<String>,
     ) -> Symbol {
         // C++ 中函数、类、结构体、枚举、命名空间在命名空间层级都是可见的
         let is_exported = matches!(
@@ -215,8 +218,8 @@ impl CppParser {
             name,
             kind,
             location,
-            signature: None,
-            doc_comment: None,
+            signature,
+            doc_comment,
             parent_id: None,
             modifiers,
             is_exported,
@@ -302,6 +305,8 @@ impl LanguageParser for CppParser {
             let mut declarator: Option<Node> = None;
             // 符号所在的语句节点，用于判断类成员位置与模板祖先
             let mut stmt: Option<Node> = None;
+            // 声明节点：签名与文档注释都从它身上取
+            let mut decl_node: Option<Node> = None;
 
             for capture in m.captures {
                 let node = capture.node;
@@ -319,47 +324,56 @@ impl LanguageParser for CppParser {
                         kind = SymbolKind::Class;
                         location = self.node_to_location(node, &file_path_str);
                         stmt = Some(node);
+                        decl_node = Some(node);
                     }
                     "struct" => {
                         kind = SymbolKind::Struct;
                         location = self.node_to_location(node, &file_path_str);
                         stmt = Some(node);
+                        decl_node = Some(node);
                     }
                     "union" => {
                         // SymbolKind 中没有 Union 变体，union 映射为 Struct
                         kind = SymbolKind::Struct;
                         location = self.node_to_location(node, &file_path_str);
                         stmt = Some(node);
+                        decl_node = Some(node);
                     }
                     "enum" => {
                         kind = SymbolKind::Enum;
                         location = self.node_to_location(node, &file_path_str);
                         stmt = Some(node);
+                        decl_node = Some(node);
                     }
                     // 枚举量（spec A）：8 个语言统一用 @enumerator 这个 capture 名，
                     // 另兼容 @symbol.enumerator 命名习惯
                     "enumerator" | "symbol.enumerator" => {
                         kind = SymbolKind::Constant;
                         location = self.node_to_location(node, &file_path_str);
+                        decl_node = Some(node);
                     }
                     "namespace" => {
                         kind = SymbolKind::Module;
                         location = self.node_to_location(node, &file_path_str);
                         stmt = Some(node);
+                        decl_node = Some(node);
                     }
                     "macro" => {
                         kind = SymbolKind::Macro;
                         location = self.node_to_location(node, &file_path_str);
                         stmt = Some(node);
+                        decl_node = Some(node);
                     }
                     "type_definition" => {
                         kind = SymbolKind::TypeAlias;
                         location = self.node_to_location(node, &file_path_str);
                         stmt = Some(node);
+                        decl_node = Some(node);
                     }
                     "func" | "method" | "declaration" => {
                         location = self.node_to_location(node, &file_path_str);
                         stmt = Some(node);
+                        decl_node = Some(node);
                     }
                     _ => {}
                 }
@@ -406,6 +420,11 @@ impl LanguageParser for CppParser {
             let id_str = id.to_string();
             let rank = stmt.map(Self::definition_rank).unwrap_or(2);
 
+            let (signature, doc_comment) = match decl_node {
+                Some(n) => doc::extract(n, source, doc::TRIPLE_SLASH_DOC, &name),
+                None => (None, None),
+            };
+
             // 去重：同名同类符号（声明+定义、类内声明+类外定义）只产出一份
             if let Some(&(idx, old_rank)) = seen.get(&id_str) {
                 if rank <= old_rank {
@@ -417,6 +436,8 @@ impl LanguageParser for CppParser {
                     kind,
                     location,
                     stmt.map(Self::has_template_ancestor).unwrap_or(false),
+                    signature,
+                    doc_comment,
                 );
                 seen.insert(id_str, (idx, rank));
                 continue;
@@ -429,6 +450,8 @@ impl LanguageParser for CppParser {
                 kind,
                 location,
                 stmt.map(Self::has_template_ancestor).unwrap_or(false),
+                signature,
+                doc_comment,
             );
             seen.insert(id_str, (results.len(), rank));
             results.push(symbol);

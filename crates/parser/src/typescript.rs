@@ -14,6 +14,7 @@ use codeconnect_core::types::{
 };
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
 
+use crate::doc;
 use crate::query_loader::load_typescript_queries;
 use crate::r#trait::LanguageParser;
 
@@ -128,6 +129,8 @@ impl LanguageParser for TypeScriptParser {
             let mut name = String::new();
             // 名字节点：枚举量的位置以它为准
             let mut name_node: Option<tree_sitter::Node> = None;
+            // 声明节点：签名与文档注释都从它身上取
+            let mut decl_node: Option<tree_sitter::Node> = None;
             let mut kind = SymbolKind::Unknown("unknown".to_string());
             let mut location = self.node_to_location(tree.root_node(), &file_path_str);
             for capture in m.captures {
@@ -142,35 +145,43 @@ impl LanguageParser for TypeScriptParser {
                     "symbol.function" => {
                         kind = SymbolKind::Function;
                         location = self.node_to_location(node, &file_path_str);
+                        decl_node = Some(node);
                     }
                     "symbol.method" => {
                         kind = SymbolKind::Method;
                         location = self.node_to_location(node, &file_path_str);
+                        decl_node = Some(node);
                     }
                     "symbol.class" => {
                         kind = SymbolKind::Class;
                         location = self.node_to_location(node, &file_path_str);
+                        decl_node = Some(node);
                     }
                     "symbol.interface" => {
                         kind = SymbolKind::Interface;
                         location = self.node_to_location(node, &file_path_str);
+                        decl_node = Some(node);
                     }
                     "symbol.enum" => {
                         kind = SymbolKind::Enum;
                         location = self.node_to_location(node, &file_path_str);
+                        decl_node = Some(node);
                     }
                     // 枚举量（spec A）：8 个语言统一用 @enumerator 这个 capture 名
                     "enumerator" | "symbol.enumerator" => {
                         kind = SymbolKind::Constant;
                         location = self.node_to_location(node, &file_path_str);
+                        decl_node = Some(node);
                     }
                     "symbol.type_alias" => {
                         kind = SymbolKind::TypeAlias;
                         location = self.node_to_location(node, &file_path_str);
+                        decl_node = Some(node);
                     }
                     "symbol.variable" => {
                         kind = SymbolKind::Variable;
                         location = self.node_to_location(node, &file_path_str);
+                        decl_node = Some(node);
                     }
                     _ => {}
                 }
@@ -216,13 +227,18 @@ impl LanguageParser for TypeScriptParser {
                 vec![]
             };
 
+            let (signature, doc_comment) = match decl_node {
+                Some(n) => doc::extract(n, source, doc::BLOCK_ONLY_DOC, &name),
+                None => (None, None),
+            };
+
             results.push(Symbol {
                 id: id.to_string(),
                 name,
                 kind,
                 location,
-                signature: None,
-                doc_comment: None,
+                signature,
+                doc_comment,
                 parent_id: None,
                 modifiers,
                 is_exported,

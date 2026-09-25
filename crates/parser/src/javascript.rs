@@ -14,6 +14,7 @@ use codeconnect_core::types::{
 };
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
 
+use crate::doc;
 use crate::query_loader::load_javascript_queries;
 use crate::r#trait::LanguageParser;
 
@@ -126,6 +127,8 @@ impl LanguageParser for JavaScriptParser {
 
         while let Some(m) = matches.next() {
             let mut name = String::new();
+            // 声明节点：签名与文档注释都从它身上取
+            let mut decl_node: Option<tree_sitter::Node> = None;
             let mut kind = SymbolKind::Unknown("unknown".to_string());
             let mut location = self.node_to_location(tree.root_node(), &file_path_str);
             for capture in m.captures {
@@ -139,18 +142,22 @@ impl LanguageParser for JavaScriptParser {
                     "symbol.function" => {
                         kind = SymbolKind::Function;
                         location = self.node_to_location(node, &file_path_str);
+                        decl_node = Some(node);
                     }
                     "symbol.method" => {
                         kind = SymbolKind::Method;
                         location = self.node_to_location(node, &file_path_str);
+                        decl_node = Some(node);
                     }
                     "symbol.class" => {
                         kind = SymbolKind::Class;
                         location = self.node_to_location(node, &file_path_str);
+                        decl_node = Some(node);
                     }
                     "symbol.variable" => {
                         kind = SymbolKind::Variable;
                         location = self.node_to_location(node, &file_path_str);
+                        decl_node = Some(node);
                     }
                     _ => {}
                 }
@@ -191,13 +198,18 @@ impl LanguageParser for JavaScriptParser {
                 vec![]
             };
 
+            let (signature, doc_comment) = match decl_node {
+                Some(n) => doc::extract(n, source, doc::BLOCK_ONLY_DOC, &name),
+                None => (None, None),
+            };
+
             results.push(Symbol {
                 id: id.to_string(),
                 name,
                 kind,
                 location,
-                signature: None,
-                doc_comment: None,
+                signature,
+                doc_comment,
                 parent_id: None,
                 modifiers,
                 is_exported,

@@ -8,6 +8,7 @@
 //! - [`ImportResolver`] — 跨文件导入解析策略
 
 pub mod coverage;
+pub mod doc;
 pub mod factory;
 pub mod import_resolver;
 pub mod query_loader;
